@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  mysql_db:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama_ai:
+    image: ollama/ollama:latest
+    container_name: ollama_ai
+    restart: always
+    volumes:
+      - ollama_models:/root/.ollama
+
+  telegram_bot:
+    build: ./bot
+    container_name: telegram_bot
+    restart: always
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - DB_HOST=mysql_db
+      - DB_USER=${MYSQL_USER}
+      - DB_PASSWORD=${MYSQL_PASSWORD}
+      - DB_NAME=${MYSQL_DATABASE}
+      - OLLAMA_HOST=http://ollama_ai:11434
+      - ADMIN_IDS=${ADMIN_IDS}
+    depends_on:
+      mysql_db:
+        condition: service_healthy
+      ollama_ai:
+        condition: service_started
+
+volumes:
+  ollama_models:

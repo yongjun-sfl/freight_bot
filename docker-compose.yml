@@ -1,6 +1,6 @@
-version: '3.8'
 
 services:
+  # 🗄️ Database Layer (Accessible Externally)
   mysql_db:
     image: mysql:8.0
     container_name: mysql_db
@@ -10,6 +10,8 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3306:3306" # <-- MOUNTS DATABASE PORT DIRECTLY TO TARGET ENVIRONMENT
     volumes:
       - ./mysql_data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -19,6 +21,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # 🤖 Local AI Layer
   ollama_ai:
     image: ollama/ollama:latest
     container_name: ollama_ai
@@ -26,6 +29,7 @@ services:
     volumes:
       - ollama_models:/root/.ollama
 
+  # 🐍 Python Telegram Bot Layer
   telegram_bot:
     build: ./bot
     container_name: telegram_bot
@@ -38,6 +42,7 @@ services:
       - DB_NAME=${MYSQL_DATABASE}
       - OLLAMA_HOST=http://ollama_ai:11434
       - ADMIN_IDS=${ADMIN_IDS}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       mysql_db:
         condition: service_healthy

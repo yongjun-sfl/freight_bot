@@ -17,9 +17,12 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_pipeline_routing, pattern="^(dep_|arr_)"))
     app.add_handler(CallbackQueryHandler(trigger_manual_override, pattern="^(fixdep_|fixarr_|manbol_)"))
-    app.add_handler(MessageHandler(filters.Reply & filters.TEXT, process_manual_replies))
+    
+    # Standard capitalized REPLY configuration filters
+    app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, process_manual_replies))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_upload))
+    
     app.run_polling()
 
 if __name__ == '__main__':

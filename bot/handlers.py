@@ -1,308 +1,620 @@
-import os, io, logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
-from telegram.ext import ContextTypes
-from ai_engine import clean_text_locally, extract_bol_locally
+import os
+import io
+import time
 import asyncio
-
-from datetime import datetime, timezone
-# Optional: If you want to convert the timestamp to a specific local time zone (e.g., Eastern Time)
-from zoneinfo import ZoneInfo 
+import logging
+import collections
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from ai_engine import extract_bol_locally, parse_text_with_llm
 
 logger = logging.getLogger(__name__)
 
-ADMIN_IDS = {int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()}
-
+# State Buffers
+ALBUM_BUFFERS = {}
+ALBUM_LOCKS = set()
 PROCESSED_GROUPS = set()
 
-def is_admin(uid: int) -> bool: 
-    return uid in ADMIN_IDS
+# Driver-Isolated FIFO Caches & Signal Events using User ID (did)
+USER_TEXT_QUEUES = collections.defaultdict(collections.deque)
+PENDING_IMAGE_QUEUE = {}
 
-async def ensure_driver_exists(conn, user_id: int, driver_name: str):
-    """Ensures driver is present in the drivers table prior to inserting message records."""
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "INSERT INTO drivers (user_id, driver_name) VALUES (%s, %s) "
-            "ON DUPLICATE KEY UPDATE driver_name=VALUES(driver_name)",
-            (user_id, driver_name)
-        )
-    await conn.commit()
+DISPATCH_CHANNEL_ID = os.getenv("DISPATCH_CHANNEL_ID")
 
 
-async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid = update.message.from_user.id
-    raw_text = update.message.text
-    chat_type = update.message.chat.type
-
-    if chat_type in ["group", "supergroup"]:
-        # 1. Run local AI instantly on the group message background thread
-        parsed = clean_text_locally(raw_text)
-        p = context.application.bot_data['db_pool']
-        
-        # Determine if message implies an ARRIVAL or DEPARTURE
-        text_lower = raw_text.lower()
-        is_arrival = any(w in text_lower for w in ["arr", "arrive", "delivered", "done", "at yard", "empty"])
-
-        if is_arrival:
-            # AUTOMATIC ARRIVAL: Find open trip and close it
-            async with p.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT id FROM messages WHERE user_id=%s AND status='active' ORDER BY id DESC LIMIT 1", (sid,))
-                    row = await cur.fetchone()
-                    if row:
-                        rid = row[0]
-                        await cur.execute("UPDATE messages SET arrival_time=%s, status='arrived' WHERE id=%s", (parsed.get("time_info") or raw_text, rid))
-                        # Only notify admin privately of successful automatic stitch
-                        for aid in ADMIN_IDS:
-                            await context.bot.send_message(chat_id=aid, text=f"✅ **Auto-Linked Arrival** for Driver {sid} to Trip #{rid}")
-                        return
-
-        # AUTOMATIC DEPARTURE (Default fallback if not an explicit arrival)
-        async with p.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "INSERT INTO messages (user_id, original_text, origin, destination, departure_time, status) VALUES (%s,%s,%s,%s,%s,'active')", 
-                    (sid, raw_text, parsed.get("origin"), parsed.get("destination"), parsed.get("time_info"))
-                )
-                rid = cur.lastrowid
-
-        # 🚨 ONLY POP UP TO ADMIN IF AI FAILS CRITICAL FIELDS
-        if not parsed.get("origin") or not parsed.get("destination"):
-            for aid in ADMIN_IDS:
-                kb = [[InlineKeyboardButton("✏️ Fix Route Manually", callback_data=f"fixdep_{rid}")]]
-                await context.bot.send_message(
-                    chat_id=aid, 
-                    text=f"⚠️ **Auto-Logged Trip #{rid} (Driver {sid}) but AI missed fields!**\n💬 *\"{raw_text}\"*", 
-                    reply_markup=InlineKeyboardMarkup(kb)
-                )
+async def delete_msg_after_delay(bot, chat_id: int, message_id: int, delay_seconds: int = 60):
+    await asyncio.sleep(delay_seconds)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Auto-deleted dispatch message {message_id} from chat {chat_id}.")
+    except Exception as e:
+        logger.warning(f"Failed to auto-delete message {message_id}: {e}")
 
 
-from datetime import datetime, timezone
-# Optional: If you want to convert the timestamp to a specific local time zone (e.g., Eastern Time)
-from zoneinfo import ZoneInfo 
+def get_telegram_link(chat_id: int, message_id: int) -> str:
+    str_chat_id = str(chat_id)
+    if str_chat_id.startswith("-100"):
+        clean_chat_id = str_chat_id[4:]
+        return f"https://t.me/c/{clean_chat_id}/{message_id}"
+    return ""
 
-async def handle_pipeline_routing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id): return
-    await q.answer()
-    act, did = q.data.split("_")
-    txt = context.bot_data.get(f"raw_text_{did}", "")
-    parsed = clean_text_locally(txt)
+
+def get_manual_reconcile_keyboard(leg_id: int, orig_chat_id: int = None, orig_msg_id: int = None):
+    keyboard = []
+    
+    if orig_chat_id and orig_msg_id:
+        jump_url = get_telegram_link(orig_chat_id, orig_msg_id)
+        if jump_url:
+            keyboard.append([InlineKeyboardButton("🔗 View Original Message in Group", url=jump_url)])
+
+    keyboard.extend([
+        [
+            InlineKeyboardButton("✅ Mark Closed", callback_data=f"rec_close_{leg_id}"),
+            InlineKeyboardButton("🚛 Fix Trailer", callback_data=f"rec_trailer_{leg_id}")
+        ],
+        [
+            InlineKeyboardButton("📍 Fix Route", callback_data=f"rec_route_{leg_id}"),
+            InlineKeyboardButton("📄 Fix BOL", callback_data=f"rec_bol_{leg_id}")
+        ]
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def handle_reconcile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
     p = context.application.bot_data['db_pool']
 
-    # ⏱️ 1. Extract the native Telegram message time (Defaults to UTC)
-    # If using a group chat webhook forwarding flow, fall back to current query message date context
-    msg_date = update.message.date if update.message else q.message.date
-    
-    # ⏱️ 2. Convert to your local fleet timezone (e.g., America/New_York for Eastern Time)
-    local_msg_date = msg_date.astimezone(ZoneInfo("America/New_York"))
-    telegram_time_str = local_msg_date.strftime("%m/%d %H:%M")
+    if not data or not data.startswith("rec_"):
+        return
 
-    if act == "dep":
-        # Use the AI's extracted text time if found; otherwise, fall back to the Telegram message time string
-        time_val = parsed.get("time_info") or telegram_time_str
-        
-        async with p.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "INSERT INTO messages (user_id, original_text, origin, destination, departure_time, status) "
-                    "VALUES (%s,%s,%s,%s,%s,'active')", 
-                    (int(did), txt, parsed.get("origin"), parsed.get("destination"), time_val)
-                )
-                rid = cur.lastrowid
-        kb = [[InlineKeyboardButton("✏️ Fix Dep", callback_data=f"fixdep_{rid}")]]
-        await q.edit_message_text(f"✅ Dep Logged! (ID: {rid})", reply_markup=InlineKeyboardMarkup(kb))
+    parts = data.split("_")
+    action = parts[1]
+    leg_id = int(parts[2])
 
-    elif act == "arr":
-        # ✅ Use the AI's extracted text time if found; otherwise, fall back to the Telegram message time string
-        time_val = parsed.get("time_info") or telegram_time_str
-        
-        async with p.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT id FROM messages WHERE user_id=%s AND status='active' ORDER BY id DESC LIMIT 1", 
-                    (int(did),)
-                )
-                row = await cur.fetchone()
-                if not row:
-                    await q.edit_message_text("❌ Error: No active open trip records found for driver.")
-                    return
-                rid = row[0]
-                # Save the clean message timestamp string into your arrival_time column
-                await cur.execute("UPDATE messages SET arrival_time=%s, status='arrived' WHERE id=%s", (time_val, rid))
+    async with p.acquire() as conn:
+        async with conn.cursor() as cur:
+            if action == "close":
+                sql = "UPDATE shuttle_legs SET leg_status = 'COMPLETED', arrival_time = NOW() WHERE id = %s;"
+                await cur.execute(sql, (leg_id,))
+                await conn.commit()
                 
-        kb = [[InlineKeyboardButton("✏️ Fix Arr", callback_data=f"fixarr_{rid}")]]
-        await q.edit_message_text(f"✅ Arr Linked to Trip #{rid}!", reply_markup=InlineKeyboardMarkup(kb))
+                new_text = query.message.text + "\n\n🛠️ Manually Closed & Resolved by Dispatcher"
+                await query.edit_message_text(text=new_text, parse_mode=None, reply_markup=None)
+
+                asyncio.create_task(
+                    delete_msg_after_delay(context.bot, query.message.chat_id, query.message.message_id, 60)
+                )
+
+            elif action in ["trailer", "route", "bol"]:
+                prompt_text = (
+                    f"⚠️ Manual Override Request (Leg #{leg_id})\n"
+                    f"Reply in this channel to edit: {action.upper()}: <value>"
+                )
+                await context.bot.send_message(chat_id=query.message.chat_id, text=prompt_text, parse_mode=None)
 
 
-async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- TEXT MESSAGE HANDLER ---
+async def handle_shuttle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     did = update.message.from_user.id
-    driver_name = update.message.from_user.full_name or f"Driver {did}"
+    text = update.message.text
+    orig_chat_id = update.effective_chat.id
+    orig_msg_id = update.message.message_id
+    now = time.time()
+
+    llm_parsed = parse_text_with_llm(text)
+
+    if llm_parsed.get("case_type") == "NONE_WORK_RELATED":
+        logger.info(f"Ignored non-work message from driver {did}: '{text}'")
+        return
+
+    if did in PENDING_IMAGE_QUEUE:
+        PENDING_IMAGE_QUEUE[did]["text"] = text
+        PENDING_IMAGE_QUEUE[did]["orig_chat_id"] = orig_chat_id
+        PENDING_IMAGE_QUEUE[did]["orig_msg_id"] = orig_msg_id
+        PENDING_IMAGE_QUEUE[did]["event"].set()
+        return
+
+    USER_TEXT_QUEUES[did].append((text, now, orig_chat_id, orig_msg_id))
+    user_name = update.message.from_user.full_name or f"Driver {did}"
+    group_title = update.effective_chat.title or "Driver Group"
+    msg_timestamp = update.message.date.strftime('%Y-%m-%d %H:%M:%S')
     p = context.application.bot_data['db_pool']
-    
-    # 1. ⚡ Send a quick status message immediately so Telegram knows the bot received the event
+
+    output_text = ""
+    leg_id = None
+    is_completed = False
+
+    async with p.acquire() as conn:
+        async with conn.cursor() as cur:
+
+            # DYNAMIC MESSAGE EDIT FOR OPEN PHOTO LEGS
+            if llm_parsed.get("origin_location") != "INFER_FROM_HISTORY" or llm_parsed.get("destination_location") != "INFER_FROM_HISTORY":
+                new_orig = llm_parsed.get("origin_location")
+                new_dest = llm_parsed.get("destination_location")
+
+                find_unresolved_sql = """
+                    SELECT id, origin_location, destination_location, trailer_number, bol_number, dispatch_msg_id 
+                    FROM shuttle_legs 
+                    WHERE user_id = %s AND leg_status = 'IN_TRANSIT' 
+                    ORDER BY id DESC LIMIT 1;
+                """
+                await cur.execute(find_unresolved_sql, (did,))
+                unresolved_leg = await cur.fetchone()
+
+                if unresolved_leg and (unresolved_leg[1] in ["Origin", "INFER_FROM_HISTORY", "UNKNOWN"] or unresolved_leg[2] in ["Destination", "INFER_FROM_HISTORY", "UNKNOWN"]):
+                    leg_id = unresolved_leg[0]
+                    curr_orig = unresolved_leg[1]
+                    curr_dest = unresolved_leg[2]
+                    curr_trailer = unresolved_leg[3]
+                    curr_bol = unresolved_leg[4]
+                    dispatch_msg_id = unresolved_leg[5]
+
+                    final_orig = new_orig if new_orig and new_orig != "INFER_FROM_HISTORY" else curr_orig
+                    final_dest = new_dest if new_dest and new_dest != "INFER_FROM_HISTORY" else curr_dest
+
+                    update_backfill_sql = "UPDATE shuttle_legs SET origin_location = %s, destination_location = %s WHERE id = %s;"
+                    await cur.execute(update_backfill_sql, (final_orig, final_dest, leg_id))
+                    await conn.commit()
+
+                    # Dynamically edit the existing Telegram message card in the dispatch channel
+                    if dispatch_msg_id:
+                        target_chat_id = DISPATCH_CHANNEL_ID if DISPATCH_CHANNEL_ID else update.effective_chat.id
+                        updated_card_text = (
+                            f"📸 **Case #1: Outbound Leg Logged**\n"
+                            f"👤 Driver: {user_name}\n"
+                            f"💬 Group: `{group_title}` (Msg ID: `{orig_msg_id}`)\n"
+                            f"🚛 Trailer: `{curr_trailer}` | BOL: `{curr_bol or 'N/A'}`\n"
+                            f"📍 Route: `{final_orig}` ➔ `{final_dest}`\n"
+                            f"⏱️ Departure: `{msg_timestamp}`"
+                        )
+                        keyboard = get_manual_reconcile_keyboard(leg_id, orig_chat_id, orig_msg_id)
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=target_chat_id,
+                                message_id=dispatch_msg_id,
+                                text=updated_card_text,
+                                parse_mode="Markdown",
+                                reply_markup=keyboard
+                            )
+                            logger.info(f"Edited dispatch message {dispatch_msg_id} with updated route {final_orig} ➔ {final_dest}.")
+                        except Exception as e:
+                            logger.error(f"Failed to edit dispatch message {dispatch_msg_id}: {e}")
+                    return
+
+            # DESTINATION ARRIVAL EXECUTION
+            elif llm_parsed.get("case_type") == "CASE_2_DESTINATION_ARRIVAL":
+                target_trailer = llm_parsed.get("trailer_number")
+                
+                if not target_trailer or target_trailer in ["UNKNOWN", "None", "null", ""]:
+                    await cur.execute(
+                        "SELECT id, trailer_number FROM shuttle_legs WHERE user_id = %s AND leg_status = 'IN_TRANSIT' ORDER BY id DESC LIMIT 1;", 
+                        (did,)
+                    )
+                    leg_row = await cur.fetchone()
+                    if leg_row:
+                        leg_id = leg_row[0]
+                        target_trailer = leg_row[1]
+
+                if leg_id:
+                    sql = """
+                        UPDATE shuttle_legs AS sl 
+                        SET sl.arrival_time = %s, 
+                            sl.arrival_action = COALESCE(NULLIF(%s, ''), sl.arrival_action, 'DROP'), 
+                            sl.dock_number = COALESCE(NULLIF(%s, ''), sl.dock_number), 
+                            sl.destination_location = COALESCE(NULLIF(%s, 'Destination'), sl.destination_location), 
+                            sl.leg_status = 'COMPLETED'
+                        WHERE sl.id = %s;
+                    """
+                    await cur.execute(sql, (msg_timestamp, llm_parsed.get("action"), llm_parsed.get("door_number"), llm_parsed.get("destination_location"), leg_id))
+                else:
+                    sql = """
+                        UPDATE shuttle_legs AS sl 
+                        SET sl.arrival_time = %s, 
+                            sl.arrival_action = COALESCE(NULLIF(%s, ''), sl.arrival_action, 'DROP'), 
+                            sl.dock_number = COALESCE(NULLIF(%s, ''), sl.dock_number), 
+                            sl.destination_location = COALESCE(NULLIF(%s, 'Destination'), sl.destination_location), 
+                            sl.leg_status = 'COMPLETED'
+                        WHERE sl.user_id = %s AND sl.leg_status = 'IN_TRANSIT'
+                        ORDER BY sl.id DESC LIMIT 1;
+                    """
+                    await cur.execute(sql, (msg_timestamp, llm_parsed.get("action"), llm_parsed.get("door_number"), llm_parsed.get("destination_location"), did))
+
+                await conn.commit()
+                is_completed = True
+                door_str = f" at Door #{llm_parsed.get('door_number')}" if llm_parsed.get('door_number') else ""
+                display_trailer = target_trailer if target_trailer else "Active Unit"
+                
+                output_text = (
+                    f"📍 **Destination Arrival Logged**\n"
+                    f"👤 Driver: {user_name}\n"
+                    f"💬 Source Chat: `{group_title}` (Msg ID: `{orig_msg_id}`)\n"
+                    f"🚛 Trailer: `{display_trailer}`{door_str}\n"
+                    f"📍 Location: `{llm_parsed.get('destination_location') or 'Destination'}`\n"
+                    f"⏱️ Time: `{msg_timestamp}`"
+                )
+
+    if output_text:
+        target_chat_id = DISPATCH_CHANNEL_ID if DISPATCH_CHANNEL_ID else update.effective_chat.id
+        try:
+            keyboard = None if is_completed else get_manual_reconcile_keyboard(leg_id, orig_chat_id, orig_msg_id)
+            
+            sent_msg = await context.bot.send_message(
+                chat_id=target_chat_id, 
+                text=output_text, 
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+
+            if is_completed:
+                asyncio.create_task(delete_msg_after_delay(context.bot, target_chat_id, sent_msg.message_id, 60))
+
+        except Exception as e:
+            logger.error(f"Failed to post text log: {e}")
+
+
+# --- PHOTO & ALBUM HANDLER ---
+async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.photo:
         return
 
-    # Check if this photo is part of a multi-photo album upload
     media_group_id = msg.media_group_id
 
-    if media_group_id:
-        # If we have already started processing a photo from this album batch, skip the rest
-        if media_group_id in PROCESSED_GROUPS:
-            logger.info(f"Skipping duplicate photo in album group {media_group_id}")
-            return
-        
-        PROCESSED_GROUPS.add(media_group_id)
-        
-        # Auto-clean set memory
-        if len(PROCESSED_GROUPS) > 500:
-            PROCESSED_GROUPS.clear()
-
-    # Continue processing single photo or first photo of the album
-    status_msg = await msg.reply_text("⏳ Processing shipping document...")
-
-    logger.info(f"📸 Received photo from Driver {did}. Downloading...")
-    
-    file = await update.message.photo[-1].get_file()
-    buf = io.BytesIO()
-    await file.download_to_memory(buf)
-    img = buf.getvalue()
-    
-    logger.info(f"⚡ Processing photo ({len(img)} bytes) via MiniCPM-V executor...")
-    
-    loop = asyncio.get_running_loop()
-    ext = await loop.run_in_executor(None, extract_bol_locally, img)
-
-    # 3. Clean up status message
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-    
-    logger.info(f"🤖 Handler Received AI Output: {ext}")
-    
-    # 🛑 1. Check if filtered out
-    if not ext.get("is_bol"):
-        logger.info(f"⏭️ Photo from Driver {did} skipped because 'is_bol' is False.")
+    if media_group_id and media_group_id in PROCESSED_GROUPS:
         return
 
-    b_num = ext.get("bol_number")
-    t_num = ext.get("trailer_number")
-    
-    ai_shipper = 1 if ext.get("shipper_signed") else 0
-    ai_receiver = 1 if ext.get("receiver_signed") else 0
-    
-    row = None
-    async with p.acquire() as conn:
-        await ensure_driver_exists(conn, did, driver_name)
-        async with conn.cursor() as cur:
-            # First try matching active open trip
-            if b_num:
-                await cur.execute(
-                    "SELECT id, status, shipper_signed, receiver_signed, bol_number FROM messages "
-                    "WHERE user_id=%s AND bol_number=%s ORDER BY id DESC LIMIT 1", 
-                    (did, b_num)
-                )
-                row = await cur.fetchone()
-            
-            if not row:
-                await cur.execute(
-                    "SELECT id, status, shipper_signed, receiver_signed, bol_number FROM messages "
-                    "WHERE user_id=%s AND status != 'completed' ORDER BY id DESC LIMIT 1", 
-                    (did,)
-                )
-                row = await cur.fetchone()
+    file = await msg.photo[-1].get_file()
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    img_bytes = buf.getvalue()
 
-            # 🛠️ If no open trip exists, create a new record directly
-            if not row:
-                logger.info(f"📝 Creating brand new BOL trip entry for Driver {did}")
-                status = 'completed' if (ai_shipper == 1 and ai_receiver == 1) else 'active'
+    did = msg.from_user.id
+    caption_text = msg.caption or ""
+    orig_chat_id = update.effective_chat.id
+    orig_msg_id = msg.message_id
 
-                # Get the exact UTC timestamp when the driver sent the message in Telegram
-                departure_time = update.message.date.strftime('%Y-%m-%d %H:%M:%S')
+    target_chat_id = DISPATCH_CHANNEL_ID if DISPATCH_CHANNEL_ID else update.effective_chat.id
 
-                await cur.execute(
-                    "INSERT INTO messages (user_id, image_blob, bol_number, trailer_number, shipper_signed, receiver_signed, status, departure_time) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (did, img, b_num, t_num, ai_shipper, ai_receiver, status, departure_time)
-                )
-                await conn.commit()
-                rid = cur.lastrowid
-                final_shipper, final_receiver = ai_shipper, ai_receiver
-                final_bol = b_num
-                new_status = status
-            else:
-                rid, current_status, existing_shipper, existing_receiver, DB_bol_number = row
-                final_bol = DB_bol_number if DB_bol_number else b_num
-                final_shipper = 1 if (existing_shipper == 1 or ai_shipper == 1) else 0
-                final_receiver = 1 if (existing_receiver == 1 or ai_receiver == 1) else 0
-                new_status = 'completed' if (final_shipper == 1 and final_receiver == 1) else current_status
+    if not media_group_id:
+        status_msg = await context.bot.send_message(chat_id=target_chat_id, text="⏳ Processing image...")
+        await handle_image_completion(update, context, [img_bytes], caption_text, status_msg, orig_chat_id, orig_msg_id)
+        return
 
-                await cur.execute(
-                    "UPDATE messages SET image_blob=%s, bol_number=%s, "
-                    "trailer_number=COALESCE(%s, trailer_number), shipper_signed=%s, "
-                    "receiver_signed=%s, status=%s WHERE id=%s",
-                    (img, final_bol, t_num, final_shipper, final_receiver, new_status, rid)
-                )
-                await conn.commit()
+    if media_group_id not in ALBUM_BUFFERS:
+        ALBUM_BUFFERS[media_group_id] = {
+            "images": [],
+            "caption": "",
+            "status_msg": None,
+            "orig_chat_id": orig_chat_id,
+            "orig_msg_id": orig_msg_id
+        }
 
-    logger.info(f"💾 Successfully saved record ID #{rid} to MySQL database!")
+    ALBUM_BUFFERS[media_group_id]["images"].append(img_bytes)
+    if caption_text and not ALBUM_BUFFERS[media_group_id]["caption"]:
+        ALBUM_BUFFERS[media_group_id]["caption"] = caption_text
 
-    # 4. Alert admins
-    for aid in ADMIN_IDS:
-        kb = [[InlineKeyboardButton("✏️ Manual Correction", callback_data=f"manbol_{rid}")]]
-        ship_chk = "✅ Signed" if final_shipper else "❌ Missing"
-        recv_chk = "✅ Signed" if final_receiver else "❌ Missing"
-        
-        report = (
-            f"📋 BOL Processed (Record #{rid})\n"
-            f"🔢 BOL #: {final_bol or 'Not Found'}\n"
-            f"🚛 Trailer: {t_num or 'Not Found'}\n"
-            f"✍️ Shipper: {ship_chk}\n"
-            f"✍️ Receiver: {recv_chk}\n"
-            f"Status: {new_status}"
+    if media_group_id in ALBUM_LOCKS:
+        return
+
+    ALBUM_LOCKS.add(media_group_id)
+    status_msg = await context.bot.send_message(chat_id=target_chat_id, text="⏳ Processing photo album...")
+    ALBUM_BUFFERS[media_group_id]["status_msg"] = status_msg
+
+    await asyncio.sleep(2.5)
+
+    PROCESSED_GROUPS.add(media_group_id)
+    album_data = ALBUM_BUFFERS.pop(media_group_id, None)
+    ALBUM_LOCKS.remove(media_group_id)
+
+    if album_data:
+        await handle_image_completion(
+            update, 
+            context, 
+            album_data["images"], 
+            album_data["caption"], 
+            album_data["status_msg"],
+            album_data["orig_chat_id"],
+            album_data["orig_msg_id"]
         )
+
+    if len(PROCESSED_GROUPS) > 1000:
+        PROCESSED_GROUPS.clear()
+
+
+# --- SYNCHRONIZED HOLD QUEUE ---
+async def handle_image_completion(update: Update, context: ContextTypes.DEFAULT_TYPE, images: list[bytes], caption_text: str, status_msg, orig_chat_id: int, orig_msg_id: int):
+    did = update.message.from_user.id
+
+    if not caption_text and USER_TEXT_QUEUES[did]:
+        while USER_TEXT_QUEUES[did]:
+            item = USER_TEXT_QUEUES[did].popleft()
+            cached_text, cached_time = item[0], item[1]
+            if time.time() - cached_time < 180:
+                caption_text = cached_text
+                if len(item) >= 4:
+                    orig_chat_id, orig_msg_id = item[2], item[3]
+                break
+
+    if not caption_text:
+        event = asyncio.Event()
+        PENDING_IMAGE_QUEUE[did] = {
+            "event": event, 
+            "text": "", 
+            "orig_chat_id": orig_chat_id, 
+            "orig_msg_id": orig_msg_id
+        }
+        
         try:
-            await context.bot.send_message(chat_id=aid, text=report, reply_markup=InlineKeyboardMarkup(kb))
-        except Exception as e:
-            logger.error(f"Failed to report to admin {aid}: {e}")
+            await asyncio.wait_for(event.wait(), timeout=10.0)
+            caption_text = PENDING_IMAGE_QUEUE[did].get("text", "")
+            orig_chat_id = PENDING_IMAGE_QUEUE[did].get("orig_chat_id", orig_chat_id)
+            orig_msg_id = PENDING_IMAGE_QUEUE[did].get("orig_msg_id", orig_msg_id)
+        except asyncio.TimeoutError:
+            logger.info(f"Driver {did} uploaded photos without caption within 10s window. Proceeding to fallback.")
+        finally:
+            PENDING_IMAGE_QUEUE.pop(did, None)
+
+    await process_photo_batch(update, context, images, caption_text, status_msg, orig_chat_id, orig_msg_id)
 
 
-async def trigger_manual_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id): return
-    await q.answer()
-    act, rid = q.data.split("_")
-    context.user_data['target_row_id'] = int(rid)
-    context.user_data['state'] = f"WAITING_{act.upper()}"
-    p = {
-        "fixdep": "Type: `Origin to Destination`", 
-        "fixarr": "Type arrival time:", 
-        "manbol": "Type exactly:\n`BOL Trailer ShipperSigned(true/false) ReceiverSigned(true/false)`\nExample: `BOL123 TR999 true true`"
-    }
-    await context.bot.send_message(chat_id=q.message.chat_id, text=p[act], reply_markup=ForceReply(selective=True))
-
-async def process_manual_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    st = context.user_data.get('state')
-    rid = context.user_data.get('target_row_id')
-    if not st or not rid: return
-    utxt = update.message.text
+# --- BATCH IMAGE & DATABASE ENGINE ---
+async def process_photo_batch(update: Update, context: ContextTypes.DEFAULT_TYPE, images: list[bytes], caption_text: str, status_msg, orig_chat_id: int, orig_msg_id: int):
+    did = update.message.from_user.id
+    user_name = update.message.from_user.full_name or f"Driver {did}"
+    group_title = update.effective_chat.title or "Driver Group"
+    msg_timestamp = update.message.date.strftime('%Y-%m-%d %H:%M:%S')
     p = context.application.bot_data['db_pool']
 
+    llm_text_data = parse_text_with_llm(caption_text) if caption_text else {}
+    
+    if llm_text_data.get("case_type") == "NONE_WORK_RELATED":
+        if status_msg:
+            try: await status_msg.delete()
+            except Exception: pass
+        return
+
+    loop = asyncio.get_running_loop()
+    ext = await loop.run_in_executor(None, extract_bol_locally, images)
+
+    bol_num = ext.get("bol_number")
+    trailer_num = llm_text_data.get("trailer_number") or ext.get("trailer_number") or "UNKNOWN"
+    primary_image_blob = images[0] if images else None
+
+    # HISTORICAL / DELAYED SIGNED BOL UPLOADS
+    if llm_text_data.get("case_type") == "CASE_HISTORICAL_BOL_UPDATE":
+        async with p.acquire() as conn:
+            async with conn.cursor() as cur:
+                leg_id = None
+                
+                if bol_num:
+                    await cur.execute("SELECT id, origin_location, destination_location, trailer_number FROM shuttle_legs WHERE bol_number = %s ORDER BY id DESC LIMIT 1;", (bol_num,))
+                    match = await cur.fetchone()
+                    if match:
+                        leg_id, origin_loc, dest_loc, trailer_num = match[0], match[1], match[2], match[3]
+
+                if not leg_id and trailer_num != "UNKNOWN":
+                    await cur.execute("SELECT id, origin_location, destination_location FROM shuttle_legs WHERE user_id = %s AND trailer_number = %s ORDER BY id DESC LIMIT 1;", (did, trailer_num))
+                    match = await cur.fetchone()
+                    if match:
+                        leg_id, origin_loc, dest_loc = match[0], match[1], match[2]
+
+                if leg_id:
+                    is_signed = ext.get("receiver_signed") or True
+                    update_sql = """
+                        UPDATE shuttle_legs 
+                        SET bol_image = COALESCE(%s, bol_image),
+                            receiver_signed = %s,
+                            leg_status = 'COMPLETED'
+                        WHERE id = %s;
+                    """
+                    await cur.execute(update_sql, (primary_image_blob, is_signed, leg_id))
+                    await conn.commit()
+
+                    output_text = (
+                        f"📑 **Historical BOL Reconciled (Past Leg #{leg_id})**\n"
+                        f"👤 Driver: {user_name}\n"
+                        f"💬 Group: `{group_title}` (Msg ID: `{orig_msg_id}`)\n"
+                        f"🚛 Trailer: `{trailer_num}` | BOL: `{bol_num or 'Attached'}`\n"
+                        f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
+                        f"✅ Status: Closed & Reconciled via Paper Upload"
+                    )
+                    
+                    target_chat_id = DISPATCH_CHANNEL_ID if DISPATCH_CHANNEL_ID else update.effective_chat.id
+                    sent_msg = await context.bot.send_message(chat_id=target_chat_id, text=output_text, parse_mode="Markdown")
+                    asyncio.create_task(delete_msg_after_delay(context.bot, target_chat_id, sent_msg.message_id, 60))
+                    
+                    if status_msg:
+                        try: await status_msg.delete()
+                        except Exception: pass
+                    return
+
+    # ACTIVE MOVEMENT LOGIC
+    raw_origin = (llm_text_data.get("origin_location") or "").strip()
+    raw_dest = (llm_text_data.get("destination_location") or "").strip()
+
+    origin_loc = raw_origin if raw_origin and raw_origin not in ["None", "null", "", "INFER_FROM_HISTORY"] else "INFER_FROM_HISTORY"
+    dest_loc = raw_dest if raw_dest and raw_dest not in ["None", "null", "", "INFER_FROM_HISTORY"] else "INFER_FROM_HISTORY"
+    load_status = llm_text_data.get("load_status") or "LOADED"
+
+    output_text = ""
+    leg_id = None
+    is_closed = False
+
     async with p.acquire() as conn:
         async with conn.cursor() as cur:
-            if st == "WAITING_FIXDEP":
-                pts = utxt.split(" to ")
-                await cur.execute("UPDATE messages SET origin=%s, destination=%s WHERE id=%s", (pts[0].strip(), pts[1].strip() if len(pts)>1 else "Unknown", rid))
-            elif st == "WAITING_FIXARR":
-                await cur.execute("UPDATE messages SET arrival_time=%s WHERE id=%s", (utxt, rid))
-            elif st == "WAITING_MANBOL":
-                pts = utxt.split()
-                if len(pts) >= 4:
-                    bol, trail = pts[0], pts[1]
-                    s_sign = 1 if pts[2].lower() == 'true' else 0
-                    r_sign = 1 if pts[3].lower() == 'true' else 0
-                    await cur.execute("UPDATE messages SET bol_number=%s, trailer_number=%s, shipper_signed=%s, receiver_signed=%s, status='completed' WHERE id=%s", (bol, trail, s_sign, r_sign, rid))
-    context.user_data.clear()
-    await update.message.reply_text("✨ Parameters saved successfully!")
+
+            if origin_loc in ["INFER_FROM_HISTORY", "Origin", "UNKNOWN"]:
+                completed_leg_sql = """
+                    SELECT destination_location FROM shuttle_legs 
+                    WHERE user_id = %s AND destination_location NOT IN ('Destination', 'UNKNOWN', 'INFER_FROM_HISTORY', '')
+                    ORDER BY id DESC LIMIT 1;
+                """
+                await cur.execute(completed_leg_sql, (did,))
+                last_completed = await cur.fetchone()
+                origin_loc = last_completed[0] if (last_completed and last_completed[0]) else "Origin"
+
+            if dest_loc in ["INFER_FROM_HISTORY", "Destination", "UNKNOWN"]:
+                active_leg_sql = """
+                    SELECT destination_location FROM shuttle_legs 
+                    WHERE user_id = %s AND leg_status = 'IN_TRANSIT' AND destination_location NOT IN ('Destination', 'UNKNOWN', '')
+                    ORDER BY id DESC LIMIT 1;
+                """
+                await cur.execute(active_leg_sql, (did,))
+                active_leg = await cur.fetchone()
+
+                if active_leg and active_leg[0] and active_leg[0] != origin_loc:
+                    dest_loc = active_leg[0]
+                else:
+                    prev_origin_sql = """
+                        SELECT origin_location FROM shuttle_legs 
+                        WHERE user_id = %s AND origin_location NOT IN ('Origin', 'UNKNOWN', '', %s)
+                        ORDER BY id DESC LIMIT 1;
+                    """
+                    await cur.execute(prev_origin_sql, (did, origin_loc))
+                    prev_leg = await cur.fetchone()
+                    dest_loc = prev_leg[0] if (prev_leg and prev_leg[0]) else "Destination"
+
+            if origin_loc == dest_loc and origin_loc not in ["Origin", "Destination", "UNKNOWN"]:
+                dest_loc = "Destination"
+            
+            # Match existing leg
+            if bol_num:
+                await cur.execute("SELECT id FROM shuttle_legs WHERE bol_number = %s ORDER BY id DESC LIMIT 1;", (bol_num,))
+                match = await cur.fetchone()
+                if match:
+                    leg_id = match[0]
+
+            if not leg_id and trailer_num != "UNKNOWN":
+                await cur.execute(
+                    "SELECT id FROM shuttle_legs WHERE user_id = %s AND trailer_number = %s AND leg_status = 'IN_TRANSIT' ORDER BY id DESC LIMIT 1;",
+                    (did, trailer_num)
+                )
+                match = await cur.fetchone()
+                if match:
+                    leg_id = match[0]
+
+            if not leg_id and trailer_num == "UNKNOWN":
+                await cur.execute(
+                    "SELECT id, trailer_number FROM shuttle_legs WHERE user_id = %s AND leg_status = 'IN_TRANSIT' ORDER BY id DESC LIMIT 1;",
+                    (did,)
+                )
+                match = await cur.fetchone()
+                if match:
+                    leg_id = match[0]
+                    if match[1] and match[1] != "UNKNOWN":
+                        trailer_num = match[1]
+
+            # RECONCILE EXISTING LEG
+            if leg_id:
+                is_receiver_signed = ext.get("receiver_signed") or False
+                is_closed = is_receiver_signed
+                
+                update_sql = """
+                    UPDATE shuttle_legs AS sl
+                    SET sl.bol_number = COALESCE(%s, sl.bol_number),
+                        sl.bol_image = COALESCE(%s, sl.bol_image),
+                        sl.shipper_signed = COALESCE(%s, sl.shipper_signed),
+                        sl.receiver_signed = COALESCE(%s, sl.receiver_signed),
+                        sl.arrival_time = IF(%s = TRUE, %s, sl.arrival_time),
+                        sl.leg_status = IF(%s = TRUE, 'COMPLETED', sl.leg_status)
+                    WHERE sl.id = %s;
+                """
+                await cur.execute(update_sql, (
+                    bol_num,
+                    primary_image_blob,
+                    ext.get("shipper_signed"),
+                    is_receiver_signed,
+                    is_receiver_signed,
+                    msg_timestamp,
+                    is_receiver_signed,
+                    leg_id
+                ))
+                await conn.commit()
+
+                status_label = "✅ Closed & Reconciled (Receiver Signed)" if is_receiver_signed else "⚠️ Action Required / Open Leg"
+                output_text = (
+                    f"📑 **{status_label}**\n"
+                    f"👤 Driver: {user_name}\n"
+                    f"💬 Group: `{group_title}` (Msg ID: `{orig_msg_id}`)\n"
+                    f"🚛 Trailer: `{trailer_num}` | BOL: `{bol_num or 'Attached'}`\n"
+                    f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
+                    f"⏱️ Timestamp: `{msg_timestamp}`"
+                )
+
+            # --- INSIDE process_photo_batch (bot/handlers.py) ---
+
+            # NEW OUTBOUND DEPARTURE LEG
+            else:
+                insert_sql = """
+                    INSERT INTO shuttle_legs (
+                        user_id, trailer_number, bol_number, bol_image, shipper_signed, receiver_signed,
+                        load_status, origin_location, destination_location, departure_time, leg_status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT');
+                """
+                await cur.execute(insert_sql, (
+                    did, 
+                    trailer_num, 
+                    bol_num, 
+                    primary_image_blob, 
+                    ext.get("shipper_signed"), 
+                    ext.get("receiver_signed"),
+                    load_status,
+                    origin_loc, 
+                    dest_loc, 
+                    msg_timestamp
+                ))
+                await conn.commit()
+                leg_id = cur.lastrowid
+
+                # CHECK IF DATA IS CLEAN AND COMPLETE
+                has_valid_locations = (
+                    origin_loc not in ["Origin", "UNKNOWN", "INFER_FROM_HISTORY", ""] and 
+                    dest_loc not in ["Destination", "UNKNOWN", "INFER_FROM_HISTORY", ""]
+                )
+                has_valid_trailer = trailer_num not in ["UNKNOWN", "None", "null", ""]
+
+                # Auto-close/auto-delete message if all movement data was captured cleanly
+                is_closed = (has_valid_locations and has_valid_trailer)
+
+                output_text = (
+                    f"📸 **Case #1: Outbound Leg Logged**\n"
+                    f"👤 Driver: {user_name}\n"
+                    f"💬 Group: `{group_title}` (Msg ID: `{orig_msg_id}`)\n"
+                    f"🚛 Trailer: `{trailer_num}` | BOL: `{bol_num or 'N/A'}`\n"
+                    f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
+                    f"⏱️ Departure: `{msg_timestamp}`"
+                )
+
+    if status_msg:
+        try: await status_msg.delete()
+        except Exception: pass
+
+    target_chat_id = DISPATCH_CHANNEL_ID if DISPATCH_CHANNEL_ID else update.effective_chat.id
+
+    try:
+        keyboard = None if is_closed else get_manual_reconcile_keyboard(leg_id, orig_chat_id, orig_msg_id)
+
+        sent_msg = await context.bot.send_message(
+            chat_id=target_chat_id, 
+            text=output_text, 
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
+        # Store dispatch_msg_id in database for dynamic live edits
+        async with p.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE shuttle_legs SET dispatch_msg_id = %s WHERE id = %s;", (sent_msg.message_id, leg_id))
+                await conn.commit()
+
+        if is_closed:
+            asyncio.create_task(delete_msg_after_delay(context.bot, target_chat_id, sent_msg.message_id, 60))
+
+    except Exception as e:
+        logger.error(f"Failed to post log to target {target_chat_id}: {e}")

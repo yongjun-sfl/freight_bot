@@ -1,9 +1,6 @@
-
 services:
-  # 🗄️ Database Layer (Accessible Externally)
   mysql_db:
     image: mysql:8.0
-    container_name: mysql_db
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -11,43 +8,26 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
-      - "3306:3306" # <-- MOUNTS DATABASE PORT DIRECTLY TO TARGET ENVIRONMENT
-    volumes:
-      - ./mysql_data:/var/lib/mysql
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - "3306:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_pass"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
 
-  # 🤖 Local AI Layer
-  ollama_ai:
-    image: ollama/ollama:latest
-    container_name: ollama_ai
-    restart: always
-    volumes:
-      - ollama_models:/root/.ollama
-
-  # 🐍 Python Telegram Bot Layer
   telegram_bot:
     build: ./bot
-    container_name: telegram_bot
     restart: always
-    environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - DB_HOST=mysql_db
-      - DB_USER=${MYSQL_USER}
-      - DB_PASSWORD=${MYSQL_PASSWORD}
-      - DB_NAME=${MYSQL_DATABASE}
-      - OLLAMA_HOST=http://ollama_ai:11434
-      - ADMIN_IDS=${ADMIN_IDS}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       mysql_db:
         condition: service_healthy
-      ollama_ai:
-        condition: service_started
-
-volumes:
-  ollama_models:
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MYSQL_HOST=mysql_db
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - DISPATCH_CHANNEL_ID=8756175976

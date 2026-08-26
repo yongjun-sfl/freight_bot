@@ -8,6 +8,8 @@ from pdf2image import convert_from_bytes
 from google import genai
 from google.genai import types
 
+from config import TABLE_LOCATION_CODES
+
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -24,7 +26,11 @@ async def refresh_location_cache(pool):
     """Loads canonical location codes and aliases from MySQL into memory."""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT canonical_code, aliases FROM location_codes WHERE is_active = TRUE;")
+            await cur.execute(
+                f"""SELECT canonical_code, aliases 
+                      FROM {TABLE_LOCATION_CODES} 
+                     WHERE is_active = TRUE;"""
+            )
             rows = await cur.fetchall()
             
             codes = []
@@ -32,7 +38,7 @@ async def refresh_location_cache(pool):
             for code, aliases in rows:
                 code_upper = code.strip().upper()
                 codes.append(code_upper)
-                alias_map[code_upper] = code_upper  # Self-map
+                alias_map[code_upper] = code_upper
                 
                 if aliases:
                     for alias in aliases.split(','):
@@ -46,7 +52,7 @@ async def refresh_location_cache(pool):
 
 
 def normalize_location(raw_loc: str) -> str:
-    """Resolves driver text or alias directly to the canonical MySQL location code."""
+    """Resolves driver text or alias directly to canonical MySQL location code."""
     if not raw_loc or raw_loc in ["UNKNOWN", "MISSING_ORIGIN", "MISSING_DEST", "NONE", "NULL"]:
         return "UNKNOWN"
     
@@ -76,7 +82,7 @@ def compress_image(image_bytes: bytes, max_dim: int = 1800) -> bytes:
         img.save(out, format="JPEG", quality=90)
         return out.getvalue()
     except Exception as e:
-        logger.warning(f"Image compression failed, fallback to raw: {e}")
+        logger.warning(f"Image compression failed: {e}")
         return image_bytes
 
 
@@ -109,62 +115,70 @@ def parse_text_with_llm(text: str) -> dict:
         location_rule = f"KNOWN VALID CODES: [{known_locations}]"
     else:
         location_rule = "KNOWN VALID CODES: [Extract short alphanumeric location names dynamically]"
-
-    prompt = f"""You are an expert logistics dispatch parser for short-haul shuttle operations.
-Analyze this driver message (English or Korean):
-"{text}"
-
-Task: Extract state transition parameters dynamically.
+    
+    prompt = f"""You are an expert logistics dispatch parser for short-haul inter-facility shuttle operations.
+Analyze driver message: "{text}"
 
 {location_rule}
 
-RULES:
+DRIVER SLANG & PATTERN DICTIONARY:
+- BOBTAIL SLANG: "bobtail", "bt", "b/t", "no trailer", "single tractor", "tractor only", "bob tail"
+- EMPTY SLANG: "empty", "mt", "emp", "e/t"
+- DEPARTURE SLANG: "heading to", "leaving", "outbound", "departed", "going to", "200 to e2f", "200 -> e2f"
+- ARRIVAL SLANG: "arrived", "at door", "in yard", "gate", "here at", "in dock", "reached"
+
+CASE CLASSIFICATION RULES:
+1. "CASE_1_ORIGIN_DEPARTURE": Driver is reporting outbound movement, leaving a facility, or traveling between facilities (e.g., "leaving 200", "200 to E2F", "heading to E2F bt").
+2. "CASE_2_DESTINATION_ARRIVAL": Driver is reporting arrival at a facility, gate, door, or yard (e.g., "arrived E2F", "at E2F door 45", "in yard at E2F").
+3. "CASE_HISTORICAL_BOL_UPDATE": Document upload or message specifically referencing late paperwork, delivery receipts, or historical BOLs.
+4. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+
+EXTRACTION & NORMALIZATION RULES:
 1. Location Extraction:
    - Match facility mentions to the KNOWN VALID CODES provided whenever possible.
    - If a driver uses a shorthand code (e.g., "200" for "200F"), extract the raw shorthand code (e.g., "200").
-   - Extract origin and destination in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
+   - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
 
 2. Door Numbers vs Locations:
-   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") belong in door_number (e.g., "#47" -> door_number="47").
+   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") belong in door_number (e.g., "#47" or "door 47" -> door_number="47"). Do not put door identifiers into location fields.
 
-3. Classification Rules:
-   - "CASE_1_ORIGIN_DEPARTURE": Outbound departures, pickups, or movements between distinct facility codes.
-   - "CASE_2_DESTINATION_ARRIVAL": In-facility arrivals, dock door assignments, live unloading/loading, or same-site dock spot moves.
-   - "CASE_HISTORICAL_BOL_UPDATE": Document uploads with explicit text context regarding paper BOLs, signed receipts, or historical paperwork.
-   - "NONE_WORK_RELATED": Casual chat or non-operational messages.
+3. Load Status & Trailer Details:
+   - Set load_status to "BOBTAIL", "EMPTY", or "LOADED" based on text or slang terms above.
+   - Extract trailer_number (e.g., "77344").
 
-Return raw JSON matching this schema ONLY:
+Return raw JSON ONLY:
 {{
   "case_type": "CASE_1_ORIGIN_DEPARTURE" | "CASE_2_DESTINATION_ARRIVAL" | "CASE_HISTORICAL_BOL_UPDATE" | "NONE_WORK_RELATED",
   "origin_location": string or null,
   "destination_location": string or null,
   "trailer_number": string or null,
   "door_number": string or null,
-  "action": "UNLOAD_COMPLETED" | "LIVE_UNLOAD" | "LIVE_LOAD" | "DROP" | "HOOK" | null,
-  "load_status": "LOADED" | "EMPTY" | "BOBTAIL"
+  "action": "LIVE_UNLOAD" | "DROP_DOCK" | "DROP_YARD" | "DROP_DOOR" | "BOBTAIL_ARRIVE" | null,
+  "load_status": "LOADED" | "EMPTY" | "BOBTAIL" | null
 }}"""
 
     try:
         response = call_gemini_with_retry(
             contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0
+            )
         )
         return json.loads(response.text)
     except Exception as e:
-        logger.error(f"Failed to parse text with Gemini LLM: {e}")
+        logger.error(f"Failed to parse text: {e}")
         return {"case_type": "NONE_WORK_RELATED"}
 
 
 def extract_bol_locally(files: list[bytes]) -> dict:
-    """Scans upload batch with short-circuiting to minimize vision API usage."""
     if not files or not client:
         return {}
 
     processed_images = []
     for file_bytes in files:
         if file_bytes.startswith(b"%PDF"):
-            pdf_imgs = convert_pdf_to_images(file_bytes)
-            processed_images.extend(pdf_imgs)
+            processed_images.extend(convert_pdf_to_images(file_bytes))
         else:
             processed_images.append(file_bytes)
 
@@ -175,15 +189,19 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 
 1. "is_paper_document": Set to True ONLY if this image is a paper document (Bill of Lading, shipping paper, manifest, reservation instruction sheet, signature paper). Set to False if it is a photo of a trailer, truck, container body, or license plate.
 2. "bol_number": Read the entire document semantically. Identify the primary tracking, BOL, delivery, reservation, or manifest number.
-   - Look explicitly for terms like: "Reservation No.", "Reservation #", "BOL", "Bill of Lading", "B/L", "Delivery #", "Shipment #", "DO #", "Ref #", "Tracking #".
-3. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
-4. "shipper_signed": Set to True if there is a signature, initials, or stamp in the origin/shipper/carrier section.
-5. "receiver_signed": Set to True if there is a signature, stamp, checkmark, or handwritten note in the delivery/consignee section.
+   - Look explicitly for terms like: "Reservation No.", "Reservation #", "Res #", "BOL", "Bill of Lading", "B/L", "Delivery #", "Shipment #", "DO #", "Ref #", "Tracking #".
+3. "document_type":
+   - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
+   - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
+4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
+5. "shipper_signed": Set to True if there is a signature, initials, or stamp in the origin/shipper/carrier section.
+6. "receiver_signed": Set to True if there is a signature, stamp, checkmark, or handwritten note in the delivery/consignee section.
 
-Return raw JSON matching this schema ONLY:
+Return raw JSON ONLY:
 {
   "is_paper_document": boolean,
   "bol_number": string or null,
+  "document_type": "FG" | "RM" | "UNKNOWN",
   "trailer_number": string or null,
   "shipper_signed": boolean,
   "receiver_signed": boolean
@@ -191,6 +209,7 @@ Return raw JSON matching this schema ONLY:
 
     result = {
         "bol_number": None,
+        "document_type": "UNKNOWN",
         "trailer_number": None,
         "shipper_signed": False,
         "receiver_signed": False,
@@ -203,26 +222,27 @@ Return raw JSON matching this schema ONLY:
         try:
             response = call_gemini_with_retry(
                 contents=[
-                    dynamic_vision_prompt, 
+                    dynamic_vision_prompt,
                     types.Part.from_bytes(data=compressed, mime_type="image/jpeg")
                 ],
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json", 
+                    response_mime_type="application/json",
                     temperature=0.0
                 )
             )
             data = json.loads(response.text)
-            logger.info(f"Vision OCR scan image #{idx+1}: {data}")
 
             is_doc = data.get("is_paper_document", False)
             if is_doc:
                 result["is_paper_document"] = True
-
-            if is_doc and not result["bol_image_blob"]:
-                result["bol_image_blob"] = img_bytes
+                if not result["bol_image_blob"]:
+                    result["bol_image_blob"] = img_bytes
 
             if data.get("bol_number") and not result["bol_number"]:
                 result["bol_number"] = data["bol_number"]
+
+            if data.get("document_type") and data["document_type"] != "UNKNOWN":
+                result["document_type"] = data["document_type"]
 
             if data.get("trailer_number") and not result["trailer_number"]:
                 result["trailer_number"] = data["trailer_number"]
@@ -239,7 +259,7 @@ Return raw JSON matching this schema ONLY:
                 break
 
         except Exception as e:
-            logger.warning(f"Failed dynamic OCR scan on image {idx+1}: {e}")
+            logger.warning(f"Vision OCR scan error on image {idx+1}: {e}")
 
     return result
 
@@ -252,6 +272,7 @@ async def prepare_text_intent(text: str) -> dict:
         "text_trailer": llm_parsed.get("trailer_number"),
         "ocr_trailer": None,
         "bol_number": None,
+        "document_type": "UNKNOWN",
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
         "door_number": llm_parsed.get("door_number"),
@@ -267,7 +288,6 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
     llm_parsed = parse_text_with_llm(caption_text) if caption_text and caption_text.strip() else {}
     ocr_data = await loop.run_in_executor(None, extract_bol_locally, images)
 
-    # Route explicitly to CASE_AUTO_RESOLVE if an image is uploaded without text
     if caption_text and caption_text.strip():
         case_type = llm_parsed.get("case_type", "CASE_1_ORIGIN_DEPARTURE")
     else:
@@ -279,6 +299,7 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "text_trailer": llm_parsed.get("trailer_number"),
         "ocr_trailer": ocr_data.get("trailer_number"),
         "bol_number": ocr_data.get("bol_number"),
+        "document_type": ocr_data.get("document_type", "UNKNOWN"),
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
         "door_number": llm_parsed.get("door_number"),

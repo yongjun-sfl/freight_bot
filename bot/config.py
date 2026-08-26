@@ -6,4 +6,4 @@ TABLE_LOCATION_CODES = "location_codes"
 TABLE_SHUTTLE_LEGS = "shuttle_legs"
 
 # INDEX NAMES
-INDEX_UNIQUE_BOL = "idx_unique_bol_number"
+INDEX_UNIQUE_BOL = "idx_unique_bol_number" 

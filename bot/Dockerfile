@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir python-telegram-bot==20.* aiomysql pydantic googl
 
 COPY . .
 
-CMD ["python", "main.py"]
+CMD ["python", "main.py"] 

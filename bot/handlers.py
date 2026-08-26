@@ -304,7 +304,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         ORDER BY id DESC 
                     LIMIT 1;""",
                     (bol_num, driver_id)
-                )
+                ) 
                 await conn.commit()
 
         resolved_text = (

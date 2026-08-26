@@ -92,7 +92,7 @@ async def init_db_pool():
                     origin_location VARCHAR(128) DEFAULT 'Origin',
                     destination_location VARCHAR(128) DEFAULT 'Destination',
                     departure_time DATETIME DEFAULT NULL,
-                    arrival_time DATETIME DEFAULT NULL,
+                    arrival_time DATETIME DEFAULT NULL, 
                     arrival_action VARCHAR(64) DEFAULT NULL,
                     dock_number VARCHAR(32) DEFAULT NULL,
                     shipper_signed TINYINT(1) DEFAULT 0,

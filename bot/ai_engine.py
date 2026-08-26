@@ -293,7 +293,7 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
     else:
         case_type = "CASE_AUTO_RESOLVE" if ocr_data.get("is_paper_document") else "NONE_WORK_RELATED"
 
-    return {
+    return { 
         "case_type": case_type,
         "raw_text": caption_text or "",
         "text_trailer": llm_parsed.get("trailer_number"),

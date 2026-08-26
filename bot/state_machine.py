@@ -451,7 +451,7 @@ async def commit_trip_leg(
 
                     return {
                         "is_clean": False,
-                        "leg_id": None,
+                        "leg_id": None, 
                         "card_text": (
                             f"⚠️ **MANUAL RECONCILE: No Open Leg Found**\n"
                             f"👤 Driver: {user_name}\n"

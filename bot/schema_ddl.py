@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     arrival_time DATETIME DEFAULT NULL,
     arrival_action VARCHAR(64) DEFAULT NULL,
     dock_number VARCHAR(32) DEFAULT NULL,
+    origin_dock VARCHAR(32) DEFAULT NULL,
+    destination_dock VARCHAR(32) DEFAULT NULL,
     shipper_signed TINYINT(1) DEFAULT 0,
     receiver_signed TINYINT(1) DEFAULT 0,
     is_positioning_leg TINYINT(1) DEFAULT 0,
@@ -55,14 +57,41 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
 
 ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS)
 
+# Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
+# is a no-op against an existing database, so these must be applied separately
+# and idempotently or production will never receive them.
+ADDITIVE_COLUMNS = (
+    ("origin_dock",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN origin_dock VARCHAR(32) DEFAULT NULL AFTER dock_number"),
+    ("destination_dock",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN destination_dock VARCHAR(32) DEFAULT NULL AFTER origin_dock"),
+)
+
 # Tables the test harness is allowed to wipe between cases, child-first.
 TRUNCATABLE = (TABLE_SHUTTLE_LEGS, TABLE_LOCATION_CODES, TABLE_DRIVERS)
 
 
 async def apply_schema(cur, db_name: str, logger=None):
-    """Create every table and ensure the unique BOL index exists."""
+    """Create every table, add late columns, ensure the unique BOL index."""
     for ddl in ALL_TABLES:
         await cur.execute(ddl)
+
+    for column, alter in ADDITIVE_COLUMNS:
+        await cur.execute(
+            """SELECT COUNT(*)
+                  FROM information_schema.columns
+                 WHERE table_schema = %s
+                   AND table_name = %s
+                   AND column_name = %s;""",
+            (db_name, TABLE_SHUTTLE_LEGS, column),
+        )
+        (column_exists,) = await cur.fetchone()
+        if not column_exists:
+            await cur.execute(alter)
+            if logger:
+                logger.info(f"Added column '{column}' to {TABLE_SHUTTLE_LEGS}.")
 
     await cur.execute(
         f"""SELECT COUNT(*)

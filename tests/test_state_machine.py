@@ -324,13 +324,6 @@ async def test_arrival_without_active_leg_is_a_noop(pool):
     assert await all_legs(pool) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="state_machine.py:330 passes `1 if receiver_signed else 0` into "
-           "COALESCE(%s, receiver_signed). 0 is not NULL, so COALESCE is defeated "
-           "and an arrival with no detected signature wipes a POD captured earlier. "
-           "Lines 381 and 444 pass None here and are correct.",
-)
 async def test_arrival_preserves_existing_receiver_signature(pool):
     leg_id = await insert_leg(
         pool, leg_status="IN_TRANSIT", load_status="LOADED", receiver_signed=1,

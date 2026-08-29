@@ -327,7 +327,10 @@ async def commit_trip_leg(
                                 msg_timestamp, 
                                 resolved_action, 
                                 door_num, 
-                                1 if receiver_signed else 0, 
+                                # None, not 0: COALESCE must fall through to the
+                                # stored value when no signature was detected,
+                                # otherwise an arrival wipes a POD captured earlier.
+                                1 if receiver_signed else None, 
                                 target_status, 
                                 leg_id
                             )

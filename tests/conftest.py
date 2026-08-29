@@ -143,6 +143,9 @@ LEG_DEFAULTS = {
     "receiver_signed": 0,
     "is_bobtail": 0,
     "leg_status": "IN_TRANSIT",
+    "paperwork_time": None,
+    "arrival_at_dock": 0,
+    "dwell_alert_level": 0,
 }
 
 

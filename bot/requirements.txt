@@ -7,7 +7,8 @@
 # release compatible with PTB 20.x -- and the version pip was already
 # resolving to silently when google-genai was unpinned.
 # Moving to google-genai 2.x requires upgrading PTB to 22.x first.
-python-telegram-bot==20.8
+# [job-queue] pulls APScheduler, needed for the dwell monitor.
+python-telegram-bot[job-queue]==20.8
 google-genai==1.2.0
 aiomysql==0.3.2
 Pillow==12.3.0

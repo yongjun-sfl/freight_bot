@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ai_engine import prepare_text_intent, prepare_image_intent, refresh_location_cache
+from config import TABLE_DRIVERS
 from routes import refresh_route_cache
 from state_machine import commit_trip_leg
 
@@ -74,6 +75,57 @@ async def _send_dispatch_card(context: ContextTypes.DEFAULT_TYPE,
     )
 
 
+# Sent at most once a week per driver. These are long-serving drivers, so the
+# ask is framed around what accurate timing gets THEM -- evidence of how long
+# the client's warehouse keeps them waiting -- rather than as a correction.
+NUDGE_INTERVAL_DAYS = 7
+
+GATE_REPORT_NUDGE = (
+    "Thanks {name} 🙏\n\n"
+    "One small thing when you get a chance — if you can send "
+    "\"arrived {facility}\" as soon as you're through the gate, before you pull "
+    "to a door, it lets us show the client exactly how long you're kept waiting "
+    "inside. Right now that waiting time isn't being counted.\n\n"
+    "Nothing else to change. Appreciate you."
+)
+
+
+async def _maybe_nudge_gate_report(context, pool, driver_id, driver_name,
+                                   facility, chat_id, reply_to):
+    """Ask, gently and rarely, for arrival to be reported at the gate.
+
+    Only fires when the driver named a dock on arrival, which means they had
+    already pulled to a door and the dwell we recorded understates their time.
+    """
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""SELECT last_nudge_at IS NULL
+                        OR last_nudge_at < NOW() - INTERVAL %s DAY
+                      FROM {TABLE_DRIVERS}
+                     WHERE user_id = %s;""",
+                (NUDGE_INTERVAL_DAYS, driver_id),
+            )
+            row = await cur.fetchone()
+            if not row or not row[0]:
+                return
+            await cur.execute(
+                f"UPDATE {TABLE_DRIVERS} SET last_nudge_at = NOW() WHERE user_id = %s;",
+                (driver_id,),
+            )
+
+    first_name = (driver_name or "").split()[0] if driver_name else "driver"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=GATE_REPORT_NUDGE.format(name=first_name,
+                                          facility=facility or "the yard"),
+            reply_to_message_id=reply_to,
+        )
+    except Exception as e:
+        logger.warning(f"Could not send gate-report nudge to {driver_id}: {e}")
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or update.message.text.startswith("/"):
         return
@@ -106,6 +158,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if res.get("card_text"):
             await _send_dispatch_card(context, chat.id, res["card_text"])
+
+        if (intent.get("case_type") == "CASE_2_DESTINATION_ARRIVAL"
+                and intent.get("door_number")):
+            await _maybe_nudge_gate_report(
+                context, pool, driver_id, user_name,
+                intent.get("destination_location"),
+                chat.id, update.message.message_id,
+            )
 
     except Exception as e:
         logger.error(f"Error processing text from {driver_id}: {e}", exc_info=True)

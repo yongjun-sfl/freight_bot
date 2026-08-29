@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_DRIVERS} (
     user_id BIGINT PRIMARY KEY,
     driver_name VARCHAR(128) NOT NULL,
     home_yard ENUM('YARD_200', 'SDS_WH') DEFAULT 'YARD_200',
+    last_nudge_at DATETIME DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
@@ -48,6 +49,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     destination_location VARCHAR(128) DEFAULT 'Destination',
     departure_time DATETIME DEFAULT NULL,
     arrival_time DATETIME DEFAULT NULL,
+    paperwork_time DATETIME DEFAULT NULL,
+    arrival_at_dock TINYINT(1) DEFAULT 0,
+    dwell_alert_level INT DEFAULT 0,
     arrival_action VARCHAR(64) DEFAULT NULL,
     dock_number VARCHAR(32) DEFAULT NULL,
     origin_dock VARCHAR(32) DEFAULT NULL,
@@ -116,9 +120,24 @@ ADDITIVE_COLUMNS = (
     ("route_code",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN route_code VARCHAR(32) DEFAULT NULL AFTER round_number"),
+    ("paperwork_time",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN paperwork_time DATETIME DEFAULT NULL AFTER arrival_time"),
+    ("arrival_at_dock",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN arrival_at_dock TINYINT(1) DEFAULT 0 AFTER paperwork_time"),
+    ("dwell_alert_level",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN dwell_alert_level INT DEFAULT 0 AFTER arrival_at_dock"),
 )
 
 # Same shape, for location_codes.
+ADDITIVE_DRIVER_COLUMNS = (
+    ("last_nudge_at",
+     f"ALTER TABLE {TABLE_DRIVERS} "
+     "ADD COLUMN last_nudge_at DATETIME DEFAULT NULL"),
+)
+
 ADDITIVE_LOCATION_COLUMNS = (
     ("site_code",
      f"ALTER TABLE {TABLE_LOCATION_CODES} "
@@ -135,7 +154,8 @@ async def apply_schema(cur, db_name: str, logger=None):
         await cur.execute(ddl)
 
     for table, columns in ((TABLE_SHUTTLE_LEGS, ADDITIVE_COLUMNS),
-                           (TABLE_LOCATION_CODES, ADDITIVE_LOCATION_COLUMNS)):
+                           (TABLE_LOCATION_CODES, ADDITIVE_LOCATION_COLUMNS),
+                           (TABLE_DRIVERS, ADDITIVE_DRIVER_COLUMNS)):
         for column, alter in columns:
             await cur.execute(
                 """SELECT COUNT(*)

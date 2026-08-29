@@ -259,9 +259,12 @@ async def commit_trip_leg(
                                    SET bol_number = COALESCE(%s, bol_number),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
                                        bol_image = COALESCE(%s, bol_image),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        trailer_number = IF(%s != 'UNKNOWN', %s, trailer_number)
                                  WHERE id = %s;""",
-                            (bol_number, document_type, document_type, primary_image_blob, display_trailer, display_trailer, leg_id)
+                            (bol_number, document_type, document_type, primary_image_blob,
+                             msg_timestamp if primary_image_blob else None,
+                             display_trailer, display_trailer, leg_id)
                         )
                         await conn.commit()
                         logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
@@ -480,6 +483,10 @@ async def commit_trip_leg(
                             f"""UPDATE {TABLE_SHUTTLE_LEGS} 
                                    SET arrival_time = COALESCE(arrival_time, %s),
                                        arrival_action = %s,
+                                       -- A dock named on arrival means the driver
+                                       -- had already pulled to a door, so real time
+                                       -- on site is longer than the recorded dwell.
+                                       arrival_at_dock = %s,
                                        dock_number = COALESCE(%s, dock_number),
                                        receiver_signed = COALESCE(%s, receiver_signed),
                                        leg_status = %s
@@ -487,6 +494,7 @@ async def commit_trip_leg(
                             (
                                 msg_timestamp, 
                                 resolved_action, 
+                                1 if door_num else 0, 
                                 door_num, 
                                 # None, not 0: COALESCE must fall through to the
                                 # stored value when no signature was detected,
@@ -535,12 +543,14 @@ async def commit_trip_leg(
                             f"""UPDATE {TABLE_SHUTTLE_LEGS} 
                                    SET bol_image = COALESCE(%s, bol_image),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        shipper_signed = COALESCE(%s, shipper_signed),
                                        receiver_signed = COALESCE(%s, receiver_signed)
                                  WHERE id = %s;""",
                             (
                                 primary_image_blob,
                                 document_type, document_type,
+                                msg_timestamp if primary_image_blob else None,
                                 1 if shipper_signed else None,
                                 1 if receiver_signed else None,
                                 leg_id
@@ -597,6 +607,7 @@ async def commit_trip_leg(
                                    SET bol_number = COALESCE(bol_number, %s),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
                                        bol_image = COALESCE(%s, bol_image),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        shipper_signed = COALESCE(%s, shipper_signed),
                                        receiver_signed = COALESCE(%s, receiver_signed)
                                  WHERE id = %s;""",
@@ -604,6 +615,7 @@ async def commit_trip_leg(
                                 bol_number,
                                 document_type, document_type,
                                 primary_image_blob,
+                                msg_timestamp if primary_image_blob else None,
                                 1 if shipper_signed else None,
                                 1 if receiver_signed else None,
                                 leg_id

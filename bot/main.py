@@ -13,6 +13,7 @@ from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
 from routes import refresh_route_cache, seed_default_routes
 from seed_network import seed_network
+from dwell import sweep_dwells
 from handlers import (
     handle_text_message,
     handle_photo_message,
@@ -71,11 +72,47 @@ async def init_db_pool():
     return pool
 
 
+DWELL_SWEEP_SECONDS = 120
+
+
+async def _dwell_job(context):
+    """Raise a card as each driver crosses a dwell threshold, while it matters."""
+    pool = context.bot_data.get("db_pool")
+    if not pool:
+        return
+    channel = os.getenv("DISPATCH_ALERT_CHANNEL_ID")
+    if not channel:
+        return
+
+    async def send_card(text):
+        await context.bot.send_message(chat_id=channel, text=text,
+                                       parse_mode="Markdown")
+
+    try:
+        sent = await sweep_dwells(pool, send_card)
+        if sent:
+            logger.info(f"Dwell sweep raised {sent} card(s).")
+    except Exception as e:
+        logger.error(f"Dwell sweep failed: {e}", exc_info=True)
+
+
 async def on_startup(application: Application):
     db_pool = await init_db_pool()
     application.bot_data["db_pool"] = db_pool
     await refresh_location_cache(db_pool)
     await refresh_route_cache(db_pool)
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            _dwell_job, interval=DWELL_SWEEP_SECONDS, first=DWELL_SWEEP_SECONDS
+        )
+        logger.info(f"Dwell monitor running every {DWELL_SWEEP_SECONDS}s.")
+    else:
+        logger.warning(
+            "JobQueue unavailable; dwell alerts disabled. "
+            "Install python-telegram-bot[job-queue]."
+        )
+
     logger.info("🚀 AI Dispatch Engine is live.")
 
 

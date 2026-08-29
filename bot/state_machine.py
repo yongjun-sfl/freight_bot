@@ -139,6 +139,76 @@ async def commit_trip_leg(
                 existing_bol = await cur.fetchone()
                 return existing_bol[0] if existing_bol else None
 
+            async def resolve_round_number(departing_from: str) -> int:
+                """Which round a new departure belongs to.
+
+                A round opens when the driver leaves a facility and closes when
+                they arrive back at that same facility, so departing from the
+                facility that anchors the current round means the round has
+                completed and a new one begins. Self-anchoring on the departure
+                facility, rather than a fixed list of depots, is what keeps the
+                200 -> E2F -> SDS -> 200 circuit intact: SDS is itself a depot,
+                but it is not this round's anchor, so passing through it does
+                not close the round.
+                """
+                await cur.execute(
+                    f"""SELECT round_number 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND is_positioning_leg = 0 
+                           AND round_number IS NOT NULL 
+                      ORDER BY id DESC 
+                         LIMIT 1;""",
+                    (did,)
+                )
+                row = await cur.fetchone()
+                current = row[0] if row else None
+
+                if current is not None:
+                    if departing_from == "UNKNOWN":
+                        # Cannot tell where they are; keep the round intact
+                        # rather than fragment it on a parsing gap.
+                        return current
+
+                    await cur.execute(
+                        f"""SELECT origin_location 
+                              FROM {TABLE_SHUTTLE_LEGS} 
+                             WHERE user_id = %s 
+                               AND round_number = %s 
+                               AND is_positioning_leg = 0 
+                          ORDER BY id ASC 
+                             LIMIT 1;""",
+                        (did, current)
+                    )
+                    anchor_row = await cur.fetchone()
+                    anchor = anchor_row[0] if anchor_row else None
+                    if anchor and departing_from != anchor:
+                        return current  # still out on the circuit
+
+                await cur.execute(
+                    f"""SELECT COALESCE(MAX(round_number), 0) 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND DATE(departure_time) = CURRENT_DATE();""",
+                    (did,)
+                )
+                (highest_today,) = await cur.fetchone()
+                return (highest_today or 0) + 1
+
+            async def current_round_number():
+                """The round a within-facility move happened during."""
+                await cur.execute(
+                    f"""SELECT round_number 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND round_number IS NOT NULL 
+                      ORDER BY id DESC 
+                         LIMIT 1;""",
+                    (did,)
+                )
+                row = await cur.fetchone()
+                return row[0] if row else None
+
             match case_type:
 
                 # =========================================================
@@ -245,12 +315,14 @@ async def commit_trip_leg(
                                shipper_signed, 
                                is_bobtail, 
                                leg_status, 
-                               load_status
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s);""",
+                               load_status,
+                               round_number
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s);""",
                         (
                             did, display_trailer, bol_number, document_type, origin_loc, dest_loc,
                             msg_timestamp, action_type, primary_image_blob, door_num,
-                            1 if shipper_signed else 0, is_bobtail_flag, load_status_val
+                            1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
+                            await resolve_round_number(origin_loc)
                         )
                     )
                     await conn.commit()
@@ -579,13 +651,15 @@ async def commit_trip_leg(
                                arrival_action, 
                                is_positioning_leg, 
                                leg_status, 
-                               load_status
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s);""",
+                               load_status,
+                               round_number
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s, %s);""",
                         (
                             did, display_trailer, facility, facility,
                             from_dock, to_dock, msg_timestamp, msg_timestamp,
                             "YARD_DROP" if to_dock == "YARD" else "DOCK_MOVE",
-                            load_status_val
+                            load_status_val,
+                            await current_round_number()
                         )
                     )
                     await conn.commit()

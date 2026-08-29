@@ -737,3 +737,190 @@ async def test_departure_after_dock_work_completes_the_trip_leg(pool):
     positioning = [l for l in await all_legs(pool) if l["is_positioning_leg"] == 1]
     assert len(positioning) == 2
     assert all(l["leg_status"] == "COMPLETED" for l in positioning)
+
+
+# ==========================================================================
+# Round grouping
+# ==========================================================================
+
+async def _depart(pool, origin, dest, **kw):
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location=origin,
+               destination_location=dest, text_trailer="77344", **kw),
+    )
+    return res["leg_id"]
+
+
+async def _arrive(pool):
+    await commit(pool, intent(case_type="CASE_2_DESTINATION_ARRIVAL"))
+
+
+async def test_simple_shuttle_round(pool):
+    """Loaded out, empty back: one round, closing where it opened."""
+    a = await _depart(pool, "200", "E2F", load_status="EMPTY")
+    await _arrive(pool)
+    b = await _depart(pool, "E2F", "200", load_status="EMPTY")
+    await _arrive(pool)
+    c = await _depart(pool, "200", "E2F", load_status="EMPTY")
+
+    assert (await get_leg(pool, a))["round_number"] == 1
+    assert (await get_leg(pool, b))["round_number"] == 1
+    assert (await get_leg(pool, c))["round_number"] == 2, "returning to 200 closes round 1"
+
+
+async def test_triangle_circuit_is_one_round(pool):
+    """200 -> E2F -> SDS -> 200 must stay a single round, even though the
+    driver passes through SDS, which is itself a depot."""
+    legs = [
+        await _depart(pool, "200", "E2F", load_status="LOADED", document_type="RM",
+                      bol_number="RM-1", primary_image_blob=IMG),
+        None, None,
+    ]
+    await _arrive(pool)
+    legs[1] = await _depart(pool, "E2F", "SDS", load_status="EMPTY")
+    await _arrive(pool)
+    legs[2] = await _depart(pool, "SDS", "200", load_status="LOADED", document_type="FG",
+                            bol_number="FG-1", primary_image_blob=IMG)
+    await _arrive(pool)
+
+    assert [(await get_leg(pool, i))["round_number"] for i in legs] == [1, 1, 1]
+
+    nxt = await _depart(pool, "200", "E2F", load_status="EMPTY")
+    assert (await get_leg(pool, nxt))["round_number"] == 2
+
+
+async def test_break_case_starts_a_new_round(pool):
+    """No RM to carry, so the driver runs empty to SDS for FG. That is a new
+    round, not the tail of the previous one."""
+    first = await _depart(pool, "200", "E2F", load_status="LOADED",
+                          bol_number="RM-9", primary_image_blob=IMG)
+    await _arrive(pool)
+    back = await _depart(pool, "E2F", "200", load_status="EMPTY")
+    await _arrive(pool)
+
+    out = await _depart(pool, "200", "SDS", load_status="EMPTY")
+    await _arrive(pool)
+    home = await _depart(pool, "SDS", "200", load_status="LOADED",
+                         bol_number="FG-9", primary_image_blob=IMG)
+
+    assert (await get_leg(pool, first))["round_number"] == 1
+    assert (await get_leg(pool, back))["round_number"] == 1
+    assert (await get_leg(pool, out))["round_number"] == 2
+    assert (await get_leg(pool, home))["round_number"] == 2
+
+
+async def test_sds_based_driver_anchors_on_sds(pool):
+    """The anchor is wherever the round opened, not a hardcoded depot."""
+    a = await _depart(pool, "SDS", "200", load_status="EMPTY")
+    await _arrive(pool)
+    b = await _depart(pool, "200", "SDS", load_status="EMPTY")
+    await _arrive(pool)
+    c = await _depart(pool, "SDS", "200", load_status="EMPTY")
+
+    assert (await get_leg(pool, a))["round_number"] == 1
+    assert (await get_leg(pool, b))["round_number"] == 1
+    assert (await get_leg(pool, c))["round_number"] == 2
+
+
+async def test_dock_moves_join_the_current_round(pool):
+    leg = await _depart(pool, "200", "E2F", load_status="EMPTY")
+    await _arrive(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_dock="13", destination_dock="47", load_status="EMPTY"),
+    )
+    move = await get_leg(pool, res["leg_id"])
+    assert move["is_positioning_leg"] == 1
+    assert move["round_number"] == (await get_leg(pool, leg))["round_number"]
+
+
+async def test_unknown_origin_does_not_fragment_the_round(pool):
+    """A parsing gap must not split one round into two."""
+    a = await _depart(pool, "200", "E2F", load_status="EMPTY")
+    await _arrive(pool)
+    b = await _depart(pool, None, "SDS", load_status="EMPTY")
+    assert (await get_leg(pool, b))["round_number"] == (await get_leg(pool, a))["round_number"]
+
+
+async def test_sds_round_may_detour_through_200(pool):
+    """SDS -> 7634 -> 200 -> SDS is one round.
+
+    7634 and 200 are close, so a driver delivering to 7634 may swing by 200
+    for a load or an empty before heading home. 200 is a depot, but it is not
+    THIS round's anchor, so the detour must not split the round.
+    """
+    a = await _depart(pool, "SDS", "7634", load_status="LOADED",
+                      bol_number="SD-1", primary_image_blob=IMG)
+    await _arrive(pool)
+    b = await _depart(pool, "7634", "200", load_status="EMPTY")
+    await _arrive(pool)
+    c = await _depart(pool, "200", "SDS", load_status="LOADED",
+                      bol_number="SD-2", primary_image_blob=IMG)
+    await _arrive(pool)
+
+    assert [(await get_leg(pool, i))["round_number"] for i in (a, b, c)] == [1, 1, 1]
+
+    # back at the anchor, so the next departure opens a fresh round
+    d = await _depart(pool, "SDS", "7634", load_status="EMPTY")
+    assert (await get_leg(pool, d))["round_number"] == 2
+
+
+async def test_sds_round_without_the_detour(pool):
+    """The usual shape: straight out and back."""
+    a = await _depart(pool, "SDS", "7634", load_status="LOADED",
+                      bol_number="SD-3", primary_image_blob=IMG)
+    await _arrive(pool)
+    b = await _depart(pool, "7634", "SDS", load_status="EMPTY")
+    await _arrive(pool)
+    c = await _depart(pool, "SDS", "7634", load_status="EMPTY")
+
+    assert (await get_leg(pool, a))["round_number"] == 1
+    assert (await get_leg(pool, b))["round_number"] == 1
+    assert (await get_leg(pool, c))["round_number"] == 2
+
+
+async def test_200_round_may_detour_through_sds(pool):
+    """Mirror of the SDS case: a 200-anchored round may swing through SDS for
+    a load or an empty and still be one round."""
+    a = await _depart(pool, "200", "7634", load_status="LOADED",
+                      bol_number="TW-1", primary_image_blob=IMG)
+    await _arrive(pool)
+    b = await _depart(pool, "7634", "SDS", load_status="EMPTY")
+    await _arrive(pool)
+    c = await _depart(pool, "SDS", "200", load_status="LOADED",
+                      bol_number="TW-2", primary_image_blob=IMG)
+    await _arrive(pool)
+
+    assert [(await get_leg(pool, i))["round_number"] for i in (a, b, c)] == [1, 1, 1]
+
+    d = await _depart(pool, "200", "7634", load_status="EMPTY")
+    assert (await get_leg(pool, d))["round_number"] == 2
+
+
+@pytest.mark.parametrize("anchor,circuit", [
+    ("200", ["E2F", "SDS"]),
+    ("200", ["7634", "SDS"]),
+    ("200", ["E2B", "SDS", "7634"]),
+    ("SDS", ["7634", "200"]),
+    ("SDS", ["200"]),
+    ("SDS", ["7634", "200", "E2F"]),
+])
+async def test_any_circuit_returning_to_its_anchor_is_one_round(pool, anchor, circuit):
+    """Whatever the shape, a round is the run from leaving the anchor to
+    getting back to it. Depots passed through along the way are irrelevant."""
+    legs = []
+    here = anchor
+    for stop in circuit:
+        legs.append(await _depart(pool, here, stop, load_status="EMPTY"))
+        await _arrive(pool)
+        here = stop
+    legs.append(await _depart(pool, here, anchor, load_status="EMPTY"))
+    await _arrive(pool)
+
+    numbers = [(await get_leg(pool, i))["round_number"] for i in legs]
+    assert numbers == [1] * len(legs), f"{anchor} via {circuit} split into {numbers}"
+
+    nxt = await _depart(pool, anchor, circuit[0], load_status="EMPTY")
+    assert (await get_leg(pool, nxt))["round_number"] == 2

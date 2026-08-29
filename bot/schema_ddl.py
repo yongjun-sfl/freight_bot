@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     shipper_signed TINYINT(1) DEFAULT 0,
     receiver_signed TINYINT(1) DEFAULT 0,
     is_positioning_leg TINYINT(1) DEFAULT 0,
+    round_number INT DEFAULT NULL,
     is_bobtail TINYINT(1) DEFAULT 0,
     leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -67,6 +68,9 @@ ADDITIVE_COLUMNS = (
     ("destination_dock",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN destination_dock VARCHAR(32) DEFAULT NULL AFTER origin_dock"),
+    ("round_number",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN round_number INT DEFAULT NULL AFTER is_positioning_leg"),
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.

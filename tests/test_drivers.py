@@ -20,9 +20,22 @@ def test_active_flag_is_case_folded():
     assert by_name["Billy Jung"]["active"] is False
 
 
-def test_telegram_ids_are_absent_and_that_is_expected():
-    """The id is Telegram's own, in no export, learned when someone messages."""
-    assert all(r["user_id"] is None for r in _roster())
+def test_every_driver_has_a_telegram_id():
+    """Without one the state machine ignores every message they send, silently."""
+    missing = [r["name_eng"] for r in _roster() if r["user_id"] is None]
+    assert missing == [], f"no Telegram id for: {missing}"
+
+
+def test_telegram_ids_are_unique():
+    """A duplicate would attribute one driver's movements to another."""
+    ids = [r["user_id"] for r in _roster() if r["user_id"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_telegram_ids_are_plausible():
+    for row in _roster():
+        uid = row["user_id"]
+        assert uid is None or 10**5 < uid < 10**12, f"{row['name_eng']}: {uid}"
 
 
 def test_home_repos_are_location_codes():
@@ -70,3 +83,37 @@ def test_a_misspelled_name_does_not_resolve():
         forms |= seed_network.name_forms(driver)
     assert "공형택" not in forms
     assert "공영택" in forms
+
+
+async def test_seeded_roster_authorises_the_real_drivers(pool):
+    """End to end: seed the roster, then a real driver's message is accepted
+    and an unknown id is still ignored."""
+    from conftest import commit, intent, all_legs
+    import seed_network
+    from config import TABLE_DRIVERS
+
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(f"DELETE FROM {TABLE_DRIVERS};")
+            seeded = await seed_network.seed_drivers(cur)
+    assert seeded == 14
+
+    roderick = next(r for r in seed_network.read_drivers_csv()
+                    if r["name_eng"] == "RODERICK MCBRIDE")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="E1",
+               destination_location="210", text_trailer="C874DW",
+               load_status="EMPTY"),
+        did=roderick["user_id"],
+    )
+    assert res["is_clean"] is True, "a seeded driver must be authorised"
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="E1",
+               destination_location="210"),
+        did=999999999,
+    )
+    assert res["is_clean"] is False
+    assert len(await all_legs(pool)) == 1

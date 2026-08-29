@@ -211,7 +211,14 @@ CASE CLASSIFICATION RULES:
    - "loaded move #4 to #13"      -> origin_dock="4",  destination_dock="13", load_status="LOADED"
    - "empty dropped yard"         -> origin_dock=null, destination_dock="YARD", load_status="EMPTY"
    - "moved 44821 door 7 to yard" -> origin_dock="7",  destination_dock="YARD"
-5. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+5. "CASE_CLOCK_IN": Driver is starting their shift. "clock in", "clocked in", "clocking in", "출근".
+6. "CASE_CLOCK_OUT": Driver is ending their shift. "clock out", "clocked out", "clocking out", "퇴근".
+7. "CASE_WORK_FINISHED": Driver reports a live load or unload is complete WITHOUT also announcing a departure. "live unloading finished", "unload done", "loading finished", "finished unloading".
+8. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+
+SEPARATE FLAG -- "work_finished":
+- Set true whenever the message says a live load or unload has been completed, INCLUDING when the driver announces a departure in the same breath ("live loading finished load 200 to E2F"). In that case the case_type is still CASE_1_ORIGIN_DEPARTURE and work_finished is true; the completion belongs to the trip they are ending, the departure starts the next one.
+- Set false otherwise.
 
 EXTRACTION & NORMALIZATION RULES:
 1. Location Extraction:
@@ -235,7 +242,8 @@ EXTRACTION & NORMALIZATION RULES:
 
 Return raw JSON ONLY:
 {{
-  "case_type": "CASE_1_ORIGIN_DEPARTURE" | "CASE_2_DESTINATION_ARRIVAL" | "CASE_HISTORICAL_BOL_UPDATE" | "CASE_3_INTRA_FACILITY_MOVE" | "NONE_WORK_RELATED",
+  "case_type": "CASE_1_ORIGIN_DEPARTURE" | "CASE_2_DESTINATION_ARRIVAL" | "CASE_HISTORICAL_BOL_UPDATE" | "CASE_3_INTRA_FACILITY_MOVE" | "CASE_CLOCK_IN" | "CASE_CLOCK_OUT" | "CASE_WORK_FINISHED" | "NONE_WORK_RELATED",
+  "work_finished": boolean,
   "origin_location": string or null,
   "destination_location": string or null,
   "origin_dock": string or null,
@@ -413,6 +421,7 @@ async def prepare_text_intent(text: str) -> dict:
         "do_number": llm_parsed.get("do_number"),
         "rm_seq": None,
         "materials": [],
+        "work_finished": bool(llm_parsed.get("work_finished")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -460,6 +469,7 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "do_number": llm_parsed.get("do_number") or ocr_data.get("do_number"),
         "rm_seq": ocr_data.get("rm_seq"),
         "materials": ocr_data.get("materials") or [],
+        "work_finished": bool(llm_parsed.get("work_finished")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

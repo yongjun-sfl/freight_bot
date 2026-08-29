@@ -16,7 +16,7 @@ looked like, so like can be compared with like rather than silently averaged.
 
 import logging
 
-from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS
+from config import TABLE_DRIVERS, TABLE_SHIFTS, TABLE_SHUTTLE_LEGS
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,16 @@ async def open_dwells(pool):
                               AND nxt.id > l.id
                               AND nxt.is_positioning_leg = 0
                        )
-                       AND l.arrival_time >= NOW() - INTERVAL 12 HOUR;"""
+                       AND l.arrival_time >= NOW() - INTERVAL 12 HOUR
+                       -- A driver who has clocked out is not on site. Without
+                       -- this they climb past every threshold overnight and
+                       -- get reported as critically delayed while at home.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM {TABLE_SHIFTS} s
+                            WHERE s.user_id = l.user_id
+                              AND s.shift_date = CURRENT_DATE()
+                              AND s.reported_clock_out IS NOT NULL
+                       );"""
             )
             return await cur.fetchall()
 

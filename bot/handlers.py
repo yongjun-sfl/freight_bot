@@ -64,6 +64,19 @@ def message_timestamp(msg) -> str:
     return sent.astimezone(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+async def _acknowledge(context: ContextTypes.DEFAULT_TYPE, message, text: str):
+    """Confirm a clock in or out back to the driver.
+
+    Confirmation, not correction: it tells them the report registered, gives
+    them their own record of hours, and surfaces a missed clock-out the same
+    day rather than at month end.
+    """
+    try:
+        await message.reply_text(text)
+    except Exception as e:
+        logger.warning(f"Could not acknowledge to driver: {e}")
+
+
 async def _send_dispatch_card(context: ContextTypes.DEFAULT_TYPE,
                               fallback_chat_id: int,
                               card_text: str):
@@ -137,6 +150,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     group_title = chat.title or "Private Chat"
     msg_timestamp = message_timestamp(update.message)
     raw_text = update.message.text.strip()
+    msg_obj = update.message
 
     pool = context.bot_data["db_pool"]
 
@@ -155,6 +169,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             msg_timestamp=msg_timestamp,
             intent=intent
         )
+
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
         if res.get("card_text"):
             await _send_dispatch_card(context, chat.id, res["card_text"])
@@ -203,6 +220,7 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
     group_title = chat.title or "Private Chat"
     msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
+    msg_obj = msg
 
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
@@ -229,6 +247,9 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
             msg_timestamp=msg_timestamp,
             intent=intent
         )
+
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
         if res.get("card_text"):
             await _send_dispatch_card(context, chat.id, res["card_text"])
@@ -263,6 +284,7 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
             caption = m.caption.strip()
             break
 
+    msg_obj = primary_msg
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
 
@@ -291,6 +313,9 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
             intent=intent
         )
 
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
+
         if res.get("card_text"):
             await _send_dispatch_card(context, chat.id, res["card_text"])
 
@@ -314,6 +339,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     group_title = chat.title or "Private Chat"
     msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
+    msg_obj = msg
 
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
@@ -340,6 +366,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             msg_timestamp=msg_timestamp,
             intent=intent
         )
+
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
         if res.get("card_text"):
             await _send_dispatch_card(context, chat.id, res["card_text"])

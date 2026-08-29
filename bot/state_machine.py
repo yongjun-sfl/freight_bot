@@ -3,7 +3,8 @@ import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
 from ai_engine import normalize_location, site_of
 from load_types import classify as classify_load
-from rm_manifest import close_rm_load, record_rm_load
+from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
+from shifts import format_worked, record_clock_in, record_clock_out
 from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
@@ -266,7 +267,88 @@ async def commit_trip_leg(
                 row = await cur.fetchone()
                 return row[0] if row else None
 
+            async def stamp_finished(target_leg=None):
+                """Record that a live load or unload completed.
+
+                Applies to the leg the driver is ending, which on a merged
+                message ("live loading finished load 200 to E2F") is the leg
+                BEFORE the departure being announced.
+                """
+                if target_leg is None:
+                    await cur.execute(
+                        f"""SELECT id FROM {TABLE_SHUTTLE_LEGS} 
+                             WHERE user_id = %s AND is_positioning_leg = 0 
+                          ORDER BY id DESC LIMIT 1;""",
+                        (did,)
+                    )
+                    row = await cur.fetchone()
+                    target_leg = row[0] if row else None
+                if not target_leg:
+                    return None
+                await cur.execute(
+                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                           SET finished_time = COALESCE(finished_time, %s) 
+                         WHERE id = %s;""",
+                    (msg_timestamp, target_leg)
+                )
+                await finish_rm_load(cur, target_leg, msg_timestamp)
+                return target_leg
+
             match case_type:
+
+                # =========================================================
+                # SHIFT BOUNDARIES
+                # =========================================================
+                case "CASE_CLOCK_IN":
+                    reported, expected = await record_clock_in(cur, did, msg_timestamp)
+                    await conn.commit()
+                    logger.info(f"🕐 Driver #{did} clocked in at {reported}.")
+                    late = ""
+                    if expected and reported and reported > expected:
+                        minutes = int((reported - expected).total_seconds() // 60)
+                        late = f" ({minutes} min after expected)"
+                    return {
+                        "is_clean": True,
+                        "leg_id": None,
+                        "card_text": None,
+                        "reply_text": f"✅ Clocked in — {reported:%H:%M}{late}",
+                    }
+
+                case "CASE_CLOCK_OUT":
+                    started, ended, worked = await record_clock_out(cur, did, msg_timestamp)
+                    await conn.commit()
+                    logger.info(f"🕐 Driver #{did} clocked out at {ended}.")
+                    if not started:
+                        return {
+                            "is_clean": False,
+                            "leg_id": None,
+                            "reply_text": f"✅ Clocked out — {ended:%H:%M}",
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Clock-out With No Clock-in**\n"
+                                f"\U0001f464 Driver: {user_name}\n"
+                                f"\U0001f550 Clocked out at `{ended:%H:%M}` but never "
+                                f"reported starting, so hours cannot be worked out."
+                            )
+                        }
+                    return {
+                        "is_clean": True,
+                        "leg_id": None,
+                        "card_text": None,
+                        "reply_text": (
+                            f"✅ Clocked out — {ended:%H:%M} · {format_worked(worked)}"
+                        ),
+                    }
+
+                # =========================================================
+                # LIVE LOAD / UNLOAD COMPLETE
+                # =========================================================
+                case "CASE_WORK_FINISHED":
+                    finished_leg = await stamp_finished()
+                    await conn.commit()
+                    if not finished_leg:
+                        return {"is_clean": True, "leg_id": None, "card_text": None}
+                    logger.info(f"🏁 Driver #{did} finished work on Leg #{finished_leg}.")
+                    return {"is_clean": True, "leg_id": finished_leg, "card_text": None}
 
                 # =========================================================
                 # CASE 1: INTER-FACILITY DEPARTURE
@@ -351,6 +433,11 @@ async def commit_trip_leg(
 
                     if not display_trailer or display_trailer == "UNKNOWN":
                         display_trailer = last_leg[1] if (last_leg and last_leg[1]) else "UNKNOWN"
+
+                    # A merged "live loading finished load 200 to E2F" ends the
+                    # previous trip and starts the next in one message.
+                    if intent.get("work_finished"):
+                        await stamp_finished()
 
                     # Complete prior active legs upon new departure
                     await cur.execute(

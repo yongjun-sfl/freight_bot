@@ -14,6 +14,7 @@ from config import (
     TABLE_UNKNOWN_SENDERS,
     TABLE_RM_LOADS,
     TABLE_RM_LOAD_ITEMS,
+    TABLE_SHIFTS,
     INDEX_UNIQUE_BOL,
 )
 
@@ -70,6 +71,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     departure_time DATETIME DEFAULT NULL,
     arrival_time DATETIME DEFAULT NULL,
     paperwork_time DATETIME DEFAULT NULL,
+    -- When the driver reported the live load or unload complete. Distinct
+    -- from arrival (on site) and from paperwork (clerk signed).
+    finished_time DATETIME DEFAULT NULL,
     arrival_at_dock TINYINT(1) DEFAULT 0,
     dwell_alert_level INT DEFAULT 0,
     arrival_action VARCHAR(64) DEFAULT NULL,
@@ -190,9 +194,28 @@ CREATE TABLE IF NOT EXISTS {TABLE_RM_LOAD_ITEMS} (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+# Expected columns are the dispatcher's, reported columns are the bot's.
+# Never merged: an inferred time sitting in a reported column becomes
+# indistinguishable from an observation, and these feed payroll.
+DDL_SHIFTS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_SHIFTS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    shift_date DATE NOT NULL,
+    expected_clock_in DATETIME DEFAULT NULL,
+    reported_clock_in DATETIME DEFAULT NULL,
+    expected_clock_out DATETIME DEFAULT NULL,
+    reported_clock_out DATETIME DEFAULT NULL,
+    worked_minutes INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_shift_driver_date (user_id, shift_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
               DDL_ROUTES, DDL_ROUTE_MEMBERS, DDL_DISTANCES,
-              DDL_UNKNOWN_SENDERS, DDL_RM_LOADS, DDL_RM_LOAD_ITEMS)
+              DDL_UNKNOWN_SENDERS, DDL_RM_LOADS, DDL_RM_LOAD_ITEMS,
+              DDL_SHIFTS)
 
 # Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
 # is a no-op against an existing database, so these must be applied separately
@@ -222,6 +245,9 @@ ADDITIVE_COLUMNS = (
     ("trip_seq",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN trip_seq INT DEFAULT NULL AFTER load_type"),
+    ("finished_time",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN finished_time DATETIME DEFAULT NULL AFTER arrival_time"),
     ("paperwork_time",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN paperwork_time DATETIME DEFAULT NULL AFTER arrival_time"),
@@ -268,8 +294,11 @@ ADDITIVE_LOCATION_COLUMNS = (
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.
-TRUNCATABLE = (TABLE_RM_LOAD_ITEMS, TABLE_RM_LOADS, TABLE_SHUTTLE_LEGS,
-               TABLE_LOCATION_CODES, TABLE_DRIVERS)
+# Every table holding per-run state. Anything omitted leaks between tests and
+# produces failures that look like logic bugs -- driver_shifts did exactly
+# that, leaving one test's clock-in visible to the next.
+TRUNCATABLE = (TABLE_RM_LOAD_ITEMS, TABLE_RM_LOADS, TABLE_SHIFTS,
+               TABLE_SHUTTLE_LEGS, TABLE_LOCATION_CODES, TABLE_DRIVERS)
 
 
 async def _relax_driver_primary_key(cur, db_name: str, logger=None):

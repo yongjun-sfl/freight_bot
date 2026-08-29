@@ -84,6 +84,10 @@ async def pool():
 
     async with p.acquire() as conn:
         async with conn.cursor() as cur:
+            # Rebuilt rather than truncated: these tables are pre-release and
+            # their shape is still settling, and CREATE TABLE IF NOT EXISTS
+            # would silently keep a stale definition from an earlier run.
+            await cur.execute("DROP TABLE IF EXISTS rm_load_items, rm_loads;")
             await apply_schema(cur, MYSQL_DB)
             await cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
             for table in (*TRUNCATABLE, TABLE_ROUTES, TABLE_ROUTE_MEMBERS,
@@ -224,16 +228,19 @@ async def seed_routes(pool, definitions=None):
 
 
 async def seed_network(pool):
-    """The real facility list and routes, read from the same files production
-    seeds from. Never restate them here -- a hardcoded copy drifts, and the
-    site codes silently stop matching the lane map."""
+    """Facilities, distances and routes, seeded by the production path.
+
+    Calls seed_network.seed_network rather than restating the inserts. Every
+    hand-written copy of this in the fixtures has drifted from production --
+    first on site codes, then on official names -- and each time the symptom
+    was a passing-looking test with quietly wrong data.
+    """
     import seed_network as seed_mod
 
-    await seed_locations(pool, [
-        (row["code"], row["aliases"] or "", row["site"])
-        for row in seed_mod.read_locations_csv()
-        if row["active"]
-    ])
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await seed_mod.seed_network(cur)
+    await ai_engine.refresh_location_cache(pool)
     await seed_routes(pool)
 
 

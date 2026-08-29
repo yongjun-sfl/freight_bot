@@ -3,6 +3,7 @@ import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
 from ai_engine import normalize_location, site_of
 from load_types import classify as classify_load
+from rm_manifest import close_rm_load, record_rm_load
 from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
@@ -302,6 +303,9 @@ async def commit_trip_leg(
                              msg_timestamp if primary_image_blob else None,
                              display_trailer, display_trailer, leg_id)
                         )
+                        await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
+                                             display_trailer, msg_timestamp,
+                                             driver_id=did, driver_name=user_name)
                         await conn.commit()
                         logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
@@ -359,6 +363,7 @@ async def commit_trip_leg(
                     )
 
                     round_and_route = await resolve_round(origin_loc, dest_loc)
+                    rm_dock = intent.get("dock_number") or door_num
 
                     # Insert new departure leg
                     await cur.execute(
@@ -394,6 +399,14 @@ async def commit_trip_leg(
                     )
                     await conn.commit()
                     leg_id = cur.lastrowid
+
+                    # RM consignments carry line items the receiving departments
+                    # at E2F and E2R report on, so they are kept in their own
+                    # tables rather than flattened into the leg.
+                    await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
+                                         display_trailer, msg_timestamp,
+                                         driver_id=did, driver_name=user_name)
+                    await conn.commit()
 
                     # ALERT GUARD 0: Stale BOL. Takes precedence over the paperwork
                     # guards below, which would otherwise fire on the fields just
@@ -561,6 +574,7 @@ async def commit_trip_leg(
                                 leg_id
                             )
                         )
+                        await close_rm_load(cur, leg_id, msg_timestamp)
                         await conn.commit()
                         logger.info(f"✅ Driver #{did} arrived at {dest_loc}. Leg #{leg_id} updated to {target_status}.")
 

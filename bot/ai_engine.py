@@ -56,6 +56,7 @@ LOCATION_CACHE = {
     # (rear/outbound) are distinct codes on a leg record but one place when
     # deciding whether a driver has returned and closed a round.
     "site_map": {},
+    "official_name": {},
 }
 
 
@@ -64,7 +65,7 @@ async def refresh_location_cache(pool):
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                f"""SELECT canonical_code, aliases, site_code 
+                f"""SELECT canonical_code, aliases, site_code, official_name 
                       FROM {TABLE_LOCATION_CODES} 
                      WHERE is_active = TRUE;"""
             )
@@ -73,11 +74,14 @@ async def refresh_location_cache(pool):
             codes = []
             alias_map = {}
             site_map = {}
-            for code, aliases, site in rows:
+            official = {}
+            for code, aliases, site, official_name in rows:
                 code_upper = code.strip().upper()
                 codes.append(code_upper)
                 alias_map[code_upper] = code_upper
                 site_map[code_upper] = (site or code).strip().upper()
+                if official_name:
+                    official[code_upper] = official_name.strip()
                 
                 if aliases:
                     for alias in aliases.split(','):
@@ -88,6 +92,7 @@ async def refresh_location_cache(pool):
             LOCATION_CACHE["codes"] = list(set(codes))
             LOCATION_CACHE["alias_map"] = alias_map
             LOCATION_CACHE["site_map"] = site_map
+            LOCATION_CACHE["official_name"] = official
             logger.info(f"Location cache refreshed: {len(codes)} valid codes loaded.")
 
 
@@ -284,6 +289,15 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 4c. "dock_number": a hand-written "#NN" with no other label is the dock the trailer was loaded at or delivered to. Return just the digits, e.g. "#47" -> "47". Return null if absent.
 
 4d. "rm_seq": RM paperwork is hand-marked with the date and that load's sequence in the day's allocation, written "08/28-7" or "8/28 - 7", meaning the 7th RM load of 28 August. Return ONLY the number after the dash, e.g. "7". Return null if there is no such mark.
+4e. "materials": the line items in the table under the MATERIAL / DESCRIPTION / QTY / WEIGHT / CONT NO / REMARK headings. Return one object per line, or an empty list if there is no such table. Copy values exactly as printed; do not normalise or infer.
+   - "material_code": the MATERIAL value, e.g. "11800335"
+   - "description": e.g. "GLASS"
+   - "qty": the total quantity with its unit as printed, e.g. "10 PLT"
+   - "weight": as printed, or null
+   - "cont_no": the CONT NO column, or null
+   - "batch_no": if the REMARK reads "Batch# 0001836335", return just "0001836335". This is issued separately by the receiving manager and is their reference, so it must not be left inside the remark text.
+   - "remark": anything else in REMARK, or null
+
 5. "shipper_signed": True only if the ORIGIN or SHIPPER side carries a hand-written signature, initials, or a department/company stamp authorising release (an "RM DEPT" stamp from the pick-up company counts).
 6. "receiver_signed": True only if the DELIVERY or CONSIGNEE section specifically carries a hand-written signature or initials from whoever received the goods.
    - Be conservative. A stamp from the SHIPPING company, a date, a dock number, or any other handwriting elsewhere on the page is NOT a receiver signature.
@@ -298,6 +312,11 @@ Return raw JSON ONLY:
   "do_number": string or null,
   "dock_number": string or null,
   "rm_seq": string or null,
+  "materials": [
+    {"material_code": string, "description": string, "qty": string,
+     "weight": string or null, "cont_no": string or null,
+     "batch_no": string or null, "remark": string or null}
+  ],
   "shipper_signed": boolean,
   "receiver_signed": boolean
 }"""
@@ -309,6 +328,7 @@ Return raw JSON ONLY:
         "do_number": None,
         "dock_number": None,
         "rm_seq": None,
+        "materials": [],
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
@@ -350,6 +370,9 @@ Return raw JSON ONLY:
                 if data.get(field) and not result[field]:
                     result[field] = data[field]
 
+            if data.get("materials") and not result["materials"]:
+                result["materials"] = [m for m in data["materials"] if isinstance(m, dict)]
+
             if data.get("shipper_signed"):
                 result["shipper_signed"] = True
 
@@ -389,6 +412,7 @@ async def prepare_text_intent(text: str) -> dict:
         "destination_dock": llm_parsed.get("destination_dock"),
         "do_number": llm_parsed.get("do_number"),
         "rm_seq": None,
+        "materials": [],
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -435,6 +459,7 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         # reliable source; a caption mentioning it still wins if present.
         "do_number": llm_parsed.get("do_number") or ocr_data.get("do_number"),
         "rm_seq": ocr_data.get("rm_seq"),
+        "materials": ocr_data.get("materials") or [],
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

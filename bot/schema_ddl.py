@@ -12,6 +12,8 @@ from config import (
     TABLE_ROUTE_MEMBERS,
     TABLE_DISTANCES,
     TABLE_UNKNOWN_SENDERS,
+    TABLE_RM_LOADS,
+    TABLE_RM_LOAD_ITEMS,
     INDEX_UNIQUE_BOL,
 )
 
@@ -138,9 +140,59 @@ CREATE TABLE IF NOT EXISTS {TABLE_UNKNOWN_SENDERS} (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+# Shaped to the dispatcher's RM Delivery Summary. Keyed on delivery_date +
+# rm_seq, because the sequence restarts each day and one trip can carry more
+# than one reservation ("926576, 926577" appears as a single row).
+DDL_RM_LOADS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_RM_LOADS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    delivery_date DATE NOT NULL,
+    rm_seq INT NOT NULL,
+    leg_id INT DEFAULT NULL,
+    driver_id BIGINT DEFAULT NULL,
+    driver_name VARCHAR(128) DEFAULT NULL,
+    -- may hold several, comma separated, when one trip carries multiple
+    reservation_no VARCHAR(128) DEFAULT NULL,
+    trailer_number VARCHAR(64) DEFAULT NULL,
+    dock_number VARCHAR(32) DEFAULT NULL,
+    origin_location VARCHAR(128) DEFAULT NULL,
+    destination_location VARCHAR(128) DEFAULT NULL,
+    -- destination in the client's own words, e.g. EAGLE 2 FRONT
+    pod VARCHAR(128) DEFAULT NULL,
+    departure_time DATETIME DEFAULT NULL,
+    eta DATETIME DEFAULT NULL,
+    arrival_time DATETIME DEFAULT NULL,
+    finished_time DATETIME DEFAULT NULL,
+    -- Finished minus Arrival: unload time at the receiving end, which is what
+    -- the summary reports. Transit is arrival minus departure and is separate.
+    time_taken_minutes INT DEFAULT NULL,
+    transit_minutes INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_rm_date_seq (delivery_date, rm_seq),
+    INDEX idx_rm_leg (leg_id),
+    INDEX idx_rm_destination (destination_location, delivery_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+DDL_RM_LOAD_ITEMS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_RM_LOAD_ITEMS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    rm_load_id INT NOT NULL,
+    material_code VARCHAR(64) DEFAULT NULL,
+    description VARCHAR(255) DEFAULT NULL,
+    qty VARCHAR(32) DEFAULT NULL,
+    weight VARCHAR(32) DEFAULT NULL,
+    cont_no VARCHAR(64) DEFAULT NULL,
+    batch_no VARCHAR(64) DEFAULT NULL,
+    remark VARCHAR(255) DEFAULT NULL,
+    INDEX idx_item_load (rm_load_id),
+    INDEX idx_item_batch (batch_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
               DDL_ROUTES, DDL_ROUTE_MEMBERS, DDL_DISTANCES,
-              DDL_UNKNOWN_SENDERS)
+              DDL_UNKNOWN_SENDERS, DDL_RM_LOADS, DDL_RM_LOAD_ITEMS)
 
 # Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
 # is a no-op against an existing database, so these must be applied separately
@@ -216,7 +268,8 @@ ADDITIVE_LOCATION_COLUMNS = (
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.
-TRUNCATABLE = (TABLE_SHUTTLE_LEGS, TABLE_LOCATION_CODES, TABLE_DRIVERS)
+TRUNCATABLE = (TABLE_RM_LOAD_ITEMS, TABLE_RM_LOADS, TABLE_SHUTTLE_LEGS,
+               TABLE_LOCATION_CODES, TABLE_DRIVERS)
 
 
 async def _relax_driver_primary_key(cur, db_name: str, logger=None):

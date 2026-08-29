@@ -97,13 +97,14 @@ async def commit_trip_leg(
                 logger.info(f"Ignored in-facility dock move for Driver #{did} at {origin_loc}.")
                 return {"is_clean": True, "leg_id": None, "card_text": None}
 
-            # 2. DUPLICATE BOL GUARD
+            # 2. DUPLICATE BOL LOOKUP
             # Deliberately NOT run ahead of the match block. The patch paths --
             # CASE_HISTORICAL_BOL_UPDATE, CASE_AUTO_RESOLVE, and the CASE 1
             # auto-heal -- all locate their target *by* an existing bol_number,
             # so a pre-match guard made every one of them unreachable. It now
             # runs only where a brand new leg would claim a BOL.
-            async def duplicate_bol_card():
+            async def find_duplicate_bol_leg():
+                """Id of an existing leg already carrying this BOL, else None."""
                 if not bol_number:
                     return None
                 await cur.execute(
@@ -114,22 +115,7 @@ async def commit_trip_leg(
                     (bol_number,)
                 )
                 existing_bol = await cur.fetchone()
-                if not existing_bol:
-                    return None
-                return {
-                    "is_clean": False,
-                    "leg_id": None,
-                    "action_type": "DUPLICATE_BOL_OVERRIDE",
-                    "duplicate_bol": bol_number,
-                    "existing_leg_id": existing_bol[0],
-                    "card_text": (
-                        f"⚠️ **MANUAL RECONCILE: Duplicate BOL Number**\n"
-                        f"👤 Driver: {user_name}\n"
-                        f"📄 BOL Number: `{bol_number}`\n"
-                        f"❓ Issue: Already logged under Leg `{existing_bol[0]}`.\n"
-                        f"👉 Click below to force save this entry anyway."
-                    )
-                }
+                return existing_bol[0] if existing_bol else None
 
             match case_type:
 
@@ -169,11 +155,24 @@ async def commit_trip_leg(
                         logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
-                    # A genuinely new departure may not claim a BOL that is
-                    # already recorded against another leg.
-                    duplicate = await duplicate_bol_card()
-                    if duplicate:
-                        return duplicate
+                    # A BOL already on another leg means the driver attached the
+                    # PREVIOUS load's paperwork to this one. Every field derived
+                    # from that document is therefore wrong and is discarded. The
+                    # movement itself is real, so the leg is still recorded -- with
+                    # no paperwork -- and the auto-heal above completes it once the
+                    # driver reposts the correct BOL.
+                    duplicate_of = await find_duplicate_bol_leg()
+                    stale_bol = None
+                    if duplicate_of:
+                        stale_bol = bol_number
+                        bol_number = None
+                        document_type = "UNKNOWN"
+                        primary_image_blob = None
+                        shipper_signed = False
+                        logger.warning(
+                            f"Driver #{did} attached BOL '{stale_bol}' already recorded on "
+                            f"Leg #{duplicate_of}; saving movement without paperwork."
+                        )
 
                     # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
                     await cur.execute(
@@ -234,6 +233,24 @@ async def commit_trip_leg(
                     )
                     await conn.commit()
                     leg_id = cur.lastrowid
+
+                    # ALERT GUARD 0: Stale BOL. Takes precedence over the paperwork
+                    # guards below, which would otherwise fire on the fields just
+                    # cleared and bury the actionable instruction.
+                    if duplicate_of:
+                        return {
+                            "is_clean": False,
+                            "leg_id": leg_id,
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Stale BOL Attached**\n"
+                                f"👤 Driver: {user_name}\n"
+                                f"🚛 Trailer: `{display_trailer}`\n"
+                                f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
+                                f"📄 BOL `{stale_bol}` is already recorded on Leg `{duplicate_of}`.\n"
+                                f"👉 Trip saved as Leg `{leg_id}` with no paperwork. "
+                                f"Ask the driver to repost the correct BOL for this load."
+                            )
+                        }
 
                     # ALERT GUARD 1: Incomplete Route Data
                     if origin_loc == "UNKNOWN" or display_trailer == "UNKNOWN" or dest_loc == "UNKNOWN":

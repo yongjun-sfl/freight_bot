@@ -3,10 +3,9 @@ import logging
 import asyncio
 from zoneinfo import ZoneInfo
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import TABLE_SHUTTLE_LEGS
 from ai_engine import prepare_text_intent, prepare_image_intent, refresh_location_cache
 from state_machine import commit_trip_leg
 
@@ -21,6 +20,17 @@ MEDIA_GROUP_LOCK = asyncio.Lock()
 
 def get_eastern_timestamp() -> str:
     return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _send_dispatch_card(context: ContextTypes.DEFAULT_TYPE,
+                              fallback_chat_id: int,
+                              card_text: str):
+    """Post a manual-reconcile card, preferring the dispatch channel."""
+    await context.bot.send_message(
+        chat_id=DISPATCH_ALERT_CHANNEL_ID or fallback_chat_id,
+        text=card_text,
+        parse_mode="Markdown"
+    )
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,19 +64,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
-
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing text from {driver_id}: {e}", exc_info=True)
@@ -132,19 +130,7 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
-
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing photo from {driver_id}: {e}", exc_info=True)
@@ -203,19 +189,7 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
         )
 
         if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
-
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing media group from {driver_id}: {e}", exc_info=True)
@@ -265,58 +239,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         )
 
         if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
-
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing document from {driver_id}: {e}", exc_info=True)
-
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    dispatcher = update.effective_user.full_name or "Dispatcher"
-
-    if data.startswith("override_bol|"):
-        _, driver_id, bol_num = data.split("|")
-        driver_id = int(driver_id)
-
-        pool = context.bot_data["db_pool"]
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                        SET bol_number = %s 
-                      WHERE user_id = %s 
-                        ORDER BY id DESC 
-                    LIMIT 1;""",
-                    (bol_num, driver_id)
-                ) 
-                await conn.commit()
-
-        resolved_text = (
-            f"✅ **RESOLVED: Duplicate BOL Approved**\n"
-            f"👤 Approved By: {dispatcher}\n"
-            f"📄 BOL Number: `{bol_num}`\n"
-            f"⚡ Status: Manually linked to Driver #{driver_id}'s latest leg."
-        )
-        await query.edit_message_text(
-            text=resolved_text,
-            parse_mode="Markdown"
-        )
 
 
 async def refresh_locations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -6,7 +6,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters
 )
 
@@ -16,7 +15,6 @@ from handlers import (
     handle_text_message,
     handle_photo_message,
     handle_document_message,
-    handle_callback_query,
     refresh_locations_command
 )
 
@@ -86,7 +84,6 @@ def main():
     app = builder.build()
 
     app.add_handler(CommandHandler("refresh_locations", refresh_locations_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))

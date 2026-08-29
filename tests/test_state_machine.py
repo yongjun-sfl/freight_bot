@@ -51,19 +51,80 @@ async def test_in_facility_move_is_ignored(pool):
     assert await all_legs(pool) == []
 
 
-async def test_duplicate_bol_returns_override_card(pool):
+async def test_stale_bol_records_movement_without_paperwork(pool):
+    """A duplicate BOL means the driver attached the PREVIOUS load's paperwork.
+
+    The document is wrong, but the trip is real: record the movement, discard
+    every field derived from that document, and tell dispatch to chase a repost.
+    """
     existing = await insert_leg(pool, bol_number="B100", leg_status="COMPLETED")
 
     res = await commit(
         pool,
         intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
-               origin_location="200", destination_location="E2F"),
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", load_status="LOADED",
+               primary_image_blob=IMG, shipper_signed=True, document_type="FG"),
     )
     assert res["is_clean"] is False
-    assert res["action_type"] == "DUPLICATE_BOL_OVERRIDE"
-    assert res["existing_leg_id"] == existing
-    assert "Duplicate BOL" in res["card_text"]
-    assert len(await all_legs(pool)) == 1  # nothing new written
+    assert res["leg_id"] is not None and res["leg_id"] != existing
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200"      # movement preserved
+    assert leg["destination_location"] == "E2F"
+    assert leg["trailer_number"] == "77344"
+    assert leg["leg_status"] == "IN_TRANSIT"
+    assert leg["bol_number"] is None            # stale paperwork discarded
+    assert leg["bol_image"] is None
+    assert leg["document_type"] == "UNKNOWN"
+    assert leg["shipper_signed"] == 0
+
+    assert "Stale BOL" in res["card_text"]
+    assert "B100" in res["card_text"]
+    assert str(existing) in res["card_text"]
+    assert "repost" in res["card_text"].lower()
+
+
+async def test_no_force_save_override_is_offered(pool):
+    """The override button was removed: a stale BOL is a driver error to correct."""
+    await insert_leg(pool, bol_number="B100", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344"),
+    )
+    assert res.get("action_type") is None
+    assert "force" not in res["card_text"].lower()
+
+
+async def test_reposted_bol_heals_the_stale_bol_leg(pool):
+    """End to end: stale BOL -> movement recorded -> repost completes the leg."""
+    await insert_leg(pool, bol_number="B100", leg_status="COMPLETED")
+
+    first = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", load_status="LOADED", primary_image_blob=IMG),
+    )
+    open_leg = first["leg_id"]
+
+    # driver reposts the correct paperwork, no caption
+    second = await commit(
+        pool,
+        intent(case_type="CASE_AUTO_RESOLVE", bol_number="B200",
+               primary_image_blob=IMG, shipper_signed=True, document_type="FG"),
+    )
+    assert second["is_clean"] is True
+    assert second["leg_id"] == open_leg
+
+    leg = await get_leg(pool, open_leg)
+    assert leg["bol_number"] == "B200"
+    assert leg["bol_image"] == IMG
+    assert leg["document_type"] == "FG"
+    assert leg["shipper_signed"] == 1
+    assert len(await all_legs(pool)) == 2   # the old leg plus this one, no extras
 
 
 # ==========================================================================

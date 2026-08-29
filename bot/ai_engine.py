@@ -2,6 +2,7 @@ import os
 import io
 import json
 import time
+import random
 import logging
 from PIL import Image
 from pdf2image import convert_from_bytes
@@ -14,7 +15,20 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-MODEL_NAME = "gemini-3.5-flash-lite"
+# Stable alias rather than a pinned point release. Measured 2026-08-28:
+# gemini-3.5-flash-lite returned 503/timeout on 2 of 5 calls, while
+# gemini-flash-lite-latest returned 200 on 5 of 5.
+MODEL_NAME = "gemini-flash-lite-latest"
+
+# Transient conditions worth waiting out. Anything else (400, 401, 404,
+# malformed request) is a bug and must fail immediately rather than burn
+# the retry budget.
+RETRYABLE_MARKERS = (
+    "503", "UNAVAILABLE", "high demand",
+    "429", "RESOURCE_EXHAUSTED",
+    "500", "INTERNAL",
+    "504", "DEADLINE_EXCEEDED", "timed out",
+)
 
 LOCATION_CACHE = {
     "codes": [],
@@ -86,7 +100,13 @@ def compress_image(image_bytes: bytes, max_dim: int = 1800) -> bytes:
         return image_bytes
 
 
-def call_gemini_with_retry(contents, config=None, retries=3, initial_delay=1.0):
+def call_gemini_with_retry(contents, config=None, retries=5, initial_delay=1.0, max_delay=8.0):
+    """Call Gemini, waiting out transient failures.
+
+    The budget is ~15s across 5 attempts (1+2+4+8, jittered). The previous
+    3 attempts / ~3s was routinely shorter than an observed demand spike,
+    and a lapsed budget means a driver's message is dropped entirely.
+    """
     delay = initial_delay
     for attempt in range(1, retries + 1):
         try:
@@ -97,13 +117,19 @@ def call_gemini_with_retry(contents, config=None, retries=3, initial_delay=1.0):
             )
         except Exception as e:
             err_msg = str(e)
-            if ("503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg) and attempt < retries:
-                logger.warning(f"Gemini API 503 spike (Attempt {attempt}/{retries}). Retrying in {delay}s...")
-                time.sleep(delay)
-                delay *= 2.0
+            retryable = any(marker in err_msg for marker in RETRYABLE_MARKERS)
+            if retryable and attempt < retries:
+                # Jitter avoids a fleet of drivers retrying in lockstep.
+                sleep_for = delay * (1.0 + random.random() * 0.25)
+                logger.warning(
+                    f"Gemini transient failure (attempt {attempt}/{retries}): {err_msg[:120]}. "
+                    f"Retrying in {sleep_for:.1f}s..."
+                )
+                time.sleep(sleep_for)
+                delay = min(delay * 2.0, max_delay)
             else:
                 logger.error(f"Gemini API call failed after {attempt} attempt(s): {e}")
-                raise e
+                raise
 
 
 def parse_text_with_llm(text: str) -> dict:

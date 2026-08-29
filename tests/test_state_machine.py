@@ -228,12 +228,6 @@ async def test_midshift_pod_guard_blocks_after_unsigned_fg_leg(pool):
     assert "Missing Receiver POD" in res["card_text"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="The global duplicate-BOL guard at state_machine.py:92 runs before the "
-           "match block, so re-sending a photo for a leg whose bol_number is already "
-           "known can never reach the CASE 1 auto-heal that would attach the image.",
-)
 async def test_autoheal_attaches_image_when_bol_already_known(pool):
     open_leg = await insert_leg(
         pool, leg_status="IN_TRANSIT", load_status="LOADED",
@@ -351,13 +345,6 @@ async def test_historical_update_with_no_match_raises_card(pool):
     assert "Unmatched Historical BOL" in res["card_text"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="CASE_HISTORICAL_BOL_UPDATE is unreachable. It patches the leg whose "
-           "bol_number matches, but the duplicate-BOL guard at state_machine.py:92 "
-           "returns DUPLICATE_BOL_OVERRIDE before the match block whenever that "
-           "bol_number already exists -- which is exactly when this case applies.",
-)
 async def test_historical_update_patches_matching_leg(pool):
     leg_id = await insert_leg(
         pool, bol_number="B22", leg_status="COMPLETED",

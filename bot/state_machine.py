@@ -88,8 +88,15 @@ async def commit_trip_leg(
                 logger.info(f"Ignored in-facility dock move for Driver #{did} at {origin_loc}.")
                 return {"is_clean": True, "leg_id": None, "card_text": None}
 
-            # 2. GLOBAL DUPLICATE BOL GUARD
-            if bol_number:
+            # 2. DUPLICATE BOL GUARD
+            # Deliberately NOT run ahead of the match block. The patch paths --
+            # CASE_HISTORICAL_BOL_UPDATE, CASE_AUTO_RESOLVE, and the CASE 1
+            # auto-heal -- all locate their target *by* an existing bol_number,
+            # so a pre-match guard made every one of them unreachable. It now
+            # runs only where a brand new leg would claim a BOL.
+            async def duplicate_bol_card():
+                if not bol_number:
+                    return None
                 await cur.execute(
                     f"""SELECT id 
                           FROM {TABLE_SHUTTLE_LEGS} 
@@ -98,21 +105,22 @@ async def commit_trip_leg(
                     (bol_number,)
                 )
                 existing_bol = await cur.fetchone()
-                if existing_bol:
-                    return {
-                        "is_clean": False,
-                        "leg_id": None,
-                        "action_type": "DUPLICATE_BOL_OVERRIDE",
-                        "duplicate_bol": bol_number,
-                        "existing_leg_id": existing_bol[0],
-                        "card_text": (
-                            f"⚠️ **MANUAL RECONCILE: Duplicate BOL Number**\n"
-                            f"👤 Driver: {user_name}\n"
-                            f"📄 BOL Number: `{bol_number}`\n"
-                            f"❓ Issue: Already logged under Leg `{existing_bol[0]}`.\n"
-                            f"👉 Click below to force save this entry anyway."
-                        )
-                    }
+                if not existing_bol:
+                    return None
+                return {
+                    "is_clean": False,
+                    "leg_id": None,
+                    "action_type": "DUPLICATE_BOL_OVERRIDE",
+                    "duplicate_bol": bol_number,
+                    "existing_leg_id": existing_bol[0],
+                    "card_text": (
+                        f"⚠️ **MANUAL RECONCILE: Duplicate BOL Number**\n"
+                        f"👤 Driver: {user_name}\n"
+                        f"📄 BOL Number: `{bol_number}`\n"
+                        f"❓ Issue: Already logged under Leg `{existing_bol[0]}`.\n"
+                        f"👉 Click below to force save this entry anyway."
+                    )
+                }
 
             match case_type:
 
@@ -151,6 +159,12 @@ async def commit_trip_leg(
                         await conn.commit()
                         logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
+
+                    # A genuinely new departure may not claim a BOL that is
+                    # already recorded against another leg.
+                    duplicate = await duplicate_bol_card()
+                    if duplicate:
+                        return duplicate
 
                     # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
                     await cur.execute(

@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     -- SDS yard slot ("DO# 34"). A parking position, unrelated to the delivery
     -- order number that may appear on a BOL. SDS is the only site using it.
     do_number VARCHAR(32) DEFAULT NULL,
+    -- Hand-marked on RM paperwork as "08/28-7": that load's place in the
+    -- allocation the SDS manager sets for the day.
+    rm_seq VARCHAR(16) DEFAULT NULL,
     shipper_signed TINYINT(1) DEFAULT 0,
     receiver_signed TINYINT(1) DEFAULT 0,
     is_positioning_leg TINYINT(1) DEFAULT 0,
@@ -158,6 +161,9 @@ ADDITIVE_COLUMNS = (
     ("do_number",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN do_number VARCHAR(32) DEFAULT NULL AFTER destination_dock"),
+    ("rm_seq",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN rm_seq VARCHAR(16) DEFAULT NULL AFTER do_number"),
     ("load_type",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN load_type VARCHAR(32) DEFAULT NULL AFTER route_code"),

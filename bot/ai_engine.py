@@ -279,9 +279,15 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
    - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
 4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
-4b. "do_number": SDS clerks HAND-WRITE a yard slot on the BOL so the driver can find the trailer in a very large yard. It looks like "DO# 34", "DO 34" or "D.O. 34", usually one to three digits, and is often the only handwriting on the page. Return just the number. This is a parking position, not a delivery order number, and only SDS paperwork carries one. Return null if absent.
-5. "shipper_signed": Set to True if there is a signature, initials, or stamp in the origin/shipper/carrier section.
-6. "receiver_signed": Set to True if there is a signature, stamp, checkmark, or handwritten note in the delivery/consignee section.
+4b. "do_number": ONLY if the letters "DO" or "D.O." literally appear next to a number, as in "DO# 34" or "D.O. 34". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
+
+4c. "dock_number": a hand-written "#NN" with no other label is the dock the trailer was loaded at or delivered to. Return just the digits, e.g. "#47" -> "47". Return null if absent.
+
+4d. "rm_seq": RM paperwork is hand-marked with the date and that load's sequence in the day's allocation, written "08/28-7" or "8/28 - 7", meaning the 7th RM load of 28 August. Return ONLY the number after the dash, e.g. "7". Return null if there is no such mark.
+5. "shipper_signed": True only if the ORIGIN or SHIPPER side carries a hand-written signature, initials, or a department/company stamp authorising release (an "RM DEPT" stamp from the pick-up company counts).
+6. "receiver_signed": True only if the DELIVERY or CONSIGNEE section specifically carries a hand-written signature or initials from whoever received the goods.
+   - Be conservative. A stamp from the SHIPPING company, a date, a dock number, or any other handwriting elsewhere on the page is NOT a receiver signature.
+   - Reporting a receipt that did not happen is far worse than missing one: it silently satisfies a compliance check that exists to catch missing proof of delivery. When unsure, return False.
 
 Return raw JSON ONLY:
 {
@@ -290,6 +296,8 @@ Return raw JSON ONLY:
   "document_type": "FG" | "RM" | "UNKNOWN",
   "trailer_number": string or null,
   "do_number": string or null,
+  "dock_number": string or null,
+  "rm_seq": string or null,
   "shipper_signed": boolean,
   "receiver_signed": boolean
 }"""
@@ -299,6 +307,8 @@ Return raw JSON ONLY:
         "document_type": "UNKNOWN",
         "trailer_number": None,
         "do_number": None,
+        "dock_number": None,
+        "rm_seq": None,
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
@@ -336,8 +346,9 @@ Return raw JSON ONLY:
             if data.get("trailer_number") and not result["trailer_number"]:
                 result["trailer_number"] = data["trailer_number"]
 
-            if data.get("do_number") and not result["do_number"]:
-                result["do_number"] = data["do_number"]
+            for field in ("do_number", "dock_number", "rm_seq"):
+                if data.get(field) and not result[field]:
+                    result[field] = data[field]
 
             if data.get("shipper_signed"):
                 result["shipper_signed"] = True
@@ -377,6 +388,7 @@ async def prepare_text_intent(text: str) -> dict:
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
         "do_number": llm_parsed.get("do_number"),
+        "rm_seq": None,
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -422,6 +434,7 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         # Handwritten on the BOL by the SDS clerk, so the image is the more
         # reliable source; a caption mentioning it still wins if present.
         "do_number": llm_parsed.get("do_number") or ocr_data.get("do_number"),
+        "rm_seq": ocr_data.get("rm_seq"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

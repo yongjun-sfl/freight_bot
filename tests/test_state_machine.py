@@ -411,13 +411,6 @@ async def test_auto_resolve_without_open_leg_raises_card(pool):
 # Slang parsing
 # ==========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="state_machine.py:39 does a bare substring test for 'bt', so any word "
-           "containing those letters ('doubt', 'subtotal', 'debt') flags the trip as "
-           "bobtail, forces load_status to EMPTY and skips the BOL compliance guard. "
-           "Needs word-boundary matching.",
-)
 async def test_bt_inside_a_word_does_not_flag_bobtail(pool):
     res = await commit(
         pool,
@@ -450,3 +443,42 @@ async def test_location_aliases_are_normalised(pool):
     assert leg["origin_location"] == "200"
     assert leg["destination_location"] == "E2F"
 
+
+@pytest.mark.parametrize("phrase", [
+    "heading to 200 bobtail",
+    "heading to 200 bob tail",
+    "200 bt",
+    "b/t to 200",
+    "no trailer, heading to 200",
+    "tractor only today",
+    "single tractor to 200",
+])
+async def test_bobtail_slang_is_still_detected(pool, phrase):
+    """Guards against the word-boundary fix over-correcting and missing real slang."""
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text=phrase,
+               origin_location="E2F", destination_location="200",
+               text_trailer="77344"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_bobtail"] == 1, f"{phrase!r} should flag bobtail"
+    assert leg["load_status"] == "EMPTY"
+
+
+@pytest.mark.parametrize("phrase", [
+    "leaving 200 to E2F, no doubt running late",
+    "200 to E2F, subtotal on the paperwork looks off",
+    "heading to E2F, paying off a debt",
+])
+async def test_ordinary_words_containing_bt_are_not_bobtail(pool, phrase):
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text=phrase,
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", bol_number=f"B-{abs(hash(phrase)) % 99999}",
+               primary_image_blob=IMG, load_status="LOADED"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_bobtail"] == 0, f"{phrase!r} must not flag bobtail"
+    assert leg["load_status"] == "LOADED"

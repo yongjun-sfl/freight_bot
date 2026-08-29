@@ -1,8 +1,17 @@
 import logging
+import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS
 from ai_engine import normalize_location
 
 logger = logging.getLogger(__name__)
+
+# Word-boundary matched: a bare `"bt" in text` substring test fires on ordinary
+# words like "doubt", "debt" and "subtotal", which forced load_status to EMPTY
+# and silently skipped the outbound BOL compliance guard.
+BOBTAIL_PATTERN = re.compile(
+    r"\b(?:bobtail|bob\s*tail|bt|b/t|no\s+trailer|single\s+tractor|tractor\s+only)\b",
+    re.IGNORECASE,
+)
 
 
 async def commit_trip_leg(
@@ -36,7 +45,7 @@ async def commit_trip_leg(
     raw_lower = raw_text.lower()
 
     # Detect Bobtail Flag
-    is_bobtail_flag = 1 if any(term in raw_lower for term in ["bobtail", "bt", "b/t", "no trailer", "tractor only"]) else 0
+    is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(raw_text) else 0
 
     # Extended Fallback Logic for Load Status
     if is_bobtail_flag or parsed_load_status == "BOBTAIL":

@@ -491,5 +491,25 @@ async def commit_trip_leg(
                         )
                     }
 
+                # =========================================================
+                # PARSE FAILURE: surface, never swallow
+                # =========================================================
+                case "PARSE_FAILED":
+                    logger.error(
+                        f"Parser unavailable for Driver #{did} ({user_name}); "
+                        f"raising manual card. Detail: {intent.get('parse_error')}"
+                    )
+                    return {
+                        "is_clean": False,
+                        "leg_id": None,
+                        "card_text": (
+                            f"⚠️ **MANUAL RECONCILE: Message Could Not Be Parsed**\n"
+                            f"👤 Driver: {user_name}\n"
+                            f"💬 Message: `{raw_text or '(no text - attached document only)'}`\n"
+                            f"❓ Issue: The AI parser was unavailable after repeated retries, so this "
+                            f"update was NOT recorded. Please enter it manually."
+                        )
+                    }
+
                 case _:
                     return {"is_clean": False, "card_text": None}

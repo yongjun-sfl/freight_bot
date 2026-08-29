@@ -3,6 +3,7 @@ import io
 import json
 import time
 import random
+import asyncio
 import logging
 from PIL import Image
 from pdf2image import convert_from_bytes
@@ -133,8 +134,15 @@ def call_gemini_with_retry(contents, config=None, retries=5, initial_delay=1.0, 
 
 
 def parse_text_with_llm(text: str) -> dict:
-    if not text or not text.strip() or not client:
+    if not text or not text.strip():
         return {"case_type": "NONE_WORK_RELATED"}
+
+    if not client:
+        logger.error("GEMINI_API_KEY is not configured; driver text cannot be parsed.")
+        return {
+            "case_type": "PARSE_FAILED",
+            "parse_error": "GEMINI_API_KEY is not configured",
+        }
 
     if LOCATION_CACHE["codes"]:
         known_locations = ", ".join(LOCATION_CACHE["codes"])
@@ -193,8 +201,11 @@ Return raw JSON ONLY:
         )
         return json.loads(response.text)
     except Exception as e:
-        logger.error(f"Failed to parse text: {e}")
-        return {"case_type": "NONE_WORK_RELATED"}
+        # Must NOT collapse to NONE_WORK_RELATED: that is indistinguishable
+        # from casual chat, so the state machine silently discards the
+        # message and the truck movement is never recorded.
+        logger.error(f"Failed to parse text after retries: {e}")
+        return {"case_type": "PARSE_FAILED", "parse_error": str(e)[:200]}
 
 
 def extract_bol_locally(files: list[bytes]) -> dict:
@@ -240,9 +251,13 @@ Return raw JSON ONLY:
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
-        "is_paper_document": False
+        "is_paper_document": False,
+        # True only when every image errored, i.e. the vision API is down.
+        # Distinct from "scanned fine, found no document".
+        "ocr_failed": False
     }
 
+    scan_errors = 0
     for idx, img_bytes in enumerate(processed_images):
         compressed = compress_image(img_bytes, max_dim=1800)
         try:
@@ -285,15 +300,21 @@ Return raw JSON ONLY:
                 break
 
         except Exception as e:
+            scan_errors += 1
             logger.warning(f"Vision OCR scan error on image {idx+1}: {e}")
 
+    result["ocr_failed"] = scan_errors == len(processed_images)
     return result
 
 
 async def prepare_text_intent(text: str) -> dict:
-    llm_parsed = parse_text_with_llm(text)
+    # parse_text_with_llm is blocking and now waits out transient failures for
+    # up to ~15s. Called inline it would stall the whole bot for every driver.
+    loop = asyncio.get_running_loop()
+    llm_parsed = await loop.run_in_executor(None, parse_text_with_llm, text)
     return {
         "case_type": llm_parsed.get("case_type", "NONE_WORK_RELATED"),
+        "parse_error": llm_parsed.get("parse_error"),
         "raw_text": text or "",
         "text_trailer": llm_parsed.get("trailer_number"),
         "ocr_trailer": None,
@@ -311,16 +332,29 @@ async def prepare_text_intent(text: str) -> dict:
 
 
 async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> dict:
-    llm_parsed = parse_text_with_llm(caption_text) if caption_text and caption_text.strip() else {}
+    has_caption = bool(caption_text and caption_text.strip())
+
+    # Both calls are blocking; neither may run on the event loop.
+    llm_parsed = (
+        await loop.run_in_executor(None, parse_text_with_llm, caption_text)
+        if has_caption else {}
+    )
     ocr_data = await loop.run_in_executor(None, extract_bol_locally, images)
 
-    if caption_text and caption_text.strip():
+    if has_caption:
         case_type = llm_parsed.get("case_type", "CASE_1_ORIGIN_DEPARTURE")
+    elif ocr_data.get("ocr_failed"):
+        # Vision was unreachable for every image. Do not pretend the driver
+        # posted something irrelevant -- surface it instead.
+        case_type = "PARSE_FAILED"
     else:
         case_type = "CASE_AUTO_RESOLVE" if ocr_data.get("is_paper_document") else "NONE_WORK_RELATED"
 
     return { 
         "case_type": case_type,
+        "parse_error": llm_parsed.get("parse_error") or (
+            "Vision OCR failed on every attached image" if ocr_data.get("ocr_failed") else None
+        ),
         "raw_text": caption_text or "",
         "text_trailer": llm_parsed.get("trailer_number"),
         "ocr_trailer": ocr_data.get("trailer_number"),

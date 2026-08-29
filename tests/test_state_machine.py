@@ -482,3 +482,42 @@ async def test_ordinary_words_containing_bt_are_not_bobtail(pool, phrase):
     leg = await get_leg(pool, res["leg_id"])
     assert leg["is_bobtail"] == 0, f"{phrase!r} must not flag bobtail"
     assert leg["load_status"] == "LOADED"
+
+
+# ==========================================================================
+# Parser availability
+# ==========================================================================
+
+async def test_parse_failure_raises_manual_card(pool):
+    """A parser outage must never look like casual chat."""
+    res = await commit(
+        pool,
+        intent(case_type="PARSE_FAILED", raw_text="200 to e2f loaded 77344",
+               parse_error="503 UNAVAILABLE"),
+    )
+    assert res["is_clean"] is False
+    assert "Could Not Be Parsed" in res["card_text"]
+    # the driver's original words must survive into the card for manual entry
+    assert "200 to e2f loaded 77344" in res["card_text"]
+    assert await all_legs(pool) == []
+
+
+async def test_parse_failure_on_captionless_document_still_cards(pool):
+    res = await commit(pool, intent(case_type="PARSE_FAILED", raw_text=""))
+    assert res["is_clean"] is False
+    assert "attached document only" in res["card_text"]
+
+
+async def test_parse_failure_from_unknown_driver_stays_silent(pool):
+    """Non-drivers must not be able to generate dispatch noise."""
+    res = await commit(
+        pool, intent(case_type="PARSE_FAILED", raw_text="hello"), did=999999,
+    )
+    assert res["card_text"] is None
+
+
+async def test_none_work_related_still_silent(pool):
+    """Genuine chatter must stay silent -- PARSE_FAILED is the only loud path."""
+    res = await commit(pool, intent(case_type="NONE_WORK_RELATED", raw_text="lunch?"))
+    assert res["card_text"] is None
+    assert await all_legs(pool) == []

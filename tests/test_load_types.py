@@ -131,3 +131,17 @@ async def test_sds_yard_slot_is_recorded(pool):
                destination_location="SDS", do_number="34"),
     )
     assert (await get_leg(pool, leg["leg_id"]))["do_number"] == "34"
+
+
+def test_loaded_200_to_sds_is_spot_work():
+    """It runs on route R2, but the load is spot delivery. Route and load type
+    are independent dimensions -- being on a defined route does not make the
+    cargo scheduled work."""
+    _sites({"200F": "200", "200R": "200"})
+    assert load_types.classify("200F", "SDS", "LOADED", "R2") == "Spot Delivery"
+
+
+def test_sds_to_200_loaded_is_still_fg_sto():
+    """The reverse lane is scheduled work, so direction matters."""
+    _sites({"200F": "200"})
+    assert load_types.classify("SDS", "200F", "LOADED", "R2") == "FG STO"

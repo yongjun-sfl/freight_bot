@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
     site_code VARCHAR(32) DEFAULT NULL,
     address VARCHAR(255) DEFAULT NULL,
     location_type VARCHAR(32) DEFAULT NULL,
+    -- Who the work at this site is billed to. SDS contracts with FNS, and FNS
+    -- sites may invoice to FNS rather than SDS. Recorded, not yet acted on:
+    -- the invoicing arrangement is unsettled.
+    owner VARCHAR(32) DEFAULT NULL,
     official_name TEXT DEFAULT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -200,6 +204,9 @@ ADDITIVE_LOCATION_COLUMNS = (
     ("location_type",
      f"ALTER TABLE {TABLE_LOCATION_CODES} "
      "ADD COLUMN location_type VARCHAR(32) DEFAULT NULL AFTER address"),
+    ("owner",
+     f"ALTER TABLE {TABLE_LOCATION_CODES} "
+     "ADD COLUMN owner VARCHAR(32) DEFAULT NULL AFTER location_type"),
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.

@@ -123,3 +123,20 @@ def test_every_route_facility_is_active():
     for code in stops:
         assert code in rows, f"route uses {code}, absent from the facility list"
         assert rows[code]["active"], f"route uses {code}, which is inactive"
+
+
+def test_fns_sites_are_marked():
+    """300 and 7634 are FNS-owned. SDS contracts with FNS, so that work may
+    invoice to FNS rather than SDS -- the leg records will need splitting by
+    who is billed, even though the arrangement is not settled yet."""
+    rows = _locations()
+    assert rows["300"]["owner"] == "FNS"
+    assert rows["7634"]["owner"] == "FNS"
+    assert rows["SDS"]["owner"] == "SDS"
+    assert rows["E2F"]["owner"] == "SDS"
+
+
+def test_uncertain_ownership_is_visible_not_guessed():
+    """1380 is named CTV FNS but was not confirmed, so it is flagged rather
+    than silently assigned to either party."""
+    assert _locations()["1380"]["owner"] == "FNS?"

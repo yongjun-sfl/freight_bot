@@ -44,6 +44,7 @@ def read_locations_csv(path=LOCATIONS_PATH):
                 "official_name": (row.get("official_name") or "").strip() or None,
                 "address": (row.get("address") or "").strip() or None,
                 "type": (row.get("type") or "").strip() or None,
+                "owner": (row.get("owner") or "").strip() or None,
                 "site": (row.get("site_code") or "").strip().upper() or code,
                 "aliases": aliases or None,
                 "active": (row.get("is_active") or "YES").strip().upper() == "YES",
@@ -180,10 +181,10 @@ async def seed_network(cur):
             await cur.execute(
                 f"""INSERT INTO {TABLE_LOCATION_CODES}
                         (canonical_code, aliases, site_code, address,
-                         location_type, official_name, is_active)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s);""",
+                         location_type, owner, official_name, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
                 (row["code"], row["aliases"], row["site"], row["address"],
-                 row["type"], row["official_name"], row["active"]),
+                 row["type"], row["owner"], row["official_name"], row["active"]),
             )
         # Anything in the distance export but absent from the facility list
         # still needs a row, or normalize_location will not resolve it.

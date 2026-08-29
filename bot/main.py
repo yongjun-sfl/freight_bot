@@ -1,6 +1,9 @@
 import os
 import sys
+import asyncio
 import logging
+import concurrent.futures
+
 import aiomysql
 from telegram.ext import (
     Application,
@@ -74,6 +77,13 @@ async def init_db_pool():
 
 DWELL_SWEEP_SECONDS = 120
 
+# Gemini calls are blocking and slow -- measured 1s to 90s for the same prompt,
+# with no errors; it is Google's latency variance, not retries. They run in a
+# thread pool so the event loop stays free, but Python's default pool is
+# min(32, cpu+4), which is 8 on a t3.xlarge. With 13 drivers that queues.
+# These threads only wait on network, so a larger pool costs nothing.
+PARSE_POOL_WORKERS = int(os.getenv("PARSE_POOL_WORKERS", 32))
+
 
 async def _dwell_job(context):
     """Raise a card as each driver crosses a dwell threshold, while it matters."""
@@ -97,6 +107,13 @@ async def _dwell_job(context):
 
 
 async def on_startup(application: Application):
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=PARSE_POOL_WORKERS, thread_name_prefix="parse"
+        )
+    )
+    logger.info(f"Parse pool sized to {PARSE_POOL_WORKERS} workers.")
+
     db_pool = await init_db_pool()
     application.bot_data["db_pool"] = db_pool
     await refresh_location_cache(db_pool)

@@ -24,6 +24,24 @@ MODEL_NAME = "gemini-flash-lite-latest"
 # Transient conditions worth waiting out. Anything else (400, 401, 404,
 # malformed request) is a bug and must fail immediately rather than burn
 # the retry budget.
+# We never pass tools, so the SDK's automatic function calling is pure
+# overhead on every request.
+# maximum_remote_calls must be cleared too: leaving its default of 10 alongside
+# disable=True makes the SDK warn on every single request.
+NO_FUNCTION_CALLING = types.AutomaticFunctionCallingConfig(
+    disable=True, maximum_remote_calls=None
+)
+
+
+def json_config(**kwargs) -> "types.GenerateContentConfig":
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=0.0,
+        automatic_function_calling=NO_FUNCTION_CALLING,
+        **kwargs,
+    )
+
+
 RETRYABLE_MARKERS = (
     "503", "UNAVAILABLE", "high demand",
     "429", "RESOURCE_EXHAUSTED",
@@ -225,10 +243,7 @@ Return raw JSON ONLY:
     try:
         response = call_gemini_with_retry(
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0
-            )
+            config=json_config()
         )
         return json.loads(response.text)
     except Exception as e:
@@ -297,10 +312,7 @@ Return raw JSON ONLY:
                     dynamic_vision_prompt,
                     types.Part.from_bytes(data=compressed, mime_type="image/jpeg")
                 ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0
-                )
+                config=json_config()
             )
             data = json.loads(response.text)
 

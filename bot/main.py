@@ -18,6 +18,8 @@ from routes import refresh_route_cache, seed_default_routes
 from seed_network import seed_network
 from dwell import sweep_dwells
 from handlers import (
+    whoami_command,
+    roster_command,
     handle_text_message,
     handle_photo_message,
     handle_document_message,
@@ -148,6 +150,8 @@ def main():
 
     app = builder.build()
 
+    app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("roster", roster_command))
     app.add_handler(CommandHandler("refresh_locations", refresh_locations_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))

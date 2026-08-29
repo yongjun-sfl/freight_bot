@@ -1,6 +1,6 @@
 import logging
 import re
-from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS
+from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
 from ai_engine import normalize_location, site_of
 from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
@@ -92,7 +92,25 @@ async def commit_trip_leg(
             )
             driver_exists = await cur.fetchone()
             if not driver_exists:
-                logger.warning(f"Unauthorized update attempt by Telegram User ID #{did} ({user_name}).")
+                # Remember them rather than only logging. driver_profiles keys on
+                # the Telegram user_id, which is not recorded anywhere else, so a
+                # driver missing from the roster is silently ignored forever.
+                # /roster turns this into the list needed to register them.
+                await cur.execute(
+                    f"""INSERT INTO {TABLE_UNKNOWN_SENDERS}
+                            (user_id, display_name, message_count)
+                        VALUES (%s, %s, 1)
+                        ON DUPLICATE KEY UPDATE
+                            display_name = VALUES(display_name),
+                            last_seen = CURRENT_TIMESTAMP,
+                            message_count = message_count + 1;""",
+                    (did, user_name),
+                )
+                await conn.commit()
+                logger.warning(
+                    f"Message from unregistered Telegram user #{did} ({user_name}); "
+                    f"recorded for /roster."
+                )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
             # 1. SAME-FACILITY DEPARTURE IS A MISPARSE

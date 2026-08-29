@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ai_engine import prepare_text_intent, prepare_image_intent, refresh_location_cache
-from config import TABLE_DRIVERS
+from config import TABLE_DRIVERS, TABLE_UNKNOWN_SENDERS
 from routes import refresh_route_cache
 from state_machine import commit_trip_leg
 
@@ -346,6 +346,50 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     except Exception as e:
         logger.error(f"Error processing document from {driver_id}: {e}", exc_info=True)
+
+
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report the sender's Telegram user_id.
+
+    driver_profiles keys on that id and nothing else records it, so a driver
+    who is not registered is silently ignored by the state machine.
+    """
+    user = update.effective_user
+    handle = f"@{user.username}" if user.username else "(no username)"
+    await update.message.reply_text(
+        f"🪪 **{user.full_name}**\n"
+        f"Telegram ID: `{user.id}`\n"
+        f"Username: {handle}",
+        parse_mode="Markdown",
+    )
+
+
+async def roster_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registered drivers, plus anyone messaging who is not on the roster."""
+    pool = context.bot_data["db_pool"]
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT user_id, driver_name FROM {TABLE_DRIVERS} ORDER BY driver_name;"
+            )
+            registered = await cur.fetchall()
+            await cur.execute(
+                f"""SELECT user_id, display_name, message_count, last_seen
+                      FROM {TABLE_UNKNOWN_SENDERS}
+                  ORDER BY message_count DESC;"""
+            )
+            unknown = await cur.fetchall()
+
+    lines = [f"👥 **Registered drivers ({len(registered)})**"]
+    lines += [f"`{uid}`  {name}" for uid, name in registered] or ["_none_"]
+
+    if unknown:
+        lines.append(f"\n⚠️ **Not on the roster ({len(unknown)})**")
+        lines.append("_These are being ignored. Add the ids to driver_profiles._")
+        for uid, name, count, seen in unknown:
+            lines.append(f"`{uid}`  {name or '?'} — {count} msg, last {seen:%m/%d %H:%M}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def refresh_locations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

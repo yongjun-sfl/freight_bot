@@ -27,6 +27,7 @@ from config import (  # noqa: E402
     TABLE_ROUTE_MEMBERS,
 )
 from schema_ddl import TRUNCATABLE, apply_schema  # noqa: E402
+from config import TABLE_UNKNOWN_SENDERS  # noqa: E402
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -85,7 +86,8 @@ async def pool():
         async with conn.cursor() as cur:
             await apply_schema(cur, MYSQL_DB)
             await cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-            for table in (*TRUNCATABLE, TABLE_ROUTES, TABLE_ROUTE_MEMBERS):
+            for table in (*TRUNCATABLE, TABLE_ROUTES, TABLE_ROUTE_MEMBERS,
+                          TABLE_UNKNOWN_SENDERS):
                 await cur.execute(f"TRUNCATE TABLE {table};")
             await cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
             await cur.execute(

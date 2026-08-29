@@ -7,6 +7,7 @@ TABLE_SHUTTLE_LEGS = "shuttle_legs"
 TABLE_ROUTES = "routes"
 TABLE_ROUTE_MEMBERS = "route_members"
 TABLE_DISTANCES = "location_distances"
+TABLE_UNKNOWN_SENDERS = "unknown_senders"
 
 # INDEX NAMES
 INDEX_UNIQUE_BOL = "idx_unique_bol_number" 

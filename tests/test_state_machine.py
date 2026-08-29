@@ -858,3 +858,42 @@ async def test_dock_moves_join_the_current_round(pool):
     move = await get_leg(pool, res["leg_id"])
     assert move["is_positioning_leg"] == 1
     assert move["round_number"] == (await get_leg(pool, leg))["round_number"]
+
+
+async def test_unregistered_sender_is_recorded_for_the_roster(pool):
+    """A driver missing from driver_profiles is ignored forever and silently.
+    Their Telegram id exists nowhere else, so capture it when they message."""
+    for _ in range(3):
+        res = await commit(
+            pool,
+            intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="200F",
+                   destination_location="E2F", raw_text="200 to e2f"),
+            did=888777,
+        )
+        assert res["is_clean"] is False
+        assert res["card_text"] is None, "must stay silent to the driver"
+
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT user_id, display_name, message_count "
+                "FROM unknown_senders WHERE user_id = 888777;"
+            )
+            row = await cur.fetchone()
+    assert row is not None, "unregistered sender should be recorded"
+    assert row[2] == 3, "repeat messages should count, not duplicate"
+    assert await all_legs(pool) == []
+
+
+async def test_registered_driver_is_not_recorded_as_unknown(pool):
+    await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="200F",
+               destination_location="E2F", text_trailer="77344",
+               load_status="EMPTY"),
+    )
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM unknown_senders;")
+            (n,) = await cur.fetchone()
+    assert n == 0

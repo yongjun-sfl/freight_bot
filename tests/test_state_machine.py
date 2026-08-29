@@ -211,13 +211,6 @@ async def test_rm_load_bypasses_pod_check(pool):
     assert res["card_text"] is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Mid-shift POD guard is dead code: the SELECT at state_machine.py:247 "
-           "runs after the INSERT and has no id filter, so ORDER BY id DESC LIMIT 1 "
-           "returns the EMPTY leg just created rather than the prior FG load. "
-           "last_shift_leg[1] == 'LOADED' is therefore never true.",
-)
 async def test_midshift_pod_guard_blocks_after_unsigned_fg_leg(pool):
     await insert_leg(
         pool, leg_status="IN_TRANSIT", load_status="LOADED",

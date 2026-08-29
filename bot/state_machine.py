@@ -244,6 +244,10 @@ async def commit_trip_leg(
 
                     # DEPARTURE RULE: EMPTY Mid-Shift POD Enforcement (FG Loads ONLY)
                     if load_status_val == "EMPTY" and not is_bobtail_flag:
+                        # `id <> %s` excludes the leg inserted moments ago: without
+                        # it ORDER BY id DESC always returned that new EMPTY row, so
+                        # the `load_status == 'LOADED'` test below could never be true
+                        # and this guard never fired for any driver.
                         await cur.execute(
                             f"""SELECT id, 
                                        load_status, 
@@ -251,10 +255,11 @@ async def commit_trip_leg(
                                        document_type
                                   FROM {TABLE_SHUTTLE_LEGS} 
                                  WHERE user_id = %s 
+                                   AND id <> %s
                                    AND DATE(departure_time) = CURRENT_DATE()
                               ORDER BY id DESC 
                                  LIMIT 1;""",
-                            (did,)
+                            (did, leg_id)
                         )
                         last_shift_leg = await cur.fetchone()
 

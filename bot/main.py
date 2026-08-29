@@ -10,7 +10,7 @@ from telegram.ext import (
     filters
 )
 
-from config import TABLE_DRIVERS, TABLE_LOCATION_CODES, TABLE_SHUTTLE_LEGS, INDEX_UNIQUE_BOL
+from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
 from handlers import (
     handle_text_message,
@@ -57,76 +57,7 @@ async def init_db_pool():
 
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            # 1. Ensure driver_profiles table exists
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_DRIVERS} (
-                    user_id BIGINT PRIMARY KEY,
-                    driver_name VARCHAR(128) NOT NULL,
-                    home_yard ENUM('YARD_200', 'SDS_WH') DEFAULT 'YARD_200',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 2. Ensure location_codes table exists
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    canonical_code VARCHAR(32) NOT NULL UNIQUE,
-                    aliases VARCHAR(255) DEFAULT NULL,
-                    official_name TEXT DEFAULT NULL,
-                    is_active TINYINT(1) DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 3. Ensure shuttle_legs table exists matching exact GUI schema
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    trailer_number VARCHAR(64) DEFAULT NULL,
-                    bol_number VARCHAR(64) DEFAULT NULL,
-                    document_type ENUM('FG', 'RM', 'UNKNOWN') DEFAULT 'UNKNOWN',
-                    bol_image MEDIUMBLOB DEFAULT NULL,
-                    load_status ENUM('EMPTY', 'LOADED') DEFAULT 'LOADED',
-                    origin_location VARCHAR(128) DEFAULT 'Origin',
-                    destination_location VARCHAR(128) DEFAULT 'Destination',
-                    departure_time DATETIME DEFAULT NULL,
-                    arrival_time DATETIME DEFAULT NULL, 
-                    arrival_action VARCHAR(64) DEFAULT NULL,
-                    dock_number VARCHAR(32) DEFAULT NULL,
-                    shipper_signed TINYINT(1) DEFAULT 0,
-                    receiver_signed TINYINT(1) DEFAULT 0,
-                    is_positioning_leg TINYINT(1) DEFAULT 0,
-                    is_bobtail TINYINT(1) DEFAULT 0,
-                    leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    dispatch_msg_id BIGINT DEFAULT NULL,
-                    INDEX idx_user_status (user_id, leg_status),
-                    INDEX idx_dep_time (departure_time)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 4. Global unique index check on bol_number
-            await cur.execute(
-                f"""SELECT COUNT(*) 
-                      FROM information_schema.statistics 
-                     WHERE table_schema = %s 
-                       AND table_name = '{TABLE_SHUTTLE_LEGS}' 
-                       AND index_name = '{INDEX_UNIQUE_BOL}';""",
-                (MYSQL_DB,)
-            )
-            (index_exists,) = await cur.fetchone()
-
-            if not index_exists:
-                try:
-                    await cur.execute(
-                        f"""ALTER TABLE {TABLE_SHUTTLE_LEGS} 
-                               ADD UNIQUE INDEX {INDEX_UNIQUE_BOL} (bol_number);"""
-                    )
-                    logger.info(f"Created unique index '{INDEX_UNIQUE_BOL}'.")
-                except Exception as e:
-                    logger.warning(f"Failed to create unique index on bol_number: {e}")
+            await apply_schema(cur, MYSQL_DB, logger)
 
     logger.info("Database pool initialized successfully in Eastern Time.")
     return pool

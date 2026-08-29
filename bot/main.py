@@ -161,7 +161,11 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
     logger.info("Starting Telegram Bot long-polling...")
-    app.run_polling(drop_pending_updates=True)
+    # Telegram holds undelivered updates for 24 hours. Dropping them meant a
+    # restart silently discarded every message sent meanwhile -- movements that
+    # then existed nowhere. Timestamps come from the driver's message, so a
+    # replayed backlog records with the correct times.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":

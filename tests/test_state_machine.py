@@ -897,3 +897,64 @@ async def test_registered_driver_is_not_recorded_as_unknown(pool):
             await cur.execute("SELECT COUNT(*) FROM unknown_senders;")
             (n,) = await cur.fetchone()
     assert n == 0
+
+
+# ==========================================================================
+# Wrong destination
+# ==========================================================================
+
+async def test_arriving_off_route_raises_a_card(pool):
+    """Departure said E2F, arrival says E2R. The leg records what was reported,
+    and dispatch is told while the driver is still on site."""
+    await seed_network(pool)
+    leg = await insert_leg(
+        pool, origin_location="200F", destination_location="E2F",
+        trailer_number="77344", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="E2R"),
+    )
+    assert res["is_clean"] is False
+    assert "Wrong Destination" in res["card_text"]
+    assert "E2F" in res["card_text"] and "E2R" in res["card_text"]
+    assert res["leg_id"] == leg
+    assert (await get_leg(pool, leg))["arrival_time"] is not None
+
+
+async def test_arriving_where_expected_is_silent(pool):
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="200F", destination_location="E2F",
+                     leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="E2F"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
+
+
+async def test_front_and_rear_is_not_a_wrong_destination(pool):
+    """Routed to 200F, arrives at 200R. Same yard, not a mistake."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="SDS", destination_location="200F",
+                     leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="200R"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
+
+
+async def test_arrival_without_a_named_facility_is_silent(pool):
+    """Most arrivals are just 'arrived' or 'at door 45' with no facility, which
+    must not be read as a mismatch."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="200F", destination_location="E2F",
+                     leg_status="IN_TRANSIT")
+    res = await commit(
+        pool, intent(case_type="CASE_2_DESTINATION_ARRIVAL", door_number="45"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None

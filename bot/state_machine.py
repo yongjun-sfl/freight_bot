@@ -467,7 +467,8 @@ async def commit_trip_leg(
                     await cur.execute(
                         f"""SELECT id, 
                                    load_status, 
-                                   is_bobtail 
+                                   is_bobtail,
+                                   destination_location 
                               FROM {TABLE_SHUTTLE_LEGS} 
                              WHERE user_id = %s 
                                AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING')
@@ -481,6 +482,17 @@ async def commit_trip_leg(
                         leg_id = active_leg[0]
                         dep_load_status = active_leg[1]
                         dep_is_bobtail = active_leg[2]
+                        booked_destination = active_leg[3]
+
+                        # Arriving somewhere other than where the departure said
+                        # they were going. Compared by site, so 200F and 200R do
+                        # not read as a mismatch, and only when the driver named
+                        # a facility -- most arrivals just say "arrived".
+                        wrong_destination = (
+                            dest_loc != "UNKNOWN"
+                            and booked_destination
+                            and site_of(dest_loc) != site_of(booked_destination)
+                        )
 
                         if dep_is_bobtail or is_bobtail_flag:
                             resolved_action = "BOBTAIL_ARRIVE"
@@ -524,6 +536,25 @@ async def commit_trip_leg(
                         )
                         await conn.commit()
                         logger.info(f"✅ Driver #{did} arrived at {dest_loc}. Leg #{leg_id} updated to {target_status}.")
+
+                        if wrong_destination:
+                            logger.warning(
+                                f"Driver #{did} was routed to {booked_destination} "
+                                f"but reports arriving at {dest_loc}."
+                            )
+                            return {
+                                "is_clean": False,
+                                "leg_id": leg_id,
+                                "card_text": (
+                                    f"⚠️ **MANUAL RECONCILE: Wrong Destination**\n"
+                                    f"\U0001f464 Driver: {user_name}\n"
+                                    f"\U0001f4cd Routed to `{booked_destination}` "
+                                    f"but arrived at `{dest_loc}`.\n"
+                                    f"\U0001f69b Leg `{leg_id}` records the arrival as reported.\n"
+                                    f"\U0001f449 Confirm with the driver while they are still on site."
+                                )
+                            }
+
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
                     return {"is_clean": True, "leg_id": None, "card_text": None}

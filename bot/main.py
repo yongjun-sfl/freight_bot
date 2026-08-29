@@ -15,7 +15,7 @@ from telegram.ext import (
 from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
 from routes import refresh_route_cache, seed_default_routes
-from seed_network import seed_network
+from seed_network import seed_drivers, seed_network
 from dwell import sweep_dwells
 from handlers import (
     whoami_command,
@@ -67,6 +67,9 @@ async def init_db_pool():
             seeded = await seed_default_routes(cur)
             if seeded:
                 logger.info(f"Seeded {seeded} default shuttle routes.")
+            crew = await seed_drivers(cur)
+            if crew:
+                logger.info(f"Seeded {crew} drivers.")
             locations, distances = await seed_network(cur)
             if locations or distances:
                 logger.info(

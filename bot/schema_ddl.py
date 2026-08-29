@@ -15,13 +15,24 @@ from config import (
     INDEX_UNIQUE_BOL,
 )
 
+# user_id is nullable and merely unique, not the primary key: the roster is
+# known long before the Telegram ids are, and a driver has to exist as a row
+# before their schedule lines can be attached to anyone.
 DDL_DRIVERS = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_DRIVERS} (
-    user_id BIGINT PRIMARY KEY,
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT DEFAULT NULL,
     driver_name VARCHAR(128) NOT NULL,
+    name_kor VARCHAR(128) DEFAULT NULL,
+    name_eng VARCHAR(128) DEFAULT NULL,
+    short_name VARCHAR(128) DEFAULT NULL,
+    truck_plate VARCHAR(32) DEFAULT NULL,
+    home_repo VARCHAR(32) DEFAULT NULL,
+    is_active TINYINT(1) DEFAULT 1,
     home_yard ENUM('YARD_200', 'SDS_WH') DEFAULT 'YARD_200',
     last_nudge_at DATETIME DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_driver_user_id (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -151,6 +162,18 @@ ADDITIVE_DRIVER_COLUMNS = (
     ("last_nudge_at",
      f"ALTER TABLE {TABLE_DRIVERS} "
      "ADD COLUMN last_nudge_at DATETIME DEFAULT NULL"),
+    ("name_kor",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN name_kor VARCHAR(128) DEFAULT NULL"),
+    ("name_eng",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN name_eng VARCHAR(128) DEFAULT NULL"),
+    ("short_name",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN short_name VARCHAR(128) DEFAULT NULL"),
+    ("truck_plate",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN truck_plate VARCHAR(32) DEFAULT NULL"),
+    ("home_repo",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN home_repo VARCHAR(32) DEFAULT NULL"),
+    ("is_active",
+     f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN is_active TINYINT(1) DEFAULT 1"),
 )
 
 ADDITIVE_LOCATION_COLUMNS = (
@@ -169,10 +192,43 @@ ADDITIVE_LOCATION_COLUMNS = (
 TRUNCATABLE = (TABLE_SHUTTLE_LEGS, TABLE_LOCATION_CODES, TABLE_DRIVERS)
 
 
+async def _relax_driver_primary_key(cur, db_name: str, logger=None):
+    """Move driver_profiles off user_id as its primary key.
+
+    The original table made the Telegram id the primary key, so a driver could
+    not be recorded until that id was known -- yet the id appears in no export
+    and is only discovered when the person first messages. The roster now loads
+    first and ids attach later, so user_id becomes a nullable unique column.
+    """
+    await cur.execute(
+        """SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = 'id';""",
+        (db_name, TABLE_DRIVERS),
+    )
+    (already_done,) = await cur.fetchone()
+    if already_done:
+        return
+    try:
+        await cur.execute(
+            f"""ALTER TABLE {TABLE_DRIVERS}
+                    DROP PRIMARY KEY,
+                    MODIFY user_id BIGINT DEFAULT NULL,
+                    ADD COLUMN id INT AUTO_INCREMENT PRIMARY KEY FIRST,
+                    ADD UNIQUE INDEX idx_driver_user_id (user_id);"""
+        )
+        if logger:
+            logger.info(f"Restructured {TABLE_DRIVERS}: user_id is now nullable.")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Could not restructure {TABLE_DRIVERS}: {e}")
+
+
 async def apply_schema(cur, db_name: str, logger=None):
     """Create every table, add late columns, ensure the unique BOL index."""
     for ddl in ALL_TABLES:
         await cur.execute(ddl)
+
+    await _relax_driver_primary_key(cur, db_name, logger)
 
     for table, columns in ((TABLE_SHUTTLE_LEGS, ADDITIVE_COLUMNS),
                            (TABLE_LOCATION_CODES, ADDITIVE_LOCATION_COLUMNS),

@@ -13,13 +13,14 @@ import csv
 import logging
 import os
 
-from config import TABLE_DISTANCES, TABLE_LOCATION_CODES
+from config import TABLE_DISTANCES, TABLE_DRIVERS, TABLE_LOCATION_CODES
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CSV_PATH = os.path.join(DATA_DIR, "location_distance.csv")
 LOCATIONS_PATH = os.path.join(DATA_DIR, "locations.csv")
+DRIVERS_PATH = os.path.join(DATA_DIR, "drivers.csv")
 
 def read_locations_csv(path=LOCATIONS_PATH):
     """Facility list with official names, addresses, sites and active flags.
@@ -91,6 +92,75 @@ def read_distance_csv(path=CSV_PATH):
 
     codes = sorted({code for pair in pairs for code in pair})
     return codes, pairs
+
+
+def read_drivers_csv(path=DRIVERS_PATH):
+    """The driver roster: Korean name, English name, short name, plate, repo.
+
+    telegram_user_id is usually blank. It appears in no export -- it is
+    Telegram's own account id, learned only when someone messages -- so the
+    roster loads without it and ids attach later via /roster.
+    """
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            english = (row.get("name_eng") or "").strip()
+            korean = (row.get("name_kor") or "").strip()
+            if not (english or korean):
+                continue
+            raw_id = (row.get("telegram_user_id") or "").strip()
+            rows.append({
+                "user_id": int(raw_id) if raw_id.isdigit() else None,
+                "name_kor": korean or None,
+                "name_eng": english or None,
+                "short_name": (row.get("short_name") or "").strip() or None,
+                "truck_plate": (row.get("truck_plate") or "").strip() or None,
+                "home_repo": (row.get("home_repo") or "").strip().upper() or None,
+                # Case-folded: the export mixes Y and y.
+                "active": (row.get("active") or "Y").strip().upper() == "Y",
+                "display": english or korean,
+            })
+    return rows
+
+
+def name_forms(driver) -> set:
+    """Every way a driver might be written in a schedule post."""
+    forms = set()
+    for value in (driver.get("name_kor"), driver.get("name_eng"),
+                  driver.get("short_name"), driver.get("display")):
+        if value:
+            forms.add(value.strip().upper())
+    return forms
+
+
+async def seed_drivers(cur):
+    """Load the roster if driver_profiles is empty. Returns rows inserted."""
+    drivers = read_drivers_csv()
+    if not drivers:
+        return 0
+    await cur.execute(f"SELECT COUNT(*) FROM {TABLE_DRIVERS};")
+    (existing,) = await cur.fetchone()
+    if existing:
+        return 0
+
+    for d in drivers:
+        await cur.execute(
+            f"""INSERT INTO {TABLE_DRIVERS}
+                    (user_id, driver_name, name_kor, name_eng, short_name,
+                     truck_plate, home_repo, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
+            (d["user_id"], d["display"], d["name_kor"], d["name_eng"],
+             d["short_name"], d["truck_plate"], d["home_repo"], d["active"]),
+        )
+    missing = sum(1 for d in drivers if d["user_id"] is None)
+    if missing:
+        logger.warning(
+            f"{missing} of {len(drivers)} drivers have no Telegram id and will be "
+            f"ignored by the state machine until one is set. Use /roster."
+        )
+    return len(drivers)
 
 
 async def seed_network(cur):

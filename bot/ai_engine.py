@@ -186,10 +186,8 @@ EXTRACTION & NORMALIZATION RULES:
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
    - Leave origin_location and destination_location null for CASE_3; drivers rarely name the facility on an internal move and it is inferred from their last known position.
 
-3. Dock Cleanup:
-   - If the driver says "cleanup" or "clean up", keep the case as CASE_3_INTRA_FACILITY_MOVE and set is_cleanup to true. Otherwise set it false.
 
-4. Load Status & Trailer Details:
+3. Load Status & Trailer Details:
    - Set load_status to "BOBTAIL", "EMPTY", or "LOADED" based on text or slang terms above.
    - Extract trailer_number (e.g., "77344").
 
@@ -200,7 +198,6 @@ Return raw JSON ONLY:
   "destination_location": string or null,
   "origin_dock": string or null,
   "destination_dock": string or null,
-  "is_cleanup": boolean,
   "trailer_number": string or null,
   "door_number": string or null,
   "action": "LIVE_UNLOAD" | "DROP_DOCK" | "DROP_YARD" | "DROP_DOOR" | "BOBTAIL_ARRIVE" | null,
@@ -341,7 +338,6 @@ async def prepare_text_intent(text: str) -> dict:
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
-        "is_cleanup": bool(llm_parsed.get("is_cleanup")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -384,7 +380,6 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
-        "is_cleanup": bool(llm_parsed.get("is_cleanup")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

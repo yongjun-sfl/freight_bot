@@ -33,7 +33,6 @@ async def commit_trip_leg(
     door_num = intent.get("door_number")
     origin_dock = intent.get("origin_dock")
     destination_dock = intent.get("destination_dock")
-    is_cleanup = bool(intent.get("is_cleanup"))
     primary_image_blob = intent.get("primary_image_blob")
     shipper_signed = intent.get("shipper_signed", False)
     receiver_signed = intent.get("receiver_signed", False)
@@ -559,48 +558,14 @@ async def commit_trip_leg(
                     to_dock = (destination_dock or "").strip().upper() or None
                     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
 
-                    # Dispatcher-assigned cleanup is billable work in its own right
-                    # and is recorded as a standalone leg even mid-trip. Otherwise
-                    # the move belongs to the trip the driver is already on.
-                    parent_leg = None
-                    if not is_cleanup and facility != "UNKNOWN":
-                        # Deliberately not restricted to open legs: a DROP arrival
-                        # closes the leg, yet the driver is still working that trip.
-                        await cur.execute(
-                            f"""SELECT id 
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND destination_location = %s 
-                                   AND is_positioning_leg = 0 
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did, facility)
-                        )
-                        row = await cur.fetchone()
-                        parent_leg = row[0] if row else None
-
-                    if parent_leg:
-                        # Trailer is COALESCEd, never overwritten: the driver may
-                        # have dropped what they arrived with and hooked another,
-                        # and this leg should keep what it actually carried.
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET origin_dock = COALESCE(%s, origin_dock),
-                                       destination_dock = COALESCE(%s, destination_dock),
-                                       trailer_number = COALESCE(trailer_number, %s)
-                                 WHERE id = %s;""",
-                            (from_dock, to_dock, display_trailer, parent_leg)
-                        )
-                        await conn.commit()
-                        logger.info(
-                            f"\u2699\ufe0f Driver #{did} repositioned {move_desc} at {facility}; "
-                            f"folded into Leg #{parent_leg}."
-                        )
-                        return {"is_clean": True, "leg_id": parent_leg, "card_text": None}
-
-                    # Standalone move: dispatcher-assigned cleanup, or no trip to
-                    # attach it to. Recorded COMPLETED so it can never be mistaken
-                    # for an open trip by a later arrival.
+                    # Every internal move gets its own row. Drivers never label
+                    # these, and billing is by shift rather than by move, so no
+                    # cleanup-vs-reposition guess is needed or wanted. Folding a
+                    # move into the trip leg would also silently overwrite earlier
+                    # moves, since a leg holds only one dock pair.
+                    #
+                    # Recorded COMPLETED so a later arrival can never mistake one
+                    # for an open trip.
                     await cur.execute(
                         f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
                                user_id, 
@@ -626,8 +591,8 @@ async def commit_trip_leg(
                     await conn.commit()
                     leg_id = cur.lastrowid
                     logger.info(
-                        f"\U0001f4e6 Driver #{did} logged {'cleanup' if is_cleanup else 'standalone'} "
-                        f"move {move_desc} at {facility} as Leg #{leg_id}."
+                        f"\U0001f4e6 Driver #{did} moved {move_desc} at {facility}; "
+                        f"recorded as positioning Leg #{leg_id}."
                     )
 
                     if facility == "UNKNOWN" or not to_dock:

@@ -20,7 +20,6 @@
 ├── pytest.ini
 ├── requirements-dev.txt        # pytest only, kept out of the runtime image
 ├── PROJECT_STRUCTURE.md
-├── handsoff.md
 └── .memory.md
 ```
 

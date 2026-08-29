@@ -1,0 +1,37 @@
+# Test overlay. Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm tests
+#
+# Reuses the mysql_db service from the base file but writes to a separate
+# `shuttle_db_test` schema, so production data is never touched.
+services:
+  # MySQL's data dir must live on a native Docker volume, not the /mnt/c drvfs
+  # mount -- InnoDB cannot initialise reliably on Windows-backed filesystems.
+  mysql_db:
+    volumes:
+      - mysql_test_data:/var/lib/mysql
+
+  tests:
+    build: ./bot
+    depends_on:
+      mysql_db:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - TEST_MYSQL_HOST=mysql_db
+      - TEST_MYSQL_PORT=3306
+      - TEST_MYSQL_USER=root
+      - TEST_MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - TEST_MYSQL_DATABASE=shuttle_db_test
+    volumes:
+      - ./bot:/src/bot:ro
+      - ./tests:/src/tests:ro
+      - ./pytest.ini:/src/pytest.ini:ro
+      - ./requirements-dev.txt:/src/requirements-dev.txt:ro
+    working_dir: /src
+    command: >
+      sh -c "pip install --no-cache-dir -q -r requirements-dev.txt &&
+             pytest"
+
+volumes:
+  mysql_test_data:

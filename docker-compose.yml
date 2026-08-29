@@ -9,8 +9,11 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
       - "3306:3306"
+    volumes:
+      # Defaults to the EC2 host path; override locally via MYSQL_DATA_PATH in .env
+      - ${MYSQL_DATA_PATH:-/home/ubuntu/SFL/freight_bot/mysql_data}:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_pass"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 3s
       timeout: 3s
       retries: 10

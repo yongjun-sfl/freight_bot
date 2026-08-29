@@ -1,0 +1,16 @@
+# Runtime dependencies. Pinned so a rebuild produces the same image.
+#
+# NOTE ON THE httpx CONSTRAINT:
+#   python-telegram-bot 20.8 requires httpx~=0.26.0
+#   google-genai >=2.x   requires httpx>=0.28.1
+# These are mutually exclusive. google-genai is held at 1.2.0, the newest
+# release compatible with PTB 20.x -- and the version pip was already
+# resolving to silently when google-genai was unpinned.
+# Moving to google-genai 2.x requires upgrading PTB to 22.x first.
+# [job-queue] pulls APScheduler, needed for the dwell monitor.
+python-telegram-bot[job-queue]==20.8
+google-genai==1.2.0
+aiomysql==0.3.2
+Pillow==12.3.0
+pdf2image==1.17.0
+tzdata==2026.3

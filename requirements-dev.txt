@@ -1,0 +1,4 @@
+# Test-only dependencies, installed by the `tests` compose service.
+# Deliberately kept out of the runtime image.
+pytest==9.1.1
+pytest-asyncio==1.4.0

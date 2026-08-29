@@ -1,22 +1,29 @@
 import os
 import sys
+import asyncio
 import logging
+import concurrent.futures
+
 import aiomysql
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters
 )
 
-from config import TABLE_DRIVERS, TABLE_LOCATION_CODES, TABLE_SHUTTLE_LEGS, INDEX_UNIQUE_BOL
+from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
+from load_types import load_lane_map
+from routes import refresh_route_cache, seed_default_routes
+from seed_network import seed_drivers, seed_network
+from dwell import sweep_dwells
 from handlers import (
+    whoami_command,
+    roster_command,
     handle_text_message,
     handle_photo_message,
     handle_document_message,
-    handle_callback_query,
     refresh_locations_command
 )
 
@@ -57,85 +64,79 @@ async def init_db_pool():
 
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            # 1. Ensure driver_profiles table exists
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_DRIVERS} (
-                    user_id BIGINT PRIMARY KEY,
-                    driver_name VARCHAR(128) NOT NULL,
-                    home_yard ENUM('YARD_200', 'SDS_WH') DEFAULT 'YARD_200',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 2. Ensure location_codes table exists
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    canonical_code VARCHAR(32) NOT NULL UNIQUE,
-                    aliases VARCHAR(255) DEFAULT NULL,
-                    official_name TEXT DEFAULT NULL,
-                    is_active TINYINT(1) DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 3. Ensure shuttle_legs table exists matching exact GUI schema
-            await cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    trailer_number VARCHAR(64) DEFAULT NULL,
-                    bol_number VARCHAR(64) DEFAULT NULL,
-                    document_type ENUM('FG', 'RM', 'UNKNOWN') DEFAULT 'UNKNOWN',
-                    bol_image MEDIUMBLOB DEFAULT NULL,
-                    load_status ENUM('EMPTY', 'LOADED') DEFAULT 'LOADED',
-                    origin_location VARCHAR(128) DEFAULT 'Origin',
-                    destination_location VARCHAR(128) DEFAULT 'Destination',
-                    departure_time DATETIME DEFAULT NULL,
-                    arrival_time DATETIME DEFAULT NULL, 
-                    arrival_action VARCHAR(64) DEFAULT NULL,
-                    dock_number VARCHAR(32) DEFAULT NULL,
-                    shipper_signed TINYINT(1) DEFAULT 0,
-                    receiver_signed TINYINT(1) DEFAULT 0,
-                    is_positioning_leg TINYINT(1) DEFAULT 0,
-                    is_bobtail TINYINT(1) DEFAULT 0,
-                    leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    dispatch_msg_id BIGINT DEFAULT NULL,
-                    INDEX idx_user_status (user_id, leg_status),
-                    INDEX idx_dep_time (departure_time)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-
-            # 4. Global unique index check on bol_number
-            await cur.execute(
-                f"""SELECT COUNT(*) 
-                      FROM information_schema.statistics 
-                     WHERE table_schema = %s 
-                       AND table_name = '{TABLE_SHUTTLE_LEGS}' 
-                       AND index_name = '{INDEX_UNIQUE_BOL}';""",
-                (MYSQL_DB,)
-            )
-            (index_exists,) = await cur.fetchone()
-
-            if not index_exists:
-                try:
-                    await cur.execute(
-                        f"""ALTER TABLE {TABLE_SHUTTLE_LEGS} 
-                               ADD UNIQUE INDEX {INDEX_UNIQUE_BOL} (bol_number);"""
-                    )
-                    logger.info(f"Created unique index '{INDEX_UNIQUE_BOL}'.")
-                except Exception as e:
-                    logger.warning(f"Failed to create unique index on bol_number: {e}")
+            await apply_schema(cur, MYSQL_DB, logger)
+            seeded = await seed_default_routes(cur)
+            if seeded:
+                logger.info(f"Seeded {seeded} default shuttle routes.")
+            crew = await seed_drivers(cur)
+            if crew:
+                logger.info(f"Seeded {crew} drivers.")
+            locations, distances = await seed_network(cur)
+            if locations or distances:
+                logger.info(
+                    f"Seeded {locations} location codes and {distances} distance pairs."
+                )
 
     logger.info("Database pool initialized successfully in Eastern Time.")
     return pool
 
 
+DWELL_SWEEP_SECONDS = 120
+
+# Gemini calls are blocking and slow -- measured 1s to 90s for the same prompt,
+# with no errors; it is Google's latency variance, not retries. They run in a
+# thread pool so the event loop stays free, but Python's default pool is
+# min(32, cpu+4), which is 8 on a t3.xlarge. With 13 drivers that queues.
+# These threads only wait on network, so a larger pool costs nothing.
+PARSE_POOL_WORKERS = int(os.getenv("PARSE_POOL_WORKERS", 32))
+
+
+async def _dwell_job(context):
+    """Raise a card as each driver crosses a dwell threshold, while it matters."""
+    pool = context.bot_data.get("db_pool")
+    if not pool:
+        return
+    channel = os.getenv("DISPATCH_ALERT_CHANNEL_ID")
+    if not channel:
+        return
+
+    async def send_card(text):
+        await context.bot.send_message(chat_id=channel, text=text,
+                                       parse_mode="Markdown")
+
+    try:
+        sent = await sweep_dwells(pool, send_card)
+        if sent:
+            logger.info(f"Dwell sweep raised {sent} card(s).")
+    except Exception as e:
+        logger.error(f"Dwell sweep failed: {e}", exc_info=True)
+
+
 async def on_startup(application: Application):
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=PARSE_POOL_WORKERS, thread_name_prefix="parse"
+        )
+    )
+    logger.info(f"Parse pool sized to {PARSE_POOL_WORKERS} workers.")
+
     db_pool = await init_db_pool()
     application.bot_data["db_pool"] = db_pool
     await refresh_location_cache(db_pool)
+    await refresh_route_cache(db_pool)
+    load_lane_map()
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            _dwell_job, interval=DWELL_SWEEP_SECONDS, first=DWELL_SWEEP_SECONDS
+        )
+        logger.info(f"Dwell monitor running every {DWELL_SWEEP_SECONDS}s.")
+    else:
+        logger.warning(
+            "JobQueue unavailable; dwell alerts disabled. "
+            "Install python-telegram-bot[job-queue]."
+        )
+
     logger.info("🚀 AI Dispatch Engine is live.")
 
 
@@ -154,14 +155,19 @@ def main():
 
     app = builder.build()
 
+    app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("roster", roster_command))
     app.add_handler(CommandHandler("refresh_locations", refresh_locations_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
     logger.info("Starting Telegram Bot long-polling...")
-    app.run_polling(drop_pending_updates=True)
+    # Telegram holds undelivered updates for 24 hours. Dropping them meant a
+    # restart silently discarded every message sent meanwhile -- movements that
+    # then existed nowhere. Timestamps come from the driver's message, so a
+    # replayed backlog records with the correct times.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":

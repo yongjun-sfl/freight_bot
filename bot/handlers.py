@@ -2,12 +2,13 @@ import os
 import logging
 import asyncio
 from zoneinfo import ZoneInfo
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timezone
+from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import TABLE_SHUTTLE_LEGS
 from ai_engine import prepare_text_intent, prepare_image_intent, refresh_location_cache
+from config import TABLE_DRIVERS, TABLE_UNKNOWN_SENDERS
+from routes import refresh_route_cache
 from state_machine import commit_trip_leg
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,122 @@ MEDIA_GROUP_LOCK = asyncio.Lock()
 
 
 def get_eastern_timestamp() -> str:
+    """Fallback only. Prefer message_timestamp()."""
     return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def original_send_time(msg):
+    """The moment the content was first sent, as an aware datetime or None.
+
+    For a forwarded message that is the ORIGINAL send time, not the time it
+    was forwarded. Someone relaying a driver's earlier report must not
+    restamp the movement to now.
+
+    Bot API 7.0 moved this to forward_origin; forward_date is the legacy
+    field. Both exist in python-telegram-bot 20.8, so both are consulted.
+    """
+    origin = getattr(msg, "forward_origin", None)
+    for candidate in (getattr(origin, "date", None),
+                      getattr(msg, "forward_date", None),
+                      getattr(msg, "date", None)):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def message_timestamp(msg) -> str:
+    """When the driver sent the message, in Eastern.
+
+    Authoritative over datetime.now(): the bot may handle a message well
+    after it was sent -- albums are buffered 1.2s, Gemini retries run up to
+    ~15s, and a restart processes a backlog at once. These values become
+    departure_time and arrival_time on records handed to accounting, so they
+    must reflect the driver, not the server.
+
+    Telegram sends these as UTC; naive values are treated as UTC too.
+    """
+    sent = original_send_time(msg)
+    if sent is None:
+        logger.warning("Message carried no Telegram date; falling back to receipt time.")
+        return get_eastern_timestamp()
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return sent.astimezone(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _acknowledge(context: ContextTypes.DEFAULT_TYPE, message, text: str):
+    """Confirm a clock in or out back to the driver.
+
+    Confirmation, not correction: it tells them the report registered, gives
+    them their own record of hours, and surfaces a missed clock-out the same
+    day rather than at month end.
+    """
+    try:
+        await message.reply_text(text)
+    except Exception as e:
+        logger.warning(f"Could not acknowledge to driver: {e}")
+
+
+async def _send_dispatch_card(context: ContextTypes.DEFAULT_TYPE,
+                              fallback_chat_id: int,
+                              card_text: str):
+    """Post a manual-reconcile card, preferring the dispatch channel."""
+    await context.bot.send_message(
+        chat_id=DISPATCH_ALERT_CHANNEL_ID or fallback_chat_id,
+        text=card_text,
+        parse_mode="Markdown"
+    )
+
+
+# Sent at most once a week per driver. These are long-serving drivers, so the
+# ask is framed around what accurate timing gets THEM -- evidence of how long
+# the client's warehouse keeps them waiting -- rather than as a correction.
+NUDGE_INTERVAL_DAYS = 7
+
+GATE_REPORT_NUDGE = (
+    "Thanks {name} 🙏\n\n"
+    "One small thing when you get a chance — if you can send "
+    "\"arrived {facility}\" as soon as you're through the gate, before you pull "
+    "to a door, it lets us show the client exactly how long you're kept waiting "
+    "inside. Right now that waiting time isn't being counted.\n\n"
+    "Nothing else to change. Appreciate you."
+)
+
+
+async def _maybe_nudge_gate_report(context, pool, driver_id, driver_name,
+                                   facility, chat_id, reply_to):
+    """Ask, gently and rarely, for arrival to be reported at the gate.
+
+    Only fires when the driver named a dock on arrival, which means they had
+    already pulled to a door and the dwell we recorded understates their time.
+    """
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""SELECT last_nudge_at IS NULL
+                        OR last_nudge_at < NOW() - INTERVAL %s DAY
+                      FROM {TABLE_DRIVERS}
+                     WHERE user_id = %s;""",
+                (NUDGE_INTERVAL_DAYS, driver_id),
+            )
+            row = await cur.fetchone()
+            if not row or not row[0]:
+                return
+            await cur.execute(
+                f"UPDATE {TABLE_DRIVERS} SET last_nudge_at = NOW() WHERE user_id = %s;",
+                (driver_id,),
+            )
+
+    first_name = (driver_name or "").split()[0] if driver_name else "driver"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=GATE_REPORT_NUDGE.format(name=first_name,
+                                          facility=facility or "the yard"),
+            reply_to_message_id=reply_to,
+        )
+    except Exception as e:
+        logger.warning(f"Could not send gate-report nudge to {driver_id}: {e}")
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -32,8 +148,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(update.message)
     raw_text = update.message.text.strip()
+    msg_obj = update.message
 
     pool = context.bot_data["db_pool"]
 
@@ -53,19 +170,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             intent=intent
         )
 
-        if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
+        if res.get("card_text"):
+            await _send_dispatch_card(context, chat.id, res["card_text"])
+
+        if (intent.get("case_type") == "CASE_2_DESTINATION_ARRIVAL"
+                and intent.get("door_number")):
+            await _maybe_nudge_gate_report(
+                context, pool, driver_id, user_name,
+                intent.get("destination_location"),
+                chat.id, update.message.message_id,
             )
 
     except Exception as e:
@@ -102,8 +218,9 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
+    msg_obj = msg
 
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
@@ -131,20 +248,11 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
             intent=intent
         )
 
-        if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+        if res.get("card_text"):
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing photo from {driver_id}: {e}", exc_info=True)
@@ -165,7 +273,9 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    # The album is one action by the driver; take the earliest send time so the
+    # 1.2s buffer and per-image arrival order cannot shift it.
+    msg_timestamp = min(message_timestamp(m) for m in messages)
 
     # Aggregate caption if driver typed it on any image in the album
     caption = ""
@@ -174,6 +284,7 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
             caption = m.caption.strip()
             break
 
+    msg_obj = primary_msg
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
 
@@ -202,20 +313,11 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
             intent=intent
         )
 
-        if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+        if res.get("card_text"):
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing media group from {driver_id}: {e}", exc_info=True)
@@ -235,8 +337,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
+    msg_obj = msg
 
     pool = context.bot_data["db_pool"]
     loop = asyncio.get_running_loop()
@@ -264,65 +367,65 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             intent=intent
         )
 
-        if res.get("card_text"):
-            target_chat_id = DISPATCH_ALERT_CHANNEL_ID if DISPATCH_ALERT_CHANNEL_ID else chat.id
-            reply_markup = None
-            if res.get("action_type") == "DUPLICATE_BOL_OVERRIDE":
-                reply_markup = InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🔓 Force Save Duplicate", callback_data=f"override_bol|{driver_id}|{res['duplicate_bol']}") 
-                ]])
+        if res.get("reply_text"):
+            await _acknowledge(context, msg_obj, res["reply_text"])
 
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=res["card_text"],
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+        if res.get("card_text"):
+            await _send_dispatch_card(context, chat.id, res["card_text"])
 
     except Exception as e:
         logger.error(f"Error processing document from {driver_id}: {e}", exc_info=True)
 
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report the sender's Telegram user_id.
 
-    data = query.data
-    dispatcher = update.effective_user.full_name or "Dispatcher"
+    driver_profiles keys on that id and nothing else records it, so a driver
+    who is not registered is silently ignored by the state machine.
+    """
+    user = update.effective_user
+    handle = f"@{user.username}" if user.username else "(no username)"
+    await update.message.reply_text(
+        f"🪪 **{user.full_name}**\n"
+        f"Telegram ID: `{user.id}`\n"
+        f"Username: {handle}",
+        parse_mode="Markdown",
+    )
 
-    if data.startswith("override_bol|"):
-        _, driver_id, bol_num = data.split("|")
-        driver_id = int(driver_id)
 
-        pool = context.bot_data["db_pool"]
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                        SET bol_number = %s 
-                      WHERE user_id = %s 
-                        ORDER BY id DESC 
-                    LIMIT 1;""",
-                    (bol_num, driver_id)
-                ) 
-                await conn.commit()
+async def roster_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registered drivers, plus anyone messaging who is not on the roster."""
+    pool = context.bot_data["db_pool"]
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT user_id, driver_name FROM {TABLE_DRIVERS} ORDER BY driver_name;"
+            )
+            registered = await cur.fetchall()
+            await cur.execute(
+                f"""SELECT user_id, display_name, message_count, last_seen
+                      FROM {TABLE_UNKNOWN_SENDERS}
+                  ORDER BY message_count DESC;"""
+            )
+            unknown = await cur.fetchall()
 
-        resolved_text = (
-            f"✅ **RESOLVED: Duplicate BOL Approved**\n"
-            f"👤 Approved By: {dispatcher}\n"
-            f"📄 BOL Number: `{bol_num}`\n"
-            f"⚡ Status: Manually linked to Driver #{driver_id}'s latest leg."
-        )
-        await query.edit_message_text(
-            text=resolved_text,
-            parse_mode="Markdown"
-        )
+    lines = [f"👥 **Registered drivers ({len(registered)})**"]
+    lines += [f"`{uid}`  {name}" for uid, name in registered] or ["_none_"]
+
+    if unknown:
+        lines.append(f"\n⚠️ **Not on the roster ({len(unknown)})**")
+        lines.append("_These are being ignored. Add the ids to driver_profiles._")
+        for uid, name, count, seen in unknown:
+            lines.append(f"`{uid}`  {name or '?'} — {count} msg, last {seen:%m/%d %H:%M}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def refresh_locations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool = context.bot_data["db_pool"]
     try:
         await refresh_location_cache(pool)
-        await update.message.reply_text("✅ Location cache refreshed successfully.")
+        await refresh_route_cache(pool)
+        await update.message.reply_text("✅ Location and route caches refreshed successfully.")
     except Exception as e:
         await update.message.reply_text(f"❌ Cache refresh failed: {e}")

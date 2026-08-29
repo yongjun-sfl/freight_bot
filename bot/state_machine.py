@@ -1,8 +1,21 @@
 import logging
-from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS
-from ai_engine import normalize_location
+import re
+from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
+from ai_engine import normalize_location, site_of
+from load_types import classify as classify_load
+from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
+from shifts import format_worked, record_clock_in, record_clock_out
+from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
+
+# Word-boundary matched: a bare `"bt" in text` substring test fires on ordinary
+# words like "doubt", "debt" and "subtotal", which forced load_status to EMPTY
+# and silently skipped the outbound BOL compliance guard.
+BOBTAIL_PATTERN = re.compile(
+    r"\b(?:bobtail|bob\s*tail|bt|b/t|no\s+trailer|single\s+tractor|tractor\s+only)\b",
+    re.IGNORECASE,
+)
 
 
 async def commit_trip_leg(
@@ -22,6 +35,9 @@ async def commit_trip_leg(
     document_type = intent.get("document_type", "UNKNOWN")
     action_type = intent.get("action")
     door_num = intent.get("door_number")
+    do_num = intent.get("do_number")
+    origin_dock = intent.get("origin_dock")
+    destination_dock = intent.get("destination_dock")
     primary_image_blob = intent.get("primary_image_blob")
     shipper_signed = intent.get("shipper_signed", False)
     receiver_signed = intent.get("receiver_signed", False)
@@ -36,7 +52,7 @@ async def commit_trip_leg(
     raw_lower = raw_text.lower()
 
     # Detect Bobtail Flag
-    is_bobtail_flag = 1 if any(term in raw_lower for term in ["bobtail", "bt", "b/t", "no trailer", "tractor only"]) else 0
+    is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(raw_text) else 0
 
     # Extended Fallback Logic for Load Status
     if is_bobtail_flag or parsed_load_status == "BOBTAIL":
@@ -80,16 +96,62 @@ async def commit_trip_leg(
             )
             driver_exists = await cur.fetchone()
             if not driver_exists:
-                logger.warning(f"Unauthorized update attempt by Telegram User ID #{did} ({user_name}).")
+                # Remember them rather than only logging. driver_profiles keys on
+                # the Telegram user_id, which is not recorded anywhere else, so a
+                # driver missing from the roster is silently ignored forever.
+                # /roster turns this into the list needed to register them.
+                await cur.execute(
+                    f"""INSERT INTO {TABLE_UNKNOWN_SENDERS}
+                            (user_id, display_name, message_count)
+                        VALUES (%s, %s, 1)
+                        ON DUPLICATE KEY UPDATE
+                            display_name = VALUES(display_name),
+                            last_seen = CURRENT_TIMESTAMP,
+                            message_count = message_count + 1;""",
+                    (did, user_name),
+                )
+                await conn.commit()
+                logger.warning(
+                    f"Message from unregistered Telegram user #{did} ({user_name}); "
+                    f"recorded for /roster."
+                )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
-            # 1. FILTER IN-FACILITY MOVEMENTS
-            if origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN" and origin_loc == dest_loc:
-                logger.info(f"Ignored in-facility dock move for Driver #{did} at {origin_loc}.")
-                return {"is_clean": True, "leg_id": None, "card_text": None}
+            # 1. SAME-FACILITY DEPARTURE IS A MISPARSE
+            # Genuine within-facility repositioning arrives as
+            # CASE_3_INTRA_FACILITY_MOVE. A departure whose origin equals its
+            # destination therefore means the parser mislabelled such a move --
+            # surface it rather than discard what may be billable work.
+            if (case_type == "CASE_1_ORIGIN_DEPARTURE"
+                    and origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
+                    and origin_loc == dest_loc):
+                logger.warning(
+                    f"Driver #{did} sent a same-facility departure at {origin_loc}; "
+                    f"likely a mis-parsed internal move."
+                )
+                return {
+                    "is_clean": False,
+                    "leg_id": None,
+                    "card_text": (
+                        f"⚠️ **MANUAL RECONCILE: Same-Facility Departure**\n"
+                        f"👤 Driver: {user_name}\n"
+                        f"💬 Message: `{raw_text}`\n"
+                        f"📍 Both ends read as `{origin_loc}`.\n"
+                        f"👉 If this was an internal dock move it was not recorded "
+                        f"correctly. Confirm with the driver and enter it manually."
+                    )
+                }
 
-            # 2. GLOBAL DUPLICATE BOL GUARD
-            if bol_number:
+            # 2. DUPLICATE BOL LOOKUP
+            # Deliberately NOT run ahead of the match block. The patch paths --
+            # CASE_HISTORICAL_BOL_UPDATE, CASE_AUTO_RESOLVE, and the CASE 1
+            # auto-heal -- all locate their target *by* an existing bol_number,
+            # so a pre-match guard made every one of them unreachable. It now
+            # runs only where a brand new leg would claim a BOL.
+            async def find_duplicate_bol_leg():
+                """Id of an existing leg already carrying this BOL, else None."""
+                if not bol_number:
+                    return None
                 await cur.execute(
                     f"""SELECT id 
                           FROM {TABLE_SHUTTLE_LEGS} 
@@ -98,23 +160,195 @@ async def commit_trip_leg(
                     (bol_number,)
                 )
                 existing_bol = await cur.fetchone()
-                if existing_bol:
-                    return {
-                        "is_clean": False,
-                        "leg_id": None,
-                        "action_type": "DUPLICATE_BOL_OVERRIDE",
-                        "duplicate_bol": bol_number,
-                        "existing_leg_id": existing_bol[0],
-                        "card_text": (
-                            f"⚠️ **MANUAL RECONCILE: Duplicate BOL Number**\n"
-                            f"👤 Driver: {user_name}\n"
-                            f"📄 BOL Number: `{bol_number}`\n"
-                            f"❓ Issue: Already logged under Leg `{existing_bol[0]}`.\n"
-                            f"👉 Click below to force save this entry anyway."
-                        )
-                    }
+                return existing_bol[0] if existing_bol else None
+
+            async def resolve_round(origin: str, destination: str):
+                """(round_number, route_code) for a new departure.
+
+                A round is one traversal of a defined route: leave an anchor,
+                work the stops that belong to a route anchored there, come back.
+                A leg to anywhere else is a spot delivery and gets its own round.
+
+                This is deliberately not distance-based. 100 and 1380 form their
+                own rounds because they sit on no route, not because they are far
+                -- Cartersville is in fact nearer to 200 than Dalton is.
+                """
+                await cur.execute(
+                    f"""SELECT round_number, route_code, destination_location 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND is_positioning_leg = 0 
+                           AND round_number IS NOT NULL 
+                      ORDER BY id DESC 
+                         LIMIT 1;""",
+                    (did,)
+                )
+                row = await cur.fetchone()
+
+                async def open_new_round():
+                    await cur.execute(
+                        f"""SELECT COALESCE(MAX(round_number), 0) 
+                              FROM {TABLE_SHUTTLE_LEGS} 
+                             WHERE user_id = %s 
+                               AND DATE(departure_time) = CURRENT_DATE();""",
+                        (did,)
+                    )
+                    (highest_today,) = await cur.fetchone()
+                    return (highest_today or 0) + 1
+
+                if not row:
+                    number = await open_new_round()
+                    if serves(origin, destination):
+                        return number, route_code_for(origin, [destination])
+                    return number, SPOT_ROUTE_CODE
+
+                current, current_route, last_destination = row
+
+                # Where the open round started, and everywhere it has been.
+                await cur.execute(
+                    f"""SELECT origin_location, destination_location 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND round_number = %s 
+                           AND is_positioning_leg = 0 
+                      ORDER BY id ASC;""",
+                    (did, current)
+                )
+                legs = await cur.fetchall()
+                anchor = legs[0][0] if legs else None
+                visited = [leg[1] for leg in legs]
+
+                # Has the open round finished? A normal round ends back at its
+                # anchor; a spot delivery ends wherever it rejoins a route.
+                if current_route == SPOT_ROUTE_CODE:
+                    if not is_anchor(last_destination):
+                        # Still out on the spot run, including the leg home.
+                        # Its origin is not a route anchor, so route membership
+                        # cannot be consulted here.
+                        return current, SPOT_ROUTE_CODE
+                elif anchor and site_of(last_destination) != site_of(anchor):
+                    if serves(anchor, destination):
+                        return current, route_code_for(anchor, visited + [destination])
+                    # Off-route: close this round, start a spot delivery.
+                    return await open_new_round(), SPOT_ROUTE_CODE
+
+                number = await open_new_round()
+                if serves(origin, destination):
+                    return number, route_code_for(origin, [destination])
+                return number, SPOT_ROUTE_CODE
+
+            async def next_trip_seq() -> int:
+                """Sequential leg number for this driver today.
+
+                Mirrors the Trip Seq column in the dispatcher's sheet, which
+                exists so rounds can be worked out from the leg order.
+                """
+                await cur.execute(
+                    f"""SELECT COALESCE(MAX(trip_seq), 0) 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND DATE(departure_time) = CURRENT_DATE();""",
+                    (did,)
+                )
+                (highest,) = await cur.fetchone()
+                return (highest or 0) + 1
+
+            async def current_round_number():
+                """The round a within-facility move happened during."""
+                await cur.execute(
+                    f"""SELECT round_number 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND round_number IS NOT NULL 
+                      ORDER BY id DESC 
+                         LIMIT 1;""",
+                    (did,)
+                )
+                row = await cur.fetchone()
+                return row[0] if row else None
+
+            async def stamp_finished(target_leg=None):
+                """Record that a live load or unload completed.
+
+                Applies to the leg the driver is ending, which on a merged
+                message ("live loading finished load 200 to E2F") is the leg
+                BEFORE the departure being announced.
+                """
+                if target_leg is None:
+                    await cur.execute(
+                        f"""SELECT id FROM {TABLE_SHUTTLE_LEGS} 
+                             WHERE user_id = %s AND is_positioning_leg = 0 
+                          ORDER BY id DESC LIMIT 1;""",
+                        (did,)
+                    )
+                    row = await cur.fetchone()
+                    target_leg = row[0] if row else None
+                if not target_leg:
+                    return None
+                await cur.execute(
+                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                           SET finished_time = COALESCE(finished_time, %s) 
+                         WHERE id = %s;""",
+                    (msg_timestamp, target_leg)
+                )
+                await finish_rm_load(cur, target_leg, msg_timestamp)
+                return target_leg
 
             match case_type:
+
+                # =========================================================
+                # SHIFT BOUNDARIES
+                # =========================================================
+                case "CASE_CLOCK_IN":
+                    reported, expected = await record_clock_in(cur, did, msg_timestamp)
+                    await conn.commit()
+                    logger.info(f"🕐 Driver #{did} clocked in at {reported}.")
+                    late = ""
+                    if expected and reported and reported > expected:
+                        minutes = int((reported - expected).total_seconds() // 60)
+                        late = f" ({minutes} min after expected)"
+                    return {
+                        "is_clean": True,
+                        "leg_id": None,
+                        "card_text": None,
+                        "reply_text": f"✅ Clocked in — {reported:%H:%M}{late}",
+                    }
+
+                case "CASE_CLOCK_OUT":
+                    started, ended, worked = await record_clock_out(cur, did, msg_timestamp)
+                    await conn.commit()
+                    logger.info(f"🕐 Driver #{did} clocked out at {ended}.")
+                    if not started:
+                        return {
+                            "is_clean": False,
+                            "leg_id": None,
+                            "reply_text": f"✅ Clocked out — {ended:%H:%M}",
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Clock-out With No Clock-in**\n"
+                                f"\U0001f464 Driver: {user_name}\n"
+                                f"\U0001f550 Clocked out at `{ended:%H:%M}` but never "
+                                f"reported starting, so hours cannot be worked out."
+                            )
+                        }
+                    return {
+                        "is_clean": True,
+                        "leg_id": None,
+                        "card_text": None,
+                        "reply_text": (
+                            f"✅ Clocked out — {ended:%H:%M} · {format_worked(worked)}"
+                        ),
+                    }
+
+                # =========================================================
+                # LIVE LOAD / UNLOAD COMPLETE
+                # =========================================================
+                case "CASE_WORK_FINISHED":
+                    finished_leg = await stamp_finished()
+                    await conn.commit()
+                    if not finished_leg:
+                        return {"is_clean": True, "leg_id": None, "card_text": None}
+                    logger.info(f"🏁 Driver #{did} finished work on Leg #{finished_leg}.")
+                    return {"is_clean": True, "leg_id": finished_leg, "card_text": None}
 
                 # =========================================================
                 # CASE 1: INTER-FACILITY DEPARTURE
@@ -144,13 +378,38 @@ async def commit_trip_leg(
                                    SET bol_number = COALESCE(%s, bol_number),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
                                        bol_image = COALESCE(%s, bol_image),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        trailer_number = IF(%s != 'UNKNOWN', %s, trailer_number)
                                  WHERE id = %s;""",
-                            (bol_number, document_type, document_type, primary_image_blob, display_trailer, display_trailer, leg_id)
+                            (bol_number, document_type, document_type, primary_image_blob,
+                             msg_timestamp if primary_image_blob else None,
+                             display_trailer, display_trailer, leg_id)
                         )
+                        await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
+                                             display_trailer, msg_timestamp,
+                                             driver_id=did, driver_name=user_name)
                         await conn.commit()
                         logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
+
+                    # A BOL already on another leg means the driver attached the
+                    # PREVIOUS load's paperwork to this one. Every field derived
+                    # from that document is therefore wrong and is discarded. The
+                    # movement itself is real, so the leg is still recorded -- with
+                    # no paperwork -- and the auto-heal above completes it once the
+                    # driver reposts the correct BOL.
+                    duplicate_of = await find_duplicate_bol_leg()
+                    stale_bol = None
+                    if duplicate_of:
+                        stale_bol = bol_number
+                        bol_number = None
+                        document_type = "UNKNOWN"
+                        primary_image_blob = None
+                        shipper_signed = False
+                        logger.warning(
+                            f"Driver #{did} attached BOL '{stale_bol}' already recorded on "
+                            f"Leg #{duplicate_of}; saving movement without paperwork."
+                        )
 
                     # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
                     await cur.execute(
@@ -175,6 +434,11 @@ async def commit_trip_leg(
                     if not display_trailer or display_trailer == "UNKNOWN":
                         display_trailer = last_leg[1] if (last_leg and last_leg[1]) else "UNKNOWN"
 
+                    # A merged "live loading finished load 200 to E2F" ends the
+                    # previous trip and starts the next in one message.
+                    if intent.get("work_finished"):
+                        await stamp_finished()
+
                     # Complete prior active legs upon new departure
                     await cur.execute(
                         f"""UPDATE {TABLE_SHUTTLE_LEGS} 
@@ -184,6 +448,9 @@ async def commit_trip_leg(
                                AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING');""",
                         (msg_timestamp, did)
                     )
+
+                    round_and_route = await resolve_round(origin_loc, dest_loc)
+                    rm_dock = intent.get("dock_number") or door_num
 
                     # Insert new departure leg
                     await cur.execute(
@@ -201,16 +468,50 @@ async def commit_trip_leg(
                                shipper_signed, 
                                is_bobtail, 
                                leg_status, 
-                               load_status
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s);""",
+                               load_status,
+                               round_number,
+                               route_code,
+                               load_type,
+                               trip_seq
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s, %s);""",
                         (
                             did, display_trailer, bol_number, document_type, origin_loc, dest_loc,
                             msg_timestamp, action_type, primary_image_blob, door_num,
-                            1 if shipper_signed else 0, is_bobtail_flag, load_status_val
+                            1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
+                            *round_and_route,
+                            classify_load(origin_loc, dest_loc, load_status_val,
+                                          round_and_route[1]),
+                            await next_trip_seq(),
                         )
                     )
                     await conn.commit()
                     leg_id = cur.lastrowid
+
+                    # RM consignments carry line items the receiving departments
+                    # at E2F and E2R report on, so they are kept in their own
+                    # tables rather than flattened into the leg.
+                    await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
+                                         display_trailer, msg_timestamp,
+                                         driver_id=did, driver_name=user_name)
+                    await conn.commit()
+
+                    # ALERT GUARD 0: Stale BOL. Takes precedence over the paperwork
+                    # guards below, which would otherwise fire on the fields just
+                    # cleared and bury the actionable instruction.
+                    if duplicate_of:
+                        return {
+                            "is_clean": False,
+                            "leg_id": leg_id,
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Stale BOL Attached**\n"
+                                f"👤 Driver: {user_name}\n"
+                                f"🚛 Trailer: `{display_trailer}`\n"
+                                f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
+                                f"📄 BOL `{stale_bol}` is already recorded on Leg `{duplicate_of}`.\n"
+                                f"👉 Trip saved as Leg `{leg_id}` with no paperwork. "
+                                f"Ask the driver to repost the correct BOL for this load."
+                            )
+                        }
 
                     # ALERT GUARD 1: Incomplete Route Data
                     if origin_loc == "UNKNOWN" or display_trailer == "UNKNOWN" or dest_loc == "UNKNOWN":
@@ -244,6 +545,10 @@ async def commit_trip_leg(
 
                     # DEPARTURE RULE: EMPTY Mid-Shift POD Enforcement (FG Loads ONLY)
                     if load_status_val == "EMPTY" and not is_bobtail_flag:
+                        # `id <> %s` excludes the leg inserted moments ago: without
+                        # it ORDER BY id DESC always returned that new EMPTY row, so
+                        # the `load_status == 'LOADED'` test below could never be true
+                        # and this guard never fired for any driver.
                         await cur.execute(
                             f"""SELECT id, 
                                        load_status, 
@@ -251,10 +556,12 @@ async def commit_trip_leg(
                                        document_type
                                   FROM {TABLE_SHUTTLE_LEGS} 
                                  WHERE user_id = %s 
+                                   AND id <> %s
+                                   AND is_positioning_leg = 0
                                    AND DATE(departure_time) = CURRENT_DATE()
                               ORDER BY id DESC 
                                  LIMIT 1;""",
-                            (did,)
+                            (did, leg_id)
                         )
                         last_shift_leg = await cur.fetchone()
 
@@ -285,7 +592,8 @@ async def commit_trip_leg(
                     await cur.execute(
                         f"""SELECT id, 
                                    load_status, 
-                                   is_bobtail 
+                                   is_bobtail,
+                                   destination_location 
                               FROM {TABLE_SHUTTLE_LEGS} 
                              WHERE user_id = %s 
                                AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING')
@@ -299,6 +607,17 @@ async def commit_trip_leg(
                         leg_id = active_leg[0]
                         dep_load_status = active_leg[1]
                         dep_is_bobtail = active_leg[2]
+                        booked_destination = active_leg[3]
+
+                        # Arriving somewhere other than where the departure said
+                        # they were going. Compared by site, so 200F and 200R do
+                        # not read as a mismatch, and only when the driver named
+                        # a facility -- most arrivals just say "arrived".
+                        wrong_destination = (
+                            dest_loc != "UNKNOWN"
+                            and booked_destination
+                            and site_of(dest_loc) != site_of(booked_destination)
+                        )
 
                         if dep_is_bobtail or is_bobtail_flag:
                             resolved_action = "BOBTAIL_ARRIVE"
@@ -319,21 +638,51 @@ async def commit_trip_leg(
                             f"""UPDATE {TABLE_SHUTTLE_LEGS} 
                                    SET arrival_time = COALESCE(arrival_time, %s),
                                        arrival_action = %s,
+                                       -- A dock named on arrival means the driver
+                                       -- had already pulled to a door, so real time
+                                       -- on site is longer than the recorded dwell.
+                                       arrival_at_dock = %s,
                                        dock_number = COALESCE(%s, dock_number),
+                                       do_number = COALESCE(%s, do_number),
                                        receiver_signed = COALESCE(%s, receiver_signed),
                                        leg_status = %s
                                  WHERE id = %s;""",
                             (
                                 msg_timestamp, 
                                 resolved_action, 
+                                1 if door_num else 0, 
                                 door_num, 
-                                1 if receiver_signed else 0, 
+                                do_num, 
+                                # None, not 0: COALESCE must fall through to the
+                                # stored value when no signature was detected,
+                                # otherwise an arrival wipes a POD captured earlier.
+                                1 if receiver_signed else None, 
                                 target_status, 
                                 leg_id
                             )
                         )
+                        await close_rm_load(cur, leg_id, msg_timestamp)
                         await conn.commit()
                         logger.info(f"✅ Driver #{did} arrived at {dest_loc}. Leg #{leg_id} updated to {target_status}.")
+
+                        if wrong_destination:
+                            logger.warning(
+                                f"Driver #{did} was routed to {booked_destination} "
+                                f"but reports arriving at {dest_loc}."
+                            )
+                            return {
+                                "is_clean": False,
+                                "leg_id": leg_id,
+                                "card_text": (
+                                    f"⚠️ **MANUAL RECONCILE: Wrong Destination**\n"
+                                    f"\U0001f464 Driver: {user_name}\n"
+                                    f"\U0001f4cd Routed to `{booked_destination}` "
+                                    f"but arrived at `{dest_loc}`.\n"
+                                    f"\U0001f69b Leg `{leg_id}` records the arrival as reported.\n"
+                                    f"\U0001f449 Confirm with the driver while they are still on site."
+                                )
+                            }
+
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
                     return {"is_clean": True, "leg_id": None, "card_text": None}
@@ -371,12 +720,14 @@ async def commit_trip_leg(
                             f"""UPDATE {TABLE_SHUTTLE_LEGS} 
                                    SET bol_image = COALESCE(%s, bol_image),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        shipper_signed = COALESCE(%s, shipper_signed),
                                        receiver_signed = COALESCE(%s, receiver_signed)
                                  WHERE id = %s;""",
                             (
                                 primary_image_blob,
                                 document_type, document_type,
+                                msg_timestamp if primary_image_blob else None,
                                 1 if shipper_signed else None,
                                 1 if receiver_signed else None,
                                 leg_id
@@ -433,6 +784,7 @@ async def commit_trip_leg(
                                    SET bol_number = COALESCE(bol_number, %s),
                                        document_type = IF(%s != 'UNKNOWN', %s, document_type),
                                        bol_image = COALESCE(%s, bol_image),
+                                       paperwork_time = COALESCE(paperwork_time, %s),
                                        shipper_signed = COALESCE(%s, shipper_signed),
                                        receiver_signed = COALESCE(%s, receiver_signed)
                                  WHERE id = %s;""",
@@ -440,6 +792,7 @@ async def commit_trip_leg(
                                 bol_number,
                                 document_type, document_type,
                                 primary_image_blob,
+                                msg_timestamp if primary_image_blob else None,
                                 1 if shipper_signed else None,
                                 1 if receiver_signed else None,
                                 leg_id
@@ -457,6 +810,109 @@ async def commit_trip_leg(
                             f"👤 Driver: {user_name}\n"
                             f"📄 BOL #: `{bol_number}`\n"
                             f"❓ Action Needed: Valid BOL scanned, but no unlinked LOADED leg today was found for this driver."
+                        )
+                    }
+
+                # =========================================================
+                # CASE 3: WITHIN-FACILITY REPOSITIONING
+                # =========================================================
+                case "CASE_3_INTRA_FACILITY_MOVE":
+                    display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
+
+                    # Drivers almost never name the facility on an internal move
+                    # ("empty move #13 to #47"), so infer it from where they were
+                    # last recorded.
+                    facility = origin_loc if origin_loc != "UNKNOWN" else dest_loc
+                    if facility == "UNKNOWN":
+                        await cur.execute(
+                            f"""SELECT destination_location 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND destination_location NOT IN ('UNKNOWN', 'MISSING_ORIGIN', 'MISSING_DEST', '')
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did,)
+                        )
+                        last_seen = await cur.fetchone()
+                        facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
+
+                    from_dock = (origin_dock or door_num or "").strip().upper() or None
+                    to_dock = (destination_dock or "").strip().upper() or None
+                    move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
+
+                    # Every internal move gets its own row. Drivers never label
+                    # these, and billing is by shift rather than by move, so no
+                    # cleanup-vs-reposition guess is needed or wanted. Folding a
+                    # move into the trip leg would also silently overwrite earlier
+                    # moves, since a leg holds only one dock pair.
+                    #
+                    # Recorded COMPLETED so a later arrival can never mistake one
+                    # for an open trip.
+                    await cur.execute(
+                        f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
+                               user_id, 
+                               trailer_number, 
+                               origin_location, 
+                               destination_location, 
+                               origin_dock, 
+                               destination_dock, 
+                               departure_time, 
+                               arrival_time, 
+                               arrival_action, 
+                               is_positioning_leg, 
+                               leg_status, 
+                               load_status,
+                               round_number
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s, %s);""",
+                        (
+                            did, display_trailer, facility, facility,
+                            from_dock, to_dock, msg_timestamp, msg_timestamp,
+                            "YARD_DROP" if to_dock == "YARD" else "DOCK_MOVE",
+                            load_status_val,
+                            await current_round_number()
+                        )
+                    )
+                    await conn.commit()
+                    leg_id = cur.lastrowid
+                    logger.info(
+                        f"\U0001f4e6 Driver #{did} moved {move_desc} at {facility}; "
+                        f"recorded as positioning Leg #{leg_id}."
+                    )
+
+                    if facility == "UNKNOWN" or not to_dock:
+                        return {
+                            "is_clean": False,
+                            "leg_id": leg_id,
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Incomplete Internal Move**\n"
+                                f"👤 Driver: {user_name}\n"
+                                f"💬 Message: `{raw_text}`\n"
+                                f"🚛 Trailer: `{display_trailer or 'UNKNOWN'}`\n"
+                                f"📍 Facility: `{facility}` | Move: `{move_desc}`\n"
+                                f"❓ Issue: Could not determine the facility or the destination "
+                                f"position. Saved as Leg `{leg_id}` for correction."
+                            )
+                        }
+
+                    return {"is_clean": True, "leg_id": leg_id, "card_text": None}
+
+                # =========================================================
+                # PARSE FAILURE: surface, never swallow
+                # =========================================================
+                case "PARSE_FAILED":
+                    logger.error(
+                        f"Parser unavailable for Driver #{did} ({user_name}); "
+                        f"raising manual card. Detail: {intent.get('parse_error')}"
+                    )
+                    return {
+                        "is_clean": False,
+                        "leg_id": None,
+                        "card_text": (
+                            f"⚠️ **MANUAL RECONCILE: Message Could Not Be Parsed**\n"
+                            f"👤 Driver: {user_name}\n"
+                            f"💬 Message: `{raw_text or '(no text - attached document only)'}`\n"
+                            f"❓ Issue: The AI parser was unavailable after repeated retries, so this "
+                            f"update was NOT recorded. Please enter it manually."
                         )
                     }
 

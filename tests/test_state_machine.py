@@ -40,14 +40,16 @@ async def test_unknown_driver_is_rejected(pool):
     assert await all_legs(pool) == []
 
 
-async def test_in_facility_move_is_ignored(pool):
+async def test_same_facility_departure_is_surfaced_not_dropped(pool):
+    """Within-facility work is billable now, so a same-facility CASE 1 is a
+    misparse to be reported rather than silently discarded."""
     res = await commit(
         pool,
-        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text="200 to 200",
                origin_location="200", destination_location="200"),
     )
-    assert res["is_clean"] is True
-    assert res["leg_id"] is None
+    assert res["is_clean"] is False
+    assert "Same-Facility Departure" in res["card_text"]
     assert await all_legs(pool) == []
 
 
@@ -582,3 +584,163 @@ async def test_none_work_related_still_silent(pool):
     res = await commit(pool, intent(case_type="NONE_WORK_RELATED", raw_text="lunch?"))
     assert res["card_text"] is None
     assert await all_legs(pool) == []
+
+
+# ==========================================================================
+# CASE 3 -- within-facility repositioning
+# ==========================================================================
+
+async def test_midtrip_dock_move_folds_into_the_current_leg(pool):
+    """Driver arrived from SDS, unloaded at an inbound dock, now moves to an
+    RM outbound dock. That is part of the trip, not a leg of its own."""
+    leg = await insert_leg(
+        pool, origin_location="SDS", destination_location="200",
+        trailer_number="77344", dock_number="13",
+        leg_status="COMPLETED", arrival_action="DROP",   # a DROP closes the leg
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", raw_text="empty move #13 to #47",
+               origin_dock="13", destination_dock="47", load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    assert res["leg_id"] == leg
+    assert len(await all_legs(pool)) == 1, "must not create a second leg"
+
+    row = await get_leg(pool, leg)
+    assert row["origin_dock"] == "13"
+    assert row["destination_dock"] == "47"
+    assert row["is_positioning_leg"] == 0
+
+
+async def test_midtrip_move_never_overwrites_the_trailer(pool):
+    """They may have dropped what they arrived with and hooked another; this
+    leg must keep what it actually carried."""
+    leg = await insert_leg(
+        pool, origin_location="SDS", destination_location="200",
+        trailer_number="77344", leg_status="COMPLETED",
+    )
+    await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", origin_dock="13",
+               destination_dock="47", ocr_trailer="99999"),
+    )
+    assert (await get_leg(pool, leg))["trailer_number"] == "77344"
+
+
+async def test_cleanup_move_is_its_own_billable_leg(pool):
+    """Dispatcher-assigned cleanup is the work being billed, so it stands alone
+    even when the driver is mid-trip."""
+    parent = await insert_leg(
+        pool, origin_location="SDS", destination_location="200",
+        trailer_number="77344", leg_status="COMPLETED",
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", is_cleanup=True,
+               raw_text="cleanup empty move #13 to #47",
+               origin_dock="13", destination_dock="47",
+               ocr_trailer="53012", load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    assert res["leg_id"] != parent
+    assert len(await all_legs(pool)) == 2
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 1
+    assert leg["origin_location"] == "200" and leg["destination_location"] == "200"
+    assert leg["origin_dock"] == "13" and leg["destination_dock"] == "47"
+    assert leg["trailer_number"] == "53012"
+    assert leg["load_status"] == "EMPTY"
+    assert leg["arrival_action"] == "DOCK_MOVE"
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["departure_time"] is not None and leg["arrival_time"] is not None
+
+    # the trip leg it happened during must be untouched
+    assert (await get_leg(pool, parent))["origin_dock"] is None
+
+
+async def test_cleanup_drop_to_yard(pool):
+    await insert_leg(pool, destination_location="200", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", is_cleanup=True,
+               raw_text="cleanup empty dropped yard", destination_dock="YARD",
+               ocr_trailer="53012", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["destination_dock"] == "YARD"
+    assert leg["arrival_action"] == "YARD_DROP"
+
+
+async def test_internal_move_with_no_known_facility_raises_card(pool):
+    """Nothing to infer the facility from -- record it, but flag it, since a
+    row with an unknown facility is useless to accounting."""
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", raw_text="empty move #13 to #47",
+               origin_dock="13", destination_dock="47"),
+    )
+    assert res["is_clean"] is False
+    assert "Incomplete Internal Move" in res["card_text"]
+    assert (await get_leg(pool, res["leg_id"]))["is_positioning_leg"] == 1
+
+
+async def test_positioning_leg_does_not_trigger_pod_guard(pool):
+    """A cleanup leg must not be read as the prior loaded trip needing a POD."""
+    await insert_leg(
+        pool, is_positioning_leg=1, load_status="LOADED", document_type="FG",
+        receiver_signed=0, origin_location="200", destination_location="200",
+        leg_status="COMPLETED",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="200",
+               destination_location="E2F", text_trailer="77344", load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
+
+
+async def test_positioning_leg_is_not_claimed_by_a_later_arrival(pool):
+    """Recorded COMPLETED, so CASE 2 cannot mistake it for an open trip."""
+    cleanup = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", is_cleanup=True,
+               origin_dock="13", destination_dock="47", origin_location="200"),
+    )
+    res = await commit(pool, intent(case_type="CASE_2_DESTINATION_ARRIVAL"))
+    assert res["leg_id"] is None, "arrival must not attach to a positioning leg"
+    assert (await get_leg(pool, cleanup["leg_id"]))["arrival_action"] == "DOCK_MOVE"
+
+
+async def test_departure_after_dock_work_completes_the_trip_leg(pool):
+    """The full 200 flow: arrive from SDS, reposition inbound -> RM outbound,
+    then 'live loading finished load 200 to E2F' closes it and opens the next."""
+    leg_a = await insert_leg(
+        pool, origin_location="SDS", destination_location="200",
+        trailer_number="77344", bol_number="B-IN", bol_image=IMG,
+        leg_status="ARRIVED", dock_number="13",
+    )
+    await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_dock="13", destination_dock="47", load_status="EMPTY"),
+    )
+    assert (await get_leg(pool, leg_a))["destination_dock"] == "47"
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="live loading finished load 200 to E2F",
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", bol_number="B-OUT",
+               primary_image_blob=IMG, load_status="LOADED", document_type="FG"),
+    )
+    assert res["is_clean"] is True
+    assert (await get_leg(pool, leg_a))["leg_status"] == "COMPLETED"
+    leg_b = await get_leg(pool, res["leg_id"])
+    assert leg_b["origin_location"] == "200" and leg_b["destination_location"] == "E2F"
+    assert leg_b["leg_status"] == "IN_TRANSIT"

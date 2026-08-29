@@ -31,6 +31,9 @@ async def commit_trip_leg(
     document_type = intent.get("document_type", "UNKNOWN")
     action_type = intent.get("action")
     door_num = intent.get("door_number")
+    origin_dock = intent.get("origin_dock")
+    destination_dock = intent.get("destination_dock")
+    is_cleanup = bool(intent.get("is_cleanup"))
     primary_image_blob = intent.get("primary_image_blob")
     shipper_signed = intent.get("shipper_signed", False)
     receiver_signed = intent.get("receiver_signed", False)
@@ -92,10 +95,30 @@ async def commit_trip_leg(
                 logger.warning(f"Unauthorized update attempt by Telegram User ID #{did} ({user_name}).")
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
-            # 1. FILTER IN-FACILITY MOVEMENTS
-            if origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN" and origin_loc == dest_loc:
-                logger.info(f"Ignored in-facility dock move for Driver #{did} at {origin_loc}.")
-                return {"is_clean": True, "leg_id": None, "card_text": None}
+            # 1. SAME-FACILITY DEPARTURE IS A MISPARSE
+            # Genuine within-facility repositioning arrives as
+            # CASE_3_INTRA_FACILITY_MOVE. A departure whose origin equals its
+            # destination therefore means the parser mislabelled such a move --
+            # surface it rather than discard what may be billable work.
+            if (case_type == "CASE_1_ORIGIN_DEPARTURE"
+                    and origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
+                    and origin_loc == dest_loc):
+                logger.warning(
+                    f"Driver #{did} sent a same-facility departure at {origin_loc}; "
+                    f"likely a mis-parsed internal move."
+                )
+                return {
+                    "is_clean": False,
+                    "leg_id": None,
+                    "card_text": (
+                        f"⚠️ **MANUAL RECONCILE: Same-Facility Departure**\n"
+                        f"👤 Driver: {user_name}\n"
+                        f"💬 Message: `{raw_text}`\n"
+                        f"📍 Both ends read as `{origin_loc}`.\n"
+                        f"👉 If this was an internal dock move it was not recorded "
+                        f"correctly. Confirm with the driver and enter it manually."
+                    )
+                }
 
             # 2. DUPLICATE BOL LOOKUP
             # Deliberately NOT run ahead of the match block. The patch paths --
@@ -296,6 +319,7 @@ async def commit_trip_leg(
                                   FROM {TABLE_SHUTTLE_LEGS} 
                                  WHERE user_id = %s 
                                    AND id <> %s
+                                   AND is_positioning_leg = 0
                                    AND DATE(departure_time) = CURRENT_DATE()
                               ORDER BY id DESC 
                                  LIMIT 1;""",
@@ -507,6 +531,121 @@ async def commit_trip_leg(
                             f"❓ Action Needed: Valid BOL scanned, but no unlinked LOADED leg today was found for this driver."
                         )
                     }
+
+                # =========================================================
+                # CASE 3: WITHIN-FACILITY REPOSITIONING
+                # =========================================================
+                case "CASE_3_INTRA_FACILITY_MOVE":
+                    display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
+
+                    # Drivers almost never name the facility on an internal move
+                    # ("empty move #13 to #47"), so infer it from where they were
+                    # last recorded.
+                    facility = origin_loc if origin_loc != "UNKNOWN" else dest_loc
+                    if facility == "UNKNOWN":
+                        await cur.execute(
+                            f"""SELECT destination_location 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND destination_location NOT IN ('UNKNOWN', 'MISSING_ORIGIN', 'MISSING_DEST', '')
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did,)
+                        )
+                        last_seen = await cur.fetchone()
+                        facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
+
+                    from_dock = (origin_dock or door_num or "").strip().upper() or None
+                    to_dock = (destination_dock or "").strip().upper() or None
+                    move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
+
+                    # Dispatcher-assigned cleanup is billable work in its own right
+                    # and is recorded as a standalone leg even mid-trip. Otherwise
+                    # the move belongs to the trip the driver is already on.
+                    parent_leg = None
+                    if not is_cleanup and facility != "UNKNOWN":
+                        # Deliberately not restricted to open legs: a DROP arrival
+                        # closes the leg, yet the driver is still working that trip.
+                        await cur.execute(
+                            f"""SELECT id 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND destination_location = %s 
+                                   AND is_positioning_leg = 0 
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did, facility)
+                        )
+                        row = await cur.fetchone()
+                        parent_leg = row[0] if row else None
+
+                    if parent_leg:
+                        # Trailer is COALESCEd, never overwritten: the driver may
+                        # have dropped what they arrived with and hooked another,
+                        # and this leg should keep what it actually carried.
+                        await cur.execute(
+                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                                   SET origin_dock = COALESCE(%s, origin_dock),
+                                       destination_dock = COALESCE(%s, destination_dock),
+                                       trailer_number = COALESCE(trailer_number, %s)
+                                 WHERE id = %s;""",
+                            (from_dock, to_dock, display_trailer, parent_leg)
+                        )
+                        await conn.commit()
+                        logger.info(
+                            f"\u2699\ufe0f Driver #{did} repositioned {move_desc} at {facility}; "
+                            f"folded into Leg #{parent_leg}."
+                        )
+                        return {"is_clean": True, "leg_id": parent_leg, "card_text": None}
+
+                    # Standalone move: dispatcher-assigned cleanup, or no trip to
+                    # attach it to. Recorded COMPLETED so it can never be mistaken
+                    # for an open trip by a later arrival.
+                    await cur.execute(
+                        f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
+                               user_id, 
+                               trailer_number, 
+                               origin_location, 
+                               destination_location, 
+                               origin_dock, 
+                               destination_dock, 
+                               departure_time, 
+                               arrival_time, 
+                               arrival_action, 
+                               is_positioning_leg, 
+                               leg_status, 
+                               load_status
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s);""",
+                        (
+                            did, display_trailer, facility, facility,
+                            from_dock, to_dock, msg_timestamp, msg_timestamp,
+                            "YARD_DROP" if to_dock == "YARD" else "DOCK_MOVE",
+                            load_status_val
+                        )
+                    )
+                    await conn.commit()
+                    leg_id = cur.lastrowid
+                    logger.info(
+                        f"\U0001f4e6 Driver #{did} logged {'cleanup' if is_cleanup else 'standalone'} "
+                        f"move {move_desc} at {facility} as Leg #{leg_id}."
+                    )
+
+                    if facility == "UNKNOWN" or not to_dock:
+                        return {
+                            "is_clean": False,
+                            "leg_id": leg_id,
+                            "card_text": (
+                                f"⚠️ **MANUAL RECONCILE: Incomplete Internal Move**\n"
+                                f"👤 Driver: {user_name}\n"
+                                f"💬 Message: `{raw_text}`\n"
+                                f"🚛 Trailer: `{display_trailer or 'UNKNOWN'}`\n"
+                                f"📍 Facility: `{facility}` | Move: `{move_desc}`\n"
+                                f"❓ Issue: Could not determine the facility or the destination "
+                                f"position. Saved as Leg `{leg_id}` for correction."
+                            )
+                        }
+
+                    return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
                 # =========================================================
                 # PARSE FAILURE: surface, never swallow

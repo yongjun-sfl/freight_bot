@@ -165,7 +165,12 @@ CASE CLASSIFICATION RULES:
 1. "CASE_1_ORIGIN_DEPARTURE": Driver is reporting outbound movement, leaving a facility, or traveling between facilities (e.g., "leaving 200", "200 to E2F", "heading to E2F bt").
 2. "CASE_2_DESTINATION_ARRIVAL": Driver is reporting arrival at a facility, gate, door, or yard (e.g., "arrived E2F", "at E2F door 45", "in yard at E2F").
 3. "CASE_HISTORICAL_BOL_UPDATE": Document upload or message specifically referencing late paperwork, delivery receipts, or historical BOLs.
-4. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+4. "CASE_3_INTRA_FACILITY_MOVE": Driver is repositioning a trailer WITHIN one facility -- between doors, or between a door and the yard. No facility-to-facility travel is involved. Examples:
+   - "empty move #13 to #47"      -> origin_dock="13", destination_dock="47", load_status="EMPTY"
+   - "loaded move #4 to #13"      -> origin_dock="4",  destination_dock="13", load_status="LOADED"
+   - "empty dropped yard"         -> origin_dock=null, destination_dock="YARD", load_status="EMPTY"
+   - "moved 44821 door 7 to yard" -> origin_dock="7",  destination_dock="YARD"
+5. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
 
 EXTRACTION & NORMALIZATION RULES:
 1. Location Extraction:
@@ -174,17 +179,28 @@ EXTRACTION & NORMALIZATION RULES:
    - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
 
 2. Door Numbers vs Locations:
-   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") belong in door_number (e.g., "#47" or "door 47" -> door_number="47"). Do not put door identifiers into location fields.
+   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") are NEVER locations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.
+   - For CASE_1 and CASE_2 a single door goes in door_number (e.g. "#47" or "door 47" -> door_number="47").
+   - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
+   - Strip the leading "#": "#13" -> "13".
+   - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
+   - Leave origin_location and destination_location null for CASE_3; drivers rarely name the facility on an internal move and it is inferred from their last known position.
 
-3. Load Status & Trailer Details:
+3. Dock Cleanup:
+   - If the driver says "cleanup" or "clean up", keep the case as CASE_3_INTRA_FACILITY_MOVE and set is_cleanup to true. Otherwise set it false.
+
+4. Load Status & Trailer Details:
    - Set load_status to "BOBTAIL", "EMPTY", or "LOADED" based on text or slang terms above.
    - Extract trailer_number (e.g., "77344").
 
 Return raw JSON ONLY:
 {{
-  "case_type": "CASE_1_ORIGIN_DEPARTURE" | "CASE_2_DESTINATION_ARRIVAL" | "CASE_HISTORICAL_BOL_UPDATE" | "NONE_WORK_RELATED",
+  "case_type": "CASE_1_ORIGIN_DEPARTURE" | "CASE_2_DESTINATION_ARRIVAL" | "CASE_HISTORICAL_BOL_UPDATE" | "CASE_3_INTRA_FACILITY_MOVE" | "NONE_WORK_RELATED",
   "origin_location": string or null,
   "destination_location": string or null,
+  "origin_dock": string or null,
+  "destination_dock": string or null,
+  "is_cleanup": boolean,
   "trailer_number": string or null,
   "door_number": string or null,
   "action": "LIVE_UNLOAD" | "DROP_DOCK" | "DROP_YARD" | "DROP_DOOR" | "BOBTAIL_ARRIVE" | null,
@@ -323,6 +339,9 @@ async def prepare_text_intent(text: str) -> dict:
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
         "door_number": llm_parsed.get("door_number"),
+        "origin_dock": llm_parsed.get("origin_dock"),
+        "destination_dock": llm_parsed.get("destination_dock"),
+        "is_cleanup": bool(llm_parsed.get("is_cleanup")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -363,6 +382,9 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
         "door_number": llm_parsed.get("door_number"),
+        "origin_dock": llm_parsed.get("origin_dock"),
+        "destination_dock": llm_parsed.get("destination_dock"),
+        "is_cleanup": bool(llm_parsed.get("is_cleanup")),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

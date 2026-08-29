@@ -10,6 +10,7 @@ from config import (
     TABLE_SHUTTLE_LEGS,
     TABLE_ROUTES,
     TABLE_ROUTE_MEMBERS,
+    TABLE_DISTANCES,
     INDEX_UNIQUE_BOL,
 )
 
@@ -85,8 +86,19 @@ CREATE TABLE IF NOT EXISTS {TABLE_ROUTE_MEMBERS} (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+DDL_DISTANCES = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_DISTANCES} (
+    origin_code VARCHAR(32) NOT NULL,
+    destination_code VARCHAR(32) NOT NULL,
+    miles DECIMAL(6,2) DEFAULT NULL,
+    drive_minutes INT DEFAULT NULL,
+    weighted_minutes DECIMAL(6,2) DEFAULT NULL,
+    PRIMARY KEY (origin_code, destination_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
-              DDL_ROUTES, DDL_ROUTE_MEMBERS)
+              DDL_ROUTES, DDL_ROUTE_MEMBERS, DDL_DISTANCES)
 
 # Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
 # is a no-op against an existing database, so these must be applied separately

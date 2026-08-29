@@ -12,6 +12,7 @@ from telegram.ext import (
 from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
 from routes import refresh_route_cache, seed_default_routes
+from seed_network import seed_network
 from handlers import (
     handle_text_message,
     handle_photo_message,
@@ -60,6 +61,11 @@ async def init_db_pool():
             seeded = await seed_default_routes(cur)
             if seeded:
                 logger.info(f"Seeded {seeded} default shuttle routes.")
+            locations, distances = await seed_network(cur)
+            if locations or distances:
+                logger.info(
+                    f"Seeded {locations} location codes and {distances} distance pairs."
+                )
 
     logger.info("Database pool initialized successfully in Eastern Time.")
     return pool

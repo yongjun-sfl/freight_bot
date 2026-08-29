@@ -17,15 +17,37 @@ from config import TABLE_DISTANCES, TABLE_LOCATION_CODES
 
 logger = logging.getLogger(__name__)
 
-CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "data", "location_distance.csv")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+CSV_PATH = os.path.join(DATA_DIR, "location_distance.csv")
+LOCATIONS_PATH = os.path.join(DATA_DIR, "locations.csv")
 
-# Codes sharing a physical site. 200F (front, FG/RM inbound) and 200R (rear,
-# FG/RM outbound) are one yard for deciding whether a round has closed.
-SITE_OVERRIDES = {"200F": "200", "200R": "200"}
+def read_locations_csv(path=LOCATIONS_PATH):
+    """Facility list with official names, addresses, sites and active flags.
 
-# Spoken shorthand -> canonical code. A bare "200" means the front.
-ALIAS_OVERRIDES = {"200F": "200,200 FRONT", "200R": "200 REAR"}
+    official_name is what the client calls the place ("EAGLE 2 FRONT"); the
+    code is our shorthand. Reports aimed at their accounting team should use
+    the former. site_code groups front/rear pairs that share an address, which
+    is what lets a round opened at 200R close on return to 200F.
+    """
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            code = (row.get("code") or "").strip().upper()
+            if not code:
+                continue
+            aliases = (row.get("aliases") or "").replace("|", ",").strip(",")
+            rows.append({
+                "code": code,
+                "official_name": (row.get("official_name") or "").strip() or None,
+                "address": (row.get("address") or "").strip() or None,
+                "type": (row.get("type") or "").strip() or None,
+                "site": (row.get("site_code") or "").strip().upper() or code,
+                "aliases": aliases or None,
+                "active": (row.get("is_active") or "YES").strip().upper() == "YES",
+            })
+    return rows
 
 
 def read_distance_csv(path=CSV_PATH):
@@ -81,14 +103,30 @@ async def seed_network(cur):
     (has_locations,) = await cur.fetchone()
     seeded_locations = 0
     if not has_locations:
-        for code in codes:
+        defined = read_locations_csv()
+        seen = set()
+        for row in defined:
+            seen.add(row["code"])
             await cur.execute(
                 f"""INSERT INTO {TABLE_LOCATION_CODES}
-                        (canonical_code, aliases, site_code)
-                    VALUES (%s, %s, %s);""",
-                (code, ALIAS_OVERRIDES.get(code), SITE_OVERRIDES.get(code, code)),
+                        (canonical_code, aliases, site_code, address,
+                         location_type, official_name, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);""",
+                (row["code"], row["aliases"], row["site"], row["address"],
+                 row["type"], row["official_name"], row["active"]),
             )
-        seeded_locations = len(codes)
+        # Anything in the distance export but absent from the facility list
+        # still needs a row, or normalize_location will not resolve it.
+        for code in codes:
+            if code in seen:
+                continue
+            await cur.execute(
+                f"""INSERT INTO {TABLE_LOCATION_CODES}
+                        (canonical_code, site_code) VALUES (%s, %s);""",
+                (code, code),
+            )
+            logger.warning(f"{code} has distances but no facility record.")
+        seeded_locations = len(seen) + len(set(codes) - seen)
 
     await cur.execute(f"SELECT COUNT(*) FROM {TABLE_DISTANCES};")
     (has_distances,) = await cur.fetchone()

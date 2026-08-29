@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
     canonical_code VARCHAR(32) NOT NULL UNIQUE,
     aliases VARCHAR(255) DEFAULT NULL,
     site_code VARCHAR(32) DEFAULT NULL,
+    address VARCHAR(255) DEFAULT NULL,
+    location_type VARCHAR(32) DEFAULT NULL,
     official_name TEXT DEFAULT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -142,6 +144,12 @@ ADDITIVE_LOCATION_COLUMNS = (
     ("site_code",
      f"ALTER TABLE {TABLE_LOCATION_CODES} "
      "ADD COLUMN site_code VARCHAR(32) DEFAULT NULL AFTER aliases"),
+    ("address",
+     f"ALTER TABLE {TABLE_LOCATION_CODES} "
+     "ADD COLUMN address VARCHAR(255) DEFAULT NULL AFTER site_code"),
+    ("location_type",
+     f"ALTER TABLE {TABLE_LOCATION_CODES} "
+     "ADD COLUMN location_type VARCHAR(32) DEFAULT NULL AFTER address"),
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.

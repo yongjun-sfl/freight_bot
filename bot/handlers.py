@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -19,7 +19,47 @@ MEDIA_GROUP_LOCK = asyncio.Lock()
 
 
 def get_eastern_timestamp() -> str:
+    """Fallback only. Prefer message_timestamp()."""
     return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def original_send_time(msg):
+    """The moment the content was first sent, as an aware datetime or None.
+
+    For a forwarded message that is the ORIGINAL send time, not the time it
+    was forwarded. Someone relaying a driver's earlier report must not
+    restamp the movement to now.
+
+    Bot API 7.0 moved this to forward_origin; forward_date is the legacy
+    field. Both exist in python-telegram-bot 20.8, so both are consulted.
+    """
+    origin = getattr(msg, "forward_origin", None)
+    for candidate in (getattr(origin, "date", None),
+                      getattr(msg, "forward_date", None),
+                      getattr(msg, "date", None)):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def message_timestamp(msg) -> str:
+    """When the driver sent the message, in Eastern.
+
+    Authoritative over datetime.now(): the bot may handle a message well
+    after it was sent -- albums are buffered 1.2s, Gemini retries run up to
+    ~15s, and a restart processes a backlog at once. These values become
+    departure_time and arrival_time on records handed to accounting, so they
+    must reflect the driver, not the server.
+
+    Telegram sends these as UTC; naive values are treated as UTC too.
+    """
+    sent = original_send_time(msg)
+    if sent is None:
+        logger.warning("Message carried no Telegram date; falling back to receipt time.")
+        return get_eastern_timestamp()
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return sent.astimezone(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def _send_dispatch_card(context: ContextTypes.DEFAULT_TYPE,
@@ -42,7 +82,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(update.message)
     raw_text = update.message.text.strip()
 
     pool = context.bot_data["db_pool"]
@@ -100,7 +140,7 @@ async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
 
     pool = context.bot_data["db_pool"]
@@ -151,7 +191,9 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    # The album is one action by the driver; take the earliest send time so the
+    # 1.2s buffer and per-image arrival order cannot shift it.
+    msg_timestamp = min(message_timestamp(m) for m in messages)
 
     # Aggregate caption if driver typed it on any image in the album
     caption = ""
@@ -209,7 +251,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
     group_title = chat.title or "Private Chat"
-    msg_timestamp = get_eastern_timestamp()
+    msg_timestamp = message_timestamp(msg)
     caption = msg.caption.strip() if msg.caption else ""
 
     pool = context.bot_data["db_pool"]

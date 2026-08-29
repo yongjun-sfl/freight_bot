@@ -904,7 +904,7 @@ async def test_registered_driver_is_not_recorded_as_unknown(pool):
 # ==========================================================================
 
 async def test_arriving_off_route_raises_a_card(pool):
-    """Departure said E2F, arrival says E2R. The leg records what was reported,
+    """Departure said E2F, arrival says SDS. The leg records what was reported,
     and dispatch is told while the driver is still on site."""
     await seed_network(pool)
     leg = await insert_leg(
@@ -913,13 +913,27 @@ async def test_arriving_off_route_raises_a_card(pool):
     )
     res = await commit(
         pool,
-        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="E2R"),
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="SDS"),
     )
     assert res["is_clean"] is False
     assert "Wrong Destination" in res["card_text"]
-    assert "E2F" in res["card_text"] and "E2R" in res["card_text"]
+    assert "E2F" in res["card_text"] and "SDS" in res["card_text"]
     assert res["leg_id"] == leg
     assert (await get_leg(pool, leg))["arrival_time"] is not None
+
+
+async def test_eagle_2_front_and_rear_is_not_a_wrong_destination(pool):
+    """Routed to E2F, arrives at E2R. Same plant at 310 Nexus Dr, same site --
+    the door used is not a routing mistake."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="200F", destination_location="E2F",
+                     leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="E2R"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
 
 
 async def test_arriving_where_expected_is_silent(pool):

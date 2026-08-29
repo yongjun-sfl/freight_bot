@@ -70,11 +70,16 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     dock_number VARCHAR(32) DEFAULT NULL,
     origin_dock VARCHAR(32) DEFAULT NULL,
     destination_dock VARCHAR(32) DEFAULT NULL,
+    -- SDS yard slot ("DO# 34"). A parking position, unrelated to the delivery
+    -- order number that may appear on a BOL. SDS is the only site using it.
+    do_number VARCHAR(32) DEFAULT NULL,
     shipper_signed TINYINT(1) DEFAULT 0,
     receiver_signed TINYINT(1) DEFAULT 0,
     is_positioning_leg TINYINT(1) DEFAULT 0,
     round_number INT DEFAULT NULL,
     route_code VARCHAR(32) DEFAULT NULL,
+    load_type VARCHAR(32) DEFAULT NULL,
+    trip_seq INT DEFAULT NULL,
     is_bobtail TINYINT(1) DEFAULT 0,
     leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -146,6 +151,15 @@ ADDITIVE_COLUMNS = (
     ("route_code",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN route_code VARCHAR(32) DEFAULT NULL AFTER round_number"),
+    ("do_number",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN do_number VARCHAR(32) DEFAULT NULL AFTER destination_dock"),
+    ("load_type",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN load_type VARCHAR(32) DEFAULT NULL AFTER route_code"),
+    ("trip_seq",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN trip_seq INT DEFAULT NULL AFTER load_type"),
     ("paperwork_time",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN paperwork_time DATETIME DEFAULT NULL AFTER arrival_time"),

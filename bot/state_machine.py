@@ -2,6 +2,7 @@ import logging
 import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
 from ai_engine import normalize_location, site_of
+from load_types import classify as classify_load
 from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ async def commit_trip_leg(
     document_type = intent.get("document_type", "UNKNOWN")
     action_type = intent.get("action")
     door_num = intent.get("door_number")
+    do_num = intent.get("do_number")
     origin_dock = intent.get("origin_dock")
     destination_dock = intent.get("destination_dock")
     primary_image_blob = intent.get("primary_image_blob")
@@ -233,6 +235,22 @@ async def commit_trip_leg(
                     return number, route_code_for(origin, [destination])
                 return number, SPOT_ROUTE_CODE
 
+            async def next_trip_seq() -> int:
+                """Sequential leg number for this driver today.
+
+                Mirrors the Trip Seq column in the dispatcher's sheet, which
+                exists so rounds can be worked out from the leg order.
+                """
+                await cur.execute(
+                    f"""SELECT COALESCE(MAX(trip_seq), 0) 
+                          FROM {TABLE_SHUTTLE_LEGS} 
+                         WHERE user_id = %s 
+                           AND DATE(departure_time) = CURRENT_DATE();""",
+                    (did,)
+                )
+                (highest,) = await cur.fetchone()
+                return (highest or 0) + 1
+
             async def current_round_number():
                 """The round a within-facility move happened during."""
                 await cur.execute(
@@ -340,6 +358,8 @@ async def commit_trip_leg(
                         (msg_timestamp, did)
                     )
 
+                    round_and_route = await resolve_round(origin_loc, dest_loc)
+
                     # Insert new departure leg
                     await cur.execute(
                         f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
@@ -358,13 +378,18 @@ async def commit_trip_leg(
                                leg_status, 
                                load_status,
                                round_number,
-                               route_code
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s);""",
+                               route_code,
+                               load_type,
+                               trip_seq
+                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s, %s);""",
                         (
                             did, display_trailer, bol_number, document_type, origin_loc, dest_loc,
                             msg_timestamp, action_type, primary_image_blob, door_num,
                             1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
-                            *(await resolve_round(origin_loc, dest_loc))
+                            *round_and_route,
+                            classify_load(origin_loc, dest_loc, load_status_val,
+                                          round_and_route[1]),
+                            await next_trip_seq(),
                         )
                     )
                     await conn.commit()
@@ -518,6 +543,7 @@ async def commit_trip_leg(
                                        -- on site is longer than the recorded dwell.
                                        arrival_at_dock = %s,
                                        dock_number = COALESCE(%s, dock_number),
+                                       do_number = COALESCE(%s, do_number),
                                        receiver_signed = COALESCE(%s, receiver_signed),
                                        leg_status = %s
                                  WHERE id = %s;""",
@@ -526,6 +552,7 @@ async def commit_trip_leg(
                                 resolved_action, 
                                 1 if door_num else 0, 
                                 door_num, 
+                                do_num, 
                                 # None, not 0: COALESCE must fall through to the
                                 # stored value when no signature was detected,
                                 # otherwise an arrival wipes a POD captured earlier.

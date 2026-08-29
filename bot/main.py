@@ -14,6 +14,7 @@ from telegram.ext import (
 
 from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
+from load_types import load_lane_map
 from routes import refresh_route_cache, seed_default_routes
 from seed_network import seed_drivers, seed_network
 from dwell import sweep_dwells
@@ -123,6 +124,7 @@ async def on_startup(application: Application):
     application.bot_data["db_pool"] = db_pool
     await refresh_location_cache(db_pool)
     await refresh_route_cache(db_pool)
+    load_lane_map()
 
     if application.job_queue:
         application.job_queue.run_repeating(

@@ -220,6 +220,7 @@ EXTRACTION & NORMALIZATION RULES:
    - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
    - Strip the leading "#": "#13" -> "13".
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
+   - SDS uses a yard slot written "DO# 34", "DO 34" or "do34". Put just the number in do_number (e.g. "34"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
    - Leave origin_location and destination_location null for CASE_3; drivers rarely name the facility on an internal move and it is inferred from their last known position.
 
 
@@ -234,6 +235,7 @@ Return raw JSON ONLY:
   "destination_location": string or null,
   "origin_dock": string or null,
   "destination_dock": string or null,
+  "do_number": string or null,
   "trailer_number": string or null,
   "door_number": string or null,
   "action": "LIVE_UNLOAD" | "DROP_DOCK" | "DROP_YARD" | "DROP_DOOR" | "BOBTAIL_ARRIVE" | null,
@@ -277,6 +279,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
    - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
 4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
+4b. "do_number": SDS clerks HAND-WRITE a yard slot on the BOL so the driver can find the trailer in a very large yard. It looks like "DO# 34", "DO 34" or "D.O. 34", usually one to three digits, and is often the only handwriting on the page. Return just the number. This is a parking position, not a delivery order number, and only SDS paperwork carries one. Return null if absent.
 5. "shipper_signed": Set to True if there is a signature, initials, or stamp in the origin/shipper/carrier section.
 6. "receiver_signed": Set to True if there is a signature, stamp, checkmark, or handwritten note in the delivery/consignee section.
 
@@ -286,6 +289,7 @@ Return raw JSON ONLY:
   "bol_number": string or null,
   "document_type": "FG" | "RM" | "UNKNOWN",
   "trailer_number": string or null,
+  "do_number": string or null,
   "shipper_signed": boolean,
   "receiver_signed": boolean
 }"""
@@ -294,6 +298,7 @@ Return raw JSON ONLY:
         "bol_number": None,
         "document_type": "UNKNOWN",
         "trailer_number": None,
+        "do_number": None,
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
@@ -330,6 +335,9 @@ Return raw JSON ONLY:
 
             if data.get("trailer_number") and not result["trailer_number"]:
                 result["trailer_number"] = data["trailer_number"]
+
+            if data.get("do_number") and not result["do_number"]:
+                result["do_number"] = data["do_number"]
 
             if data.get("shipper_signed"):
                 result["shipper_signed"] = True
@@ -368,6 +376,7 @@ async def prepare_text_intent(text: str) -> dict:
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
+        "do_number": llm_parsed.get("do_number"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -410,6 +419,9 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
+        # Handwritten on the BOL by the SDS clerk, so the image is the more
+        # reliable source; a caption mentioning it still wins if present.
+        "do_number": llm_parsed.get("do_number") or ocr_data.get("do_number"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),

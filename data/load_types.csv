@@ -1,0 +1,16 @@
+origin_site,destination_site,load_type,note
+200,E2,RM,RM out of 200 rear to Eagle 2
+E2,200,RM Inbound,RM returning from Eagle 2
+SDS,200,FG STO,finished goods inbound to 200
+200,SDS,FG SDS,UNCONFIRMED - is a loaded 200 to SDS leg FG SDS?
+E1,210,FG E1,
+210,E1,FG E1,
+200,7634,FG ES,
+7634,200,FG ES,
+SDS,7634,FG DS,
+7634,SDS,FG DS,
+3551,E1,RM 3551,
+3551,E2,RM 3551,
+E1,3551,RM 3551,
+E2,3551,RM 3551,
+1380,300,FG CTV,on hold lane

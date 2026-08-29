@@ -224,19 +224,15 @@ async def seed_routes(pool, definitions=None):
 
 
 async def seed_network(pool):
-    """The real facility list plus the seven routes."""
+    """The real facility list and routes, read from the same files production
+    seeds from. Never restate them here -- a hardcoded copy drifts, and the
+    site codes silently stop matching the lane map."""
+    import seed_network as seed_mod
+
     await seed_locations(pool, [
-        ("200F", "200,200 FRONT", "200"),
-        ("200R", "200 REAR", "200"),
-        ("7634", "", "7634"),
-        ("SDS", "", "SDS"),
-        ("E1", "", "E1"),
-        ("E2F", "", "E2F"),
-        ("E2R", "", "E2R"),
-        ("210", "", "210"),
-        ("3551", "", "3551"),
-        ("100", "", "100"),
-        ("1380", "", "1380"),
+        (row["code"], row["aliases"] or "", row["site"])
+        for row in seed_mod.read_locations_csv()
+        if row["active"]
     ])
     await seed_routes(pool)
 

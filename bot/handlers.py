@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ai_engine import prepare_text_intent, prepare_image_intent, refresh_location_cache
+from routes import refresh_route_cache
 from state_machine import commit_trip_leg
 
 logger = logging.getLogger(__name__)
@@ -291,6 +292,7 @@ async def refresh_locations_command(update: Update, context: ContextTypes.DEFAUL
     pool = context.bot_data["db_pool"]
     try:
         await refresh_location_cache(pool)
-        await update.message.reply_text("✅ Location cache refreshed successfully.")
+        await refresh_route_cache(pool)
+        await update.message.reply_text("✅ Location and route caches refreshed successfully.")
     except Exception as e:
         await update.message.reply_text(f"❌ Cache refresh failed: {e}")

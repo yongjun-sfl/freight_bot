@@ -11,6 +11,7 @@ from telegram.ext import (
 
 from schema_ddl import apply_schema
 from ai_engine import refresh_location_cache
+from routes import refresh_route_cache, seed_default_routes
 from handlers import (
     handle_text_message,
     handle_photo_message,
@@ -56,6 +57,9 @@ async def init_db_pool():
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await apply_schema(cur, MYSQL_DB, logger)
+            seeded = await seed_default_routes(cur)
+            if seeded:
+                logger.info(f"Seeded {seeded} default shuttle routes.")
 
     logger.info("Database pool initialized successfully in Eastern Time.")
     return pool
@@ -65,6 +69,7 @@ async def on_startup(application: Application):
     db_pool = await init_db_pool()
     application.bot_data["db_pool"] = db_pool
     await refresh_location_cache(db_pool)
+    await refresh_route_cache(db_pool)
     logger.info("🚀 AI Dispatch Engine is live.")
 
 

@@ -4,7 +4,14 @@ Both the bot startup path (``main.init_db_pool``) and the test harness apply the
 schema from here, so a fresh test database can never drift from production.
 """
 
-from config import TABLE_DRIVERS, TABLE_LOCATION_CODES, TABLE_SHUTTLE_LEGS, INDEX_UNIQUE_BOL
+from config import (
+    TABLE_DRIVERS,
+    TABLE_LOCATION_CODES,
+    TABLE_SHUTTLE_LEGS,
+    TABLE_ROUTES,
+    TABLE_ROUTE_MEMBERS,
+    INDEX_UNIQUE_BOL,
+)
 
 DDL_DRIVERS = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_DRIVERS} (
@@ -20,6 +27,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
     id INT AUTO_INCREMENT PRIMARY KEY,
     canonical_code VARCHAR(32) NOT NULL UNIQUE,
     aliases VARCHAR(255) DEFAULT NULL,
+    site_code VARCHAR(32) DEFAULT NULL,
     official_name TEXT DEFAULT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -47,6 +55,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     receiver_signed TINYINT(1) DEFAULT 0,
     is_positioning_leg TINYINT(1) DEFAULT 0,
     round_number INT DEFAULT NULL,
+    route_code VARCHAR(32) DEFAULT NULL,
     is_bobtail TINYINT(1) DEFAULT 0,
     leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -56,7 +65,28 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
-ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS)
+DDL_ROUTES = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_ROUTES} (
+    route_code VARCHAR(32) PRIMARY KEY,
+    route_name VARCHAR(128) DEFAULT NULL,
+    anchor_location VARCHAR(32) NOT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_anchor (anchor_location)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+DDL_ROUTE_MEMBERS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_ROUTE_MEMBERS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    route_code VARCHAR(32) NOT NULL,
+    location_code VARCHAR(32) NOT NULL,
+    UNIQUE INDEX idx_route_location (route_code, location_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
+              DDL_ROUTES, DDL_ROUTE_MEMBERS)
 
 # Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
 # is a no-op against an existing database, so these must be applied separately
@@ -71,6 +101,16 @@ ADDITIVE_COLUMNS = (
     ("round_number",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN round_number INT DEFAULT NULL AFTER is_positioning_leg"),
+    ("route_code",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN route_code VARCHAR(32) DEFAULT NULL AFTER round_number"),
+)
+
+# Same shape, for location_codes.
+ADDITIVE_LOCATION_COLUMNS = (
+    ("site_code",
+     f"ALTER TABLE {TABLE_LOCATION_CODES} "
+     "ADD COLUMN site_code VARCHAR(32) DEFAULT NULL AFTER aliases"),
 )
 
 # Tables the test harness is allowed to wipe between cases, child-first.
@@ -82,20 +122,22 @@ async def apply_schema(cur, db_name: str, logger=None):
     for ddl in ALL_TABLES:
         await cur.execute(ddl)
 
-    for column, alter in ADDITIVE_COLUMNS:
-        await cur.execute(
-            """SELECT COUNT(*)
-                  FROM information_schema.columns
-                 WHERE table_schema = %s
-                   AND table_name = %s
-                   AND column_name = %s;""",
-            (db_name, TABLE_SHUTTLE_LEGS, column),
-        )
-        (column_exists,) = await cur.fetchone()
-        if not column_exists:
-            await cur.execute(alter)
-            if logger:
-                logger.info(f"Added column '{column}' to {TABLE_SHUTTLE_LEGS}.")
+    for table, columns in ((TABLE_SHUTTLE_LEGS, ADDITIVE_COLUMNS),
+                           (TABLE_LOCATION_CODES, ADDITIVE_LOCATION_COLUMNS)):
+        for column, alter in columns:
+            await cur.execute(
+                """SELECT COUNT(*)
+                      FROM information_schema.columns
+                     WHERE table_schema = %s
+                       AND table_name = %s
+                       AND column_name = %s;""",
+                (db_name, table, column),
+            )
+            (column_exists,) = await cur.fetchone()
+            if not column_exists:
+                await cur.execute(alter)
+                if logger:
+                    logger.info(f"Added column '{column}' to {table}.")
 
     await cur.execute(
         f"""SELECT COUNT(*)

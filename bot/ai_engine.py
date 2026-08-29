@@ -33,7 +33,11 @@ RETRYABLE_MARKERS = (
 
 LOCATION_CACHE = {
     "codes": [],
-    "alias_map": {}
+    "alias_map": {},
+    # canonical code -> physical site. 200F (front/inbound) and 200R
+    # (rear/outbound) are distinct codes on a leg record but one place when
+    # deciding whether a driver has returned and closed a round.
+    "site_map": {},
 }
 
 
@@ -42,7 +46,7 @@ async def refresh_location_cache(pool):
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                f"""SELECT canonical_code, aliases 
+                f"""SELECT canonical_code, aliases, site_code 
                       FROM {TABLE_LOCATION_CODES} 
                      WHERE is_active = TRUE;"""
             )
@@ -50,10 +54,12 @@ async def refresh_location_cache(pool):
             
             codes = []
             alias_map = {}
-            for code, aliases in rows:
+            site_map = {}
+            for code, aliases, site in rows:
                 code_upper = code.strip().upper()
                 codes.append(code_upper)
                 alias_map[code_upper] = code_upper
+                site_map[code_upper] = (site or code).strip().upper()
                 
                 if aliases:
                     for alias in aliases.split(','):
@@ -63,6 +69,7 @@ async def refresh_location_cache(pool):
             
             LOCATION_CACHE["codes"] = list(set(codes))
             LOCATION_CACHE["alias_map"] = alias_map
+            LOCATION_CACHE["site_map"] = site_map
             logger.info(f"Location cache refreshed: {len(codes)} valid codes loaded.")
 
 
@@ -73,6 +80,17 @@ def normalize_location(raw_loc: str) -> str:
     
     clean = raw_loc.strip().upper()
     return LOCATION_CACHE["alias_map"].get(clean, clean)
+
+
+def site_of(location: str) -> str:
+    """The physical site a code belongs to, for deciding round closure.
+
+    200F and 200R are the same yard; unmapped codes are their own site.
+    """
+    if not location:
+        return location
+    clean = location.strip().upper()
+    return LOCATION_CACHE["site_map"].get(clean, clean)
 
 
 def convert_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:

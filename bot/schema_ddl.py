@@ -7,6 +7,7 @@ schema from here, so a fresh test database can never drift from production.
 from config import (
     TABLE_DRIVERS,
     TABLE_LOCATION_CODES,
+    TABLE_LOCATION_DOCKS,
     TABLE_SHUTTLE_LEGS,
     TABLE_ROUTES,
     TABLE_ROUTE_MEMBERS,
@@ -56,6 +57,25 @@ CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_CODES} (
     official_name TEXT DEFAULT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+DDL_LOCATION_DOCKS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_LOCATION_DOCKS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    facility_code VARCHAR(32) NOT NULL,
+    -- Doors are numbered in bands, and the band says what the door is for.
+    -- At 200: 3-21 FG inbound and 22-45 RM inbound at the front, 47-66 RM
+    -- outbound and 67-99 FG outbound at the rear. That is how "#3 to #47"
+    -- is known to cross from the front building to the rear one.
+    first_dock INT NOT NULL,
+    last_dock INT NOT NULL,
+    dock_use VARCHAR(32) DEFAULT NULL,
+    -- Who works the band. 200F 22-45 is Hanjin's RM inbound, not our traffic.
+    operator VARCHAR(32) DEFAULT NULL,
+    note VARCHAR(255) DEFAULT NULL,
+    UNIQUE KEY uniq_dock_band (facility_code, first_dock, last_dock),
+    INDEX idx_dock_facility (facility_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -258,7 +278,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_MANIFEST_ROWS} (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
-ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
+ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_LOCATION_DOCKS,
+              DDL_SHUTTLE_LEGS,
               DDL_ROUTES, DDL_ROUTE_MEMBERS, DDL_DISTANCES,
               DDL_UNKNOWN_SENDERS, DDL_RM_LOADS, DDL_RM_LOAD_ITEMS,
               DDL_SHIFTS, DDL_MANIFESTS, DDL_MANIFEST_ROWS)

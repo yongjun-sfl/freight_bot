@@ -12,6 +12,7 @@ Options come from the environment:
     REPLAY_SHEET=08282026     which day of the workbook is the truth
     REPLAY_PHOTOS=1           also run vision on photos (slow, costs more)
     REPLAY_DRIVER="JOHN SHIM" limit to one driver
+    REPLAY_DEBUG=1             per-driver mismatch diagnostics (recommended!)
 """
 
 import asyncio
@@ -41,7 +42,8 @@ SHEET = os.getenv("REPLAY_SHEET", "08282026")
 WITH_PHOTOS = os.getenv("REPLAY_PHOTOS") == "1"
 ONLY_DRIVER = (os.getenv("REPLAY_DRIVER") or "").upper() or None
 DB = "replay_scratch"
-MATCH_WINDOW_MIN = 45
+MATCH_WINDOW_MIN = 105  # 1h45m - covers lunch breaks and delayed batch reporting
+REPLAY_DEBUG = os.getenv("REPLAY_DEBUG") == "1"
 
 
 def message_text(m):
@@ -54,6 +56,9 @@ def message_text(m):
 
 
 async def build_scratch(password):
+    # Emptied at the START of a run, never at the end: the point of the scratch
+    # database is to still be there afterwards, so the legs the bot produced can
+    # be read row by row instead of only through this script's summary.
     conn = await aiomysql.connect(host="mysql_db", user="root",
                                   password=password, autocommit=True)
     async with conn.cursor() as cur:
@@ -151,29 +156,55 @@ def site(code, sites):
     return sites.get((code or "").upper(), (code or "").upper())
 
 
+def _why_rejected(leg, row, sites, want, got, gap, best_gap):
+    """One-line reason a candidate leg was not chosen for a manual row.
+    Used by REPLAY_DEBUG to expose *why* a match did not happen, not just
+    that it failed."""
+    if site(leg["origin_location"], sites) != site(row["origin"], sites):
+        return f"origin mismatch (bot {site(leg['origin_location'], sites)} vs manual {site(row['origin'], sites)})"
+    if site(leg["destination_location"], sites) != site(row["destination"], sites):
+        return f"destination mismatch (bot {site(leg['destination_location'], sites)} vs manual {site(row['destination'], sites)})"
+    if want is None:
+        return "manual depart time unparseable"
+    if got is None:
+        return "bot depart time unparseable"
+    if gap > MATCH_WINDOW_MIN:
+        return f"depart {row['depart']} vs bot {hhmm(leg['departure_time'])} gap {gap}min (>{MATCH_WINDOW_MIN})"
+    if best_gap is not None and gap >= best_gap:
+        return f"depart gap {gap}min >= a better candidate's {best_gap}min"
+    return "unknown"
+
+
 def compare(manual, bot, sites):
-    """Greedy match on driver, both endpoints, and departure within the window."""
+    """Greedy match on driver, both endpoints, and departure within the window.
+
+    When REPLAY_DEBUG is set, also returns debug rows: for each unmatched
+    manual row, the closest bot candidate and the reason it was rejected.
+    """
     by_driver = defaultdict(list)
     for leg in bot:
         by_driver[leg["driver"].upper()].append(leg)
 
-    matched, missing = [], []
+    matched, missing, debug = [], [], []
     used = set()
     for row in manual:
         candidates = by_driver.get(row["driver"], [])
         want = minutes(row["depart"])
         best, best_gap = None, None
+        closest, closest_gap, closest_reason = None, None, None
         for leg in candidates:
             if id(leg) in used:
                 continue
+            got = minutes(hhmm(leg["departure_time"]))
+            gap = abs(got - want) if (want is not None and got is not None) else None
+            if gap is not None and (closest_gap is None or gap < closest_gap):
+                closest, closest_gap = leg, gap
             if site(leg["origin_location"], sites) != site(row["origin"], sites):
                 continue
             if site(leg["destination_location"], sites) != site(row["destination"], sites):
                 continue
-            got = minutes(hhmm(leg["departure_time"]))
             if want is None or got is None:
                 continue
-            gap = abs(got - want)
             if gap <= MATCH_WINDOW_MIN and (best_gap is None or gap < best_gap):
                 best, best_gap = leg, gap
         if best:
@@ -181,9 +212,18 @@ def compare(manual, bot, sites):
             matched.append((row, best, best_gap))
         else:
             missing.append(row)
+            if REPLAY_DEBUG and candidates:
+                # If no candidate even passed endpoint checks, show the one
+                # that was nearest in time so the operator can see whether
+                # a small endpoint typo or a long delay is the real cause.
+                if closest is not None:
+                    reason = _why_rejected(closest, row, sites, want,
+                                            minutes(hhmm(closest["departure_time"])),
+                                            closest_gap, best_gap)
+                    debug.append((row, closest, reason))
 
     extra = [l for l in bot if id(l) not in used]
-    return matched, missing, extra
+    return matched, missing, extra, debug
 
 
 async def main():
@@ -201,7 +241,7 @@ async def main():
     bot = await bot_legs(pool)
     sites = dict(ai_engine.LOCATION_CACHE.get("site_map") or {})
 
-    matched, missing, extra = compare(manual, bot, sites)
+    matched, missing, extra, debug = compare(manual, bot, sites)
 
     print(f"  {'DRIVER':20} {'MANUAL':>6} {'BOT':>5} {'MATCHED':>8}   RATE")
     print("  " + "-" * 52)
@@ -234,8 +274,24 @@ async def main():
         if len(extra) > 25:
             print(f"    ... and {len(extra)-25} more")
 
+    if debug:
+        print(f"\n  MISMATCH DIAGNOSTICS (set REPLAY_DEBUG=1 for full detail)")
+        for row, leg, reason in debug:
+            print(f"    MANUAL:   {row['driver'][:16]:16} {row['origin']:6} {row['depart']} -> "
+                  f"{row['destination']:6}  {row['transaction'] or ''}")
+            print(f"    CANDIDATE:{leg['driver'][:16]:16} {str(leg['origin_location'])[:6]:6} "
+                  f"{hhmm(leg['departure_time'])} -> {str(leg['destination_location'])[:6]:6} "
+                  f"round={leg['round_number']} {leg['route_code'] or ''}")
+            print(f"    REJECTED: {reason}")
+            print()
+
     pool.close()
     await pool.wait_closed()
+
+    print(f"\n  Legs left in `{DB}` on mysql_db for inspection "
+          f"(dropped and rebuilt at the start of the next run):")
+    print(f"    docker compose exec mysql_db mysql -uroot -p -D {DB}")
+    print(f"    SELECT * FROM shuttle_legs ORDER BY user_id, departure_time;")
 
 
 asyncio.run(main())

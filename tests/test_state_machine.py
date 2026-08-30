@@ -6,6 +6,8 @@ that once the defect is fixed the test turns into an error until the marker is
 removed -- so a fix can never land silently.
 """
 
+from datetime import timedelta
+
 import pytest
 
 from conftest import (
@@ -664,6 +666,389 @@ async def test_drop_to_yard_is_recorded(pool):
     assert leg["destination_dock"] == "YARD"
     assert leg["arrival_action"] == "YARD_DROP"
     assert leg["is_positioning_leg"] == 1
+
+
+# --------------------------------------------------------------------------
+# A drop at the destination is the arrival, not a yard move
+# --------------------------------------------------------------------------
+
+async def test_drop_at_the_destination_completes_the_open_trip(pool):
+    """From live data: "Pickup empty trailer pactra yard to sds" at 07:32, then
+    "Drop empty trailer at sds yard D021 #25773" at 08:09.
+
+    The second message ends the trip, but it reads exactly like an internal
+    move -- one facility, a position, no travel -- so the bot opened a second
+    SDS -> SDS leg and left the real one running until the next departure
+    closed it, 11 minutes after the driver actually got there.
+    """
+    await seed_network(pool)
+    departed = eastern_now() - timedelta(minutes=37)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        trailer_number="UNKNOWN", load_status="EMPTY",
+        leg_status="IN_TRANSIT", departure_time=ts(departed),
+    )
+
+    dropped = eastern_now()
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Drop empty trailer at sds yard D021 #25773",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="YARD", do_number="21",
+               text_trailer="25773", load_status="EMPTY"),
+        when=ts(dropped),
+    )
+    assert res["is_clean"] is True
+    assert res["leg_id"] == trip, "the drop belongs to the trip already running"
+
+    leg = await get_leg(pool, trip)
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["arrival_time"].strftime("%H:%M") == dropped.strftime("%H:%M")
+    assert leg["arrival_action"] == "DROP_YARD"
+    assert leg["destination_dock"] == "YARD"
+    assert leg["do_number"] == "21"
+    assert leg["trailer_number"] == "25773"
+
+    assert [l for l in await all_legs(pool) if l["is_positioning_leg"] == 1] == [], \
+        "no phantom SDS -> SDS leg"
+
+
+async def test_a_move_between_two_positions_is_never_the_arrival(pool):
+    """"door 7 to yard" names somewhere the driver moved off, so it is a real
+    move whatever trip happens to be open."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="SDS", destination_location="200F",
+        trailer_number="77344", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="moved 44821 door 7 to yard", origin_dock="7",
+               destination_dock="YARD", ocr_trailer="44821",
+               load_status="EMPTY"),
+    )
+    assert res["leg_id"] != trip
+    assert (await get_leg(pool, res["leg_id"]))["is_positioning_leg"] == 1
+    assert (await get_leg(pool, trip))["leg_status"] == "IN_TRANSIT"
+
+
+async def test_a_drop_somewhere_else_is_not_the_arrival(pool):
+    """Dropping in the 200 yard says nothing about a trip running to SDS."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="drop empty 200 r yard", origin_location="200R",
+               destination_location="200R", destination_dock="YARD",
+               load_status="EMPTY"),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["is_positioning_leg"] == 1
+    assert (await get_leg(pool, trip))["leg_status"] == "IN_TRANSIT"
+
+
+async def test_the_trailer_named_at_the_drop_corrects_the_leg(pool):
+    """From live data: Sokhwan Yun's 11:18 SDS run was recorded with trailer
+    25773, inherited by the CASE 1 fallback from three legs earlier. He had
+    swapped trailers at 08:20 and was hauling 77155 -- which is what he named
+    on dropping it, and what the dispatcher logged. A first-hand report from
+    the destination beats a value carried forward, so it must not be read as
+    "different trailer, therefore a yard move"."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        trailer_number="25773", load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Drop empty trailer at sds yard D026 #77155",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="YARD", do_number="26",
+               text_trailer="77155", load_status="EMPTY"),
+    )
+    assert res["leg_id"] == trip
+
+    leg = await get_leg(pool, trip)
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["trailer_number"] == "77155", "the trailer actually dropped"
+    assert leg["do_number"] == "26"
+    assert [l for l in await all_legs(pool) if l["is_positioning_leg"] == 1] == []
+
+
+async def test_front_to_rear_while_a_trip_is_open_stays_a_move(pool):
+    """"200F to 200R" is two named places -- a reposition, not a drop on
+    arrival -- even when a leg to 200 is still marked in transit."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="SDS", destination_location="200F",
+        leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text="200F to 200R",
+               origin_location="200F", destination_location="200R",
+               load_status="EMPTY"),
+    )
+    move = await get_leg(pool, res["leg_id"])
+    assert move["is_positioning_leg"] == 1
+    assert move["id"] != trip
+
+
+async def test_drop_after_the_arrival_was_already_reported_is_a_move(pool):
+    """Once the trip is closed the next drop is a yard move again."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        leg_status="IN_TRANSIT",
+    )
+    first = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="YARD", text_trailer="25773",
+               load_status="EMPTY"),
+    )
+    assert first["leg_id"] == trip
+
+    second = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="YARD", text_trailer="61002",
+               load_status="EMPTY"),
+    )
+    assert second["leg_id"] != trip
+    assert (await get_leg(pool, second["leg_id"]))["is_positioning_leg"] == 1
+
+
+# --------------------------------------------------------------------------
+# Doors say which building, and finish the job they end
+# --------------------------------------------------------------------------
+
+async def test_dock_move_across_the_site_records_both_buildings(pool):
+    """From live data: "Finish live unloading at pactra #3 move to Dock 47".
+
+    Door 3 is FG inbound at 200F, door 47 is RM outbound at 200R, so this is
+    the trailer coming off the inbound door and being staged on a vacant
+    outbound one -- for himself or whoever takes the next RM round. The bot
+    read "move to Dock 47" as travel and recorded a leg to UNKNOWN.
+    """
+    await seed_network(pool)
+    delivery = await insert_leg(
+        pool, origin_location="SDS", destination_location="200F",
+        trailer_number="77209", load_status="LOADED", leg_status="ARRIVED",
+        arrival_time=ts(eastern_now() - timedelta(minutes=26)),
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Finish live unloading at pactra #3  move to Dock 47",
+               origin_location="200F", destination_location="200F",
+               origin_dock="3", destination_dock="47",
+               work_finished=True, load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+
+    move = await get_leg(pool, res["leg_id"])
+    assert move["is_positioning_leg"] == 1
+    assert move["origin_location"] == "200F", "door 3 is the FG inbound side"
+    assert move["destination_location"] == "200R", "door 47 is RM outbound"
+    assert move["origin_dock"] == "3" and move["destination_dock"] == "47"
+    assert move["arrival_action"] == "DOCK_MOVE"
+    assert move["load_status"] == "EMPTY"
+
+    # the unload it ends belongs to the trip that brought the load in
+    assert (await get_leg(pool, delivery))["finished_time"] is not None
+
+
+async def test_a_completion_is_not_stamped_on_a_trip_that_ended_elsewhere(pool):
+    """When the departure was never recorded -- the driver did not say where
+    he was taking the load -- the newest leg is an earlier run to somewhere
+    else. Stamping it would file this unload against the wrong trip."""
+    await seed_network(pool)
+    elsewhere = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        leg_status="COMPLETED",
+        arrival_time=ts(eastern_now() - timedelta(minutes=90)),
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Finish live unloading at pactra #3 move to Dock 47",
+               origin_location="200F", destination_location="200F",
+               origin_dock="3", destination_dock="47",
+               work_finished=True, load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    assert (await get_leg(pool, elsewhere))["finished_time"] is None
+    assert (await get_leg(pool, res["leg_id"]))["destination_location"] == "200R"
+
+
+async def test_a_move_within_one_building_stays_there(pool):
+    """3 and 13 are both FG inbound doors: one building, no crossing."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="200F", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="empty move #3 to #13", origin_dock="3",
+               destination_dock="13", load_status="EMPTY"),
+    )
+    move = await get_leg(pool, res["leg_id"])
+    assert move["origin_location"] == "200F"
+    assert move["destination_location"] == "200F"
+
+
+async def test_an_unmapped_door_keeps_the_facility_it_had(pool):
+    """Door 46 sits between two bands and the upper bounds are approximate, so
+    an unmapped door must not drag the move to another building."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="200R", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="empty move #46 to yard", origin_dock="46",
+               destination_dock="YARD", load_status="EMPTY"),
+    )
+    move = await get_leg(pool, res["leg_id"])
+    assert move["origin_location"] == "200R"
+    assert move["destination_location"] == "200R"
+
+
+async def test_doors_at_another_site_are_not_read_as_200_doors(pool):
+    """Only 200 has bands recorded. A door move at Eagle 2 must stay at E2F."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="E2F", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="empty move #3 to #47", origin_dock="3",
+               destination_dock="47", load_status="EMPTY"),
+    )
+    move = await get_leg(pool, res["leg_id"])
+    assert move["origin_location"] == "E2F"
+    assert move["destination_location"] == "E2F"
+
+
+# --------------------------------------------------------------------------
+# A load hooked with no destination named
+# --------------------------------------------------------------------------
+
+async def test_loaded_pickup_with_no_destination_raises_a_card(pool):
+    """From live data: "Load trailer pickup sds dock28 #77209" at 14:24. The
+    driver forgot to say where he was taking it, so the whole SDS -> 200F run
+    went missing from the day -- silently, because the message reads as a yard
+    move. Nothing can be recorded without a destination, but dispatch has to
+    know the message happened."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="SDS", leg_status="COMPLETED")
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="28", text_trailer="77209",
+               load_status="LOADED"),
+    )
+    assert res["is_clean"] is False
+    assert res["leg_id"] is None, "a leg to UNKNOWN would enter a round as a real trip"
+    assert "Load Picked Up With No Destination" in res["card_text"]
+    assert "SDS" in res["card_text"] and "77209" in res["card_text"]
+    assert "28" in res["card_text"]
+
+    assert [l for l in await all_legs(pool) if l["is_positioning_leg"] == 1] == []
+
+
+async def test_pickup_at_the_destination_stamps_arrival_and_still_cards(pool):
+    """Hooking the next load on arrival: the trip that just ended is safe, the
+    one starting is not."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="28", text_trailer="77209",
+               load_status="LOADED"),
+    )
+    assert res["leg_id"] == trip
+    assert res["is_clean"] is False
+    assert "Load Picked Up With No Destination" in res["card_text"]
+
+    leg = await get_leg(pool, trip)
+    assert leg["leg_status"] == "COMPLETED", "the inbound run still ends here"
+    assert leg["arrival_time"] is not None
+
+
+async def test_orphan_loaded_pickup_read_as_an_arrival_also_cards(pool):
+    """The same message classified CASE 2 instead of CASE 3 must not go quiet."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               origin_location="SDS", door_number="28",
+               text_trailer="77209", load_status="LOADED"),
+    )
+    assert res["is_clean"] is False
+    assert res["leg_id"] is None
+    assert "Load Picked Up With No Destination" in res["card_text"]
+
+
+async def test_a_plain_arrival_with_no_open_trip_stays_quiet(pool):
+    """Only a pickup is a lost departure; a bare "arrived" is nothing."""
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", raw_text="arrived sds",
+               origin_location="SDS"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
+
+
+async def test_a_loaded_yard_move_is_not_a_lost_pickup(pool):
+    """"loaded move #4 to #13" names where it moved off. Still a yard move."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="200F", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="loaded move #4 to #13", origin_dock="4",
+               destination_dock="13", load_status="LOADED"),
+    )
+    assert res["is_clean"] is True
+    assert res["card_text"] is None
+    assert (await get_leg(pool, res["leg_id"]))["is_positioning_leg"] == 1
+
+
+async def test_a_pickup_that_names_its_destination_is_a_departure(pool):
+    """The control: "pickup load sds yard D033 to pactra" is a normal trip."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Load trailer pickup sds yard D033 to pactra",
+               origin_location="SDS", destination_location="200F",
+               do_number="33", text_trailer="77209", load_status="LOADED",
+               bol_number="B1", primary_image_blob=IMG, document_type="FG"),
+    )
+    assert res["is_clean"] is True
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "SDS"
+    assert leg["destination_location"] == "200F"
+    assert leg["leg_status"] == "IN_TRANSIT"
 
 
 async def test_internal_move_with_no_known_facility_raises_card(pool):

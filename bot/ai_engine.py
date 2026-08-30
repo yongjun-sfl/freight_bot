@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import time
 import random
 import asyncio
@@ -10,7 +11,7 @@ from pdf2image import convert_from_bytes
 from google import genai
 from google.genai import types
 
-from config import TABLE_LOCATION_CODES
+from config import TABLE_LOCATION_CODES, TABLE_LOCATION_DOCKS
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,10 @@ LOCATION_CACHE = {
     # deciding whether a driver has returned and closed a round.
     "site_map": {},
     "official_name": {},
+    # Door bands, as (first, last, facility, use). At 200 the front building
+    # runs 3-21 FG inbound and 22-45 RM inbound, the rear 47-66 RM outbound and
+    # 67-99 FG outbound -- so a door number says which building is meant.
+    "dock_bands": [],
 }
 
 
@@ -93,6 +98,16 @@ async def refresh_location_cache(pool):
             LOCATION_CACHE["alias_map"] = alias_map
             LOCATION_CACHE["site_map"] = site_map
             LOCATION_CACHE["official_name"] = official
+
+            await cur.execute(
+                f"""SELECT facility_code, first_dock, last_dock, dock_use 
+                      FROM {TABLE_LOCATION_DOCKS} 
+                  ORDER BY first_dock;"""
+            )
+            LOCATION_CACHE["dock_bands"] = [
+                (first, last, facility.strip().upper(), (use or "").strip() or None)
+                for facility, first, last, use in await cur.fetchall()
+            ]
             logger.info(f"Location cache refreshed: {len(codes)} valid codes loaded.")
 
 
@@ -114,6 +129,48 @@ def site_of(location: str) -> str:
         return location
     clean = location.strip().upper()
     return LOCATION_CACHE["site_map"].get(clean, clean)
+
+
+def _dock_band(dock, site: str = None):
+    """The door band a number falls in, or None if it cannot be told.
+
+    Door numbers repeat across sites, so `site` narrows the search; without it
+    a number matching bands at more than one site resolves to nothing. Bands
+    are the dispatcher's own numbers and some upper bounds are approximate, so
+    a door outside every band gives None and callers keep what they had.
+    """
+    digits = re.sub(r"\D", "", str(dock or ""))
+    if not digits:
+        return None
+    number = int(digits)
+    hits = [
+        band for band in LOCATION_CACHE["dock_bands"]
+        if band[0] <= number <= band[1]
+        and (site is None or site_of(band[2]) == site)
+    ]
+    if len({band[2] for band in hits}) != 1:
+        return None
+    return hits[0]
+
+
+def facility_for_dock(dock, site: str = None) -> str:
+    """The building a numbered door belongs to, or None.
+
+    200F takes doors 3-45 and 200R doors 47-99, so "moved #3 to #47" crosses
+    from the front building to the rear rather than shuffling within one yard.
+    """
+    band = _dock_band(dock, site)
+    return band[2] if band else None
+
+
+def dock_use(dock, site: str = None) -> str:
+    """What a door is for -- "FG INBOUND", "RM OUTBOUND" -- or None.
+
+    Recorded, not yet acted on. It is what makes an empty parked on 47-66 a
+    trailer staged for the next RM round rather than an idle one.
+    """
+    band = _dock_band(dock, site)
+    return band[3] if band else None
 
 
 def convert_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:
@@ -226,10 +283,11 @@ CASE CLASSIFICATION RULES:
    - "loaded move #4 to #13"      -> origin_dock="4",  destination_dock="13", load_status="LOADED"
    - "empty dropped yard"         -> origin_dock=null, destination_dock="YARD", load_status="EMPTY"
    - "moved 44821 door 7 to yard" -> origin_dock="7",  destination_dock="YARD"
+   - "Finish live unloading at pactra #3 move to Dock 47" -> origin_location="200F", destination_location="200F", origin_dock="3", destination_dock="47", work_finished=true. Moving TO A DOOR is not travel: a door is a position inside the facility the driver is already at, so this stays CASE_3 however much it sounds like a departure. Drivers do this constantly -- park the empty on a free door for the next load -- and reading it as a trip invents a leg to nowhere.
 5. "CASE_CLOCK_IN": Driver is starting their shift. "clock in", "clocked in", "clocking in", "출근".
 6. "CASE_CLOCK_OUT": Driver is ending their shift. "clock out", "clocked out", "clocking out", "퇴근".
 7. "CASE_WORK_FINISHED": ONLY when a driver reports a live load or unload complete and names NO destination and NO onward movement whatsoever. "live unloading finished", "unload done", "finished unloading".
-   - If ANY destination or onward movement appears, however briefly, the case is CASE_1_ORIGIN_DEPARTURE and work_finished is true. Movement always wins over completion, because a completion records a time while a departure records a trip -- choosing wrongly loses the trip entirely.
+   - If ANY destination or onward movement appears, however briefly, the case is CASE_1_ORIGIN_DEPARTURE and work_finished is true. A destination means ANOTHER FACILITY. A door, dock or yard position at the facility they are already at is not one -- that is CASE_3_INTRA_FACILITY_MOVE with work_finished true. Movement always wins over completion, because a completion records a time while a departure records a trip -- choosing wrongly loses the trip entirely.
    - "7634 unloading finished Empty to 200R" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200R", load_status="EMPTY", work_finished=true.
    - "jung kim finished live unloading empty 7634 to 200" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200", load_status="EMPTY", work_finished=true.
    - "live unloading finished" alone is CASE_WORK_FINISHED.
@@ -252,7 +310,7 @@ EXTRACTION & NORMALIZATION RULES:
    - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
 
 2. Door Numbers vs Locations:
-   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") are NEVER locations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.
+   - Door, bay, or spot identifiers (starting with "#", "door", "dock", "bay", "spot") are NEVER locations, and never destinations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.
    - For CASE_1 and CASE_2 a single door goes in door_number (e.g. "#47" or "door 47" -> door_number="47").
    - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
    - Strip the leading "#": "#13" -> "13".

@@ -1,7 +1,8 @@
 import logging
 import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
-from ai_engine import LOCATION_CACHE, normalize_location, site_of
+from ai_engine import (LOCATION_CACHE, facility_for_dock,
+                       normalize_location, site_of)
 from load_types import classify as classify_load
 from manifests import read_manifest, store_manifest
 from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
@@ -21,6 +22,15 @@ REPEAT_MOVE_MINUTES = 30
 # and silently skipped the outbound BOL compliance guard.
 BOBTAIL_PATTERN = re.compile(
     r"\b(?:bobtail|bob\s*tail|bt|b/t|no\s+trailer|single\s+tractor|tractor\s+only)\b",
+    re.IGNORECASE,
+)
+
+# Hooking a load starts a trip; it is never a within-yard reposition. When the
+# driver names no destination there is nothing to record, so the message would
+# otherwise vanish -- "Load trailer pickup sds dock28 #77209" left the whole
+# SDS -> 200F run missing from the day.
+PICKUP_PATTERN = re.compile(
+    r"\b(?:pick\s*-?\s*up|pickup|picking\s+up|hook(?:ed|ing)?(?:\s+up)?)\b",
     re.IGNORECASE,
 )
 
@@ -305,6 +315,27 @@ async def commit_trip_leg(
                 )
                 await finish_rm_load(cur, target_leg, msg_timestamp)
                 return target_leg
+
+            def pickup_with_no_destination(where, position, trailer):
+                """Card for a load hooked with nowhere recorded to take it.
+
+                The trip is real and the dispatcher can work out where it went
+                from the arrival that follows, but only if they are told the
+                message happened. Nothing is written: a leg to UNKNOWN would
+                enter a round and a route as though it were a real destination.
+                """
+                at = f"`{where}`"
+                if position:
+                    at += f" (dock `{position}`)"
+                return (
+                    f"\u26a0\ufe0f **MANUAL RECONCILE: Load Picked Up With No Destination**\n"
+                    f"\U0001f464 Driver: {user_name}\n"
+                    f"\U0001f4ac Message: `{raw_text}`\n"
+                    f"\U0001f69b Trailer: `{trailer or 'UNKNOWN'}`\n"
+                    f"\U0001f4cd Origin: {at}\n"
+                    f"\u2753 Issue: Load picked up with an origin but no destination "
+                    f"mentioned, so the departure was NOT recorded as a leg."
+                )
 
             lunch_boundary = intent.get("lunch")
             if lunch_boundary in ("START", "END"):
@@ -723,6 +754,24 @@ async def commit_trip_leg(
 
                         return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
+                    # No open trip. A plain "arrived" with nothing running is
+                    # nothing to record, but a LOADED pickup is a departure the
+                    # driver forgot to announce.
+                    if (load_status_val == "LOADED"
+                            and PICKUP_PATTERN.search(raw_text)
+                            and origin_loc != "UNKNOWN"):
+                        logger.warning(
+                            f"Driver #{did} picked up a load at {origin_loc} "
+                            f"without naming a destination; carding for dispatch."
+                        )
+                        return {
+                            "is_clean": False,
+                            "leg_id": None,
+                            "card_text": pickup_with_no_destination(
+                                origin_loc, door_num,
+                                text_trailer or ocr_trailer),
+                        }
+
                     return {"is_clean": True, "leg_id": None, "card_text": None}
 
                 # =========================================================
@@ -941,7 +990,168 @@ async def commit_trip_leg(
                         last_seen = await cur.fetchone()
                         facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
 
+                    # Which half of the site each door belongs to. At 200 the
+                    # FG inbound doors are 3-21 (200F) and the RM outbound doors
+                    # 47-66 (200R), so "finish live unloading at pactra #3 move
+                    # to Dock 47" is a trailer coming off an inbound door and
+                    # being staged on a vacant outbound one -- the driver saving
+                    # himself, or whoever takes the next RM round, a hook.
+                    site = site_of(facility)
+                    from_facility = facility_for_dock(from_dock, site) or facility
+                    to_facility = facility_for_dock(to_dock, site) or facility
+
                     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
+
+                    # A drop at the facility a trip is still running to is that
+                    # trip's ARRIVAL, not a yard shuffle. "Drop empty trailer at
+                    # sds yard D021" reads exactly like an internal move -- one
+                    # facility, a position, no travel -- and the parser cannot
+                    # tell the difference, because only the open leg says the
+                    # driver was on their way there. Recorded as a move it
+                    # invented a second SDS -> SDS leg and left the real one
+                    # open until the next departure closed it, stamping an
+                    # arrival time tens of minutes late.
+                    #
+                    # Only a drop with no position moved FROM qualifies: "door 7
+                    # to yard" and "200F to 200R" both name somewhere the driver
+                    # moved off, so they stay genuine moves whatever else is open.
+                    named_two_places = (
+                        origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
+                        and origin_loc != dest_loc
+                    )
+                    # Hooking a load is the start of a trip, never a yard move:
+                    # the driver just left the destination out.
+                    loaded_pickup = bool(
+                        load_status_val == "LOADED" and from_dock is None
+                        and not named_two_places
+                        and PICKUP_PATTERN.search(raw_text)
+                    )
+                    await cur.execute(
+                        f"""SELECT id, destination_location
+                              FROM {TABLE_SHUTTLE_LEGS}
+                             WHERE user_id = %s
+                               AND is_positioning_leg = 0
+                               AND leg_status = 'IN_TRANSIT'
+                          ORDER BY id DESC
+                             LIMIT 1;""",
+                        (did,)
+                    )
+                    open_trip = await cur.fetchone()
+                    if (open_trip and from_dock is None and not named_two_places
+                            and facility != "UNKNOWN"):
+                        trip_id, booked_destination = open_trip
+                        if site_of(booked_destination or "") == site_of(facility):
+                            at_dock = bool(to_dock) and to_dock != "YARD"
+                            # The trailer named at the drop wins over the one on
+                            # the leg. A leg's trailer is often inherited from the
+                            # driver's previous leg (CASE 1 fills it in when the
+                            # message does not name one), so it is a guess that
+                            # goes stale the moment they swap trailers -- Sokhwan
+                            # Yun's 11:18 SDS run carried 25773 from three legs
+                            # earlier while he was actually hauling 77155. The
+                            # drop is a first-hand report from the destination,
+                            # and it is the trailer the dispatcher logs.
+                            dropped_trailer = (
+                                display_trailer
+                                if display_trailer and display_trailer != "UNKNOWN"
+                                else None
+                            )
+                            await cur.execute(
+                                f"""UPDATE {TABLE_SHUTTLE_LEGS}
+                                       SET arrival_time = COALESCE(arrival_time, %s),
+                                           arrival_action = %s,
+                                           arrival_at_dock = %s,
+                                           destination_dock = COALESCE(destination_dock, %s),
+                                           do_number = COALESCE(do_number, %s),
+                                           trailer_number = COALESCE(%s, trailer_number),
+                                           receiver_signed = COALESCE(%s, receiver_signed),
+                                           leg_status = 'COMPLETED'
+                                     WHERE id = %s;""",
+                                (msg_timestamp,
+                                 action_type or ("DROP_DOCK" if at_dock
+                                                 else "DROP_YARD"),
+                                 1 if at_dock else 0,
+                                 to_dock, do_num, dropped_trailer,
+                                 1 if receiver_signed else None,
+                                 trip_id)
+                            )
+                            await close_rm_load(cur, trip_id, msg_timestamp)
+                            # Stamped after the arrival, never before: the unload
+                            # is measured from arrival, and finish_rm_load skips
+                            # any load that has not arrived yet.
+                            if intent.get("work_finished"):
+                                await stamp_finished(trip_id)
+                            await conn.commit()
+                            logger.info(
+                                f"Driver #{did} dropped at {facility} while Leg "
+                                f"#{trip_id} was still running there; recorded as "
+                                f"that leg's arrival, not a positioning move."
+                            )
+                            # They hooked the next load in the same breath. The
+                            # arrival is safe now; the onward trip is not, so it
+                            # still has to be raised.
+                            if loaded_pickup:
+                                logger.warning(
+                                    f"Driver #{did} picked up a load at {facility} "
+                                    f"without naming a destination; carding."
+                                )
+                                return {
+                                    "is_clean": False,
+                                    "leg_id": trip_id,
+                                    "card_text": pickup_with_no_destination(
+                                        facility, to_dock or door_num,
+                                        display_trailer),
+                                }
+                            return {"is_clean": True, "leg_id": trip_id,
+                                    "card_text": None}
+
+                    # "Finish live unloading at pactra #3 move to Dock 47" ends
+                    # one job and describes a move in the same breath. CASE 1
+                    # already handles that pairing on a departure; a yard move
+                    # needs it too, or the unload time is lost.
+                    #
+                    # Only if the last trip actually ended here. When the
+                    # departure was never recorded -- the driver did not say
+                    # where he was taking the load -- the newest leg is some
+                    # earlier run to somewhere else, and stamping it would put
+                    # this unload against the wrong trip.
+                    if intent.get("work_finished"):
+                        await cur.execute(
+                            f"""SELECT id, destination_location 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND is_positioning_leg = 0 
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did,)
+                        )
+                        finished_candidate = await cur.fetchone()
+                        if (finished_candidate
+                                and site_of(finished_candidate[1] or "") == site):
+                            await stamp_finished(finished_candidate[0])
+                            await conn.commit()
+                        else:
+                            logger.warning(
+                                f"Driver #{did} reported work finished at "
+                                f"{facility}, but their last recorded trip did "
+                                f"not end there; completion not stamped."
+                            )
+
+                    # Carded rather than recorded: the dispatcher reads the
+                    # destination off the arrival that follows, and only needs to
+                    # know the message happened. A leg to UNKNOWN would instead
+                    # enter a round and a route as if it were a real trip.
+                    if loaded_pickup and facility != "UNKNOWN":
+                        logger.warning(
+                            f"Driver #{did} picked up a load at {facility} "
+                            f"without naming a destination; carding for dispatch."
+                        )
+                        return {
+                            "is_clean": False,
+                            "leg_id": None,
+                            "card_text": pickup_with_no_destination(
+                                facility, to_dock or door_num, display_trailer),
+                        }
 
                     # Drivers report one move more than once -- typically the
                     # signed paperwork first and a photo of the parked trailer a
@@ -1014,7 +1224,7 @@ async def commit_trip_leg(
                                round_number
                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s, %s);""",
                         (
-                            did, display_trailer, facility, facility,
+                            did, display_trailer, from_facility, to_facility,
                             from_dock, to_dock, msg_timestamp, msg_timestamp,
                             "YARD_DROP" if to_dock == "YARD" else "DOCK_MOVE",
                             load_status_val,

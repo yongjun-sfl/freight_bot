@@ -3,6 +3,7 @@
 # DATABASE TABLE NAMES
 TABLE_DRIVERS = "driver_profiles"
 TABLE_LOCATION_CODES = "location_codes"
+TABLE_LOCATION_DOCKS = "location_docks"
 TABLE_SHUTTLE_LEGS = "shuttle_legs"
 TABLE_ROUTES = "routes"
 TABLE_ROUTE_MEMBERS = "route_members"

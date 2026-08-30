@@ -1,0 +1,5 @@
+facility,first_dock,last_dock,use,operator,note
+200F,3,21,FG INBOUND,SFL,finished goods arriving from SDS; live unload
+200F,22,45,RM INBOUND,HANJIN,worked by Hanjin - not our traffic; upper bound approximate
+200R,47,66,RM OUTBOUND,SFL,raw materials for Eagle; empties staged on a vacant door for the next round
+200R,67,99,FG OUTBOUND,SFL,the 200 <-> 7634 lane; upper bound approximate

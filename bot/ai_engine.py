@@ -213,8 +213,15 @@ CASE CLASSIFICATION RULES:
    - "moved 44821 door 7 to yard" -> origin_dock="7",  destination_dock="YARD"
 5. "CASE_CLOCK_IN": Driver is starting their shift. "clock in", "clocked in", "clocking in", "출근".
 6. "CASE_CLOCK_OUT": Driver is ending their shift. "clock out", "clocked out", "clocking out", "퇴근".
-7. "CASE_WORK_FINISHED": Driver reports a live load or unload is complete WITHOUT also announcing a departure. "live unloading finished", "unload done", "loading finished", "finished unloading".
+7. "CASE_WORK_FINISHED": ONLY when a driver reports a live load or unload complete and names NO destination and NO onward movement whatsoever. "live unloading finished", "unload done", "finished unloading".
+   - If ANY destination or onward movement appears, however briefly, the case is CASE_1_ORIGIN_DEPARTURE and work_finished is true. Movement always wins over completion, because a completion records a time while a departure records a trip -- choosing wrongly loses the trip entirely.
+   - "7634 unloading finished Empty to 200R" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200R", load_status="EMPTY", work_finished=true.
+   - "jung kim finished live unloading empty 7634 to 200" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200", load_status="EMPTY", work_finished=true.
+   - "live unloading finished" alone is CASE_WORK_FINISHED.
 8. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+   - ALSO a status report describing where OTHER trailers are sitting, or counting them. Every other case records one movement by the sender; a message about several trailers is information for the dispatcher, not a trip.
+   - "200R 닥에 4대 야드에 8대 (지금 드랍하신분 포함) 200F에는 한분 언로드중" -- four at the 200R dock, eight in the yard, one unloading at 200F -- is NONE_WORK_RELATED. It names facilities but reports no movement of its own.
+   - The test is whether the sender is describing something THEY did or are doing. If not, it is NONE_WORK_RELATED.
 
 SEPARATE FLAG -- "work_finished":
 - Set true whenever the message says a live load or unload has been completed, INCLUDING when the driver announces a departure in the same breath ("live loading finished load 200 to E2F"). In that case the case_type is still CASE_1_ORIGIN_DEPARTURE and work_finished is true; the completion belongs to the trip they are ending, the departure starts the next one.
@@ -223,6 +230,8 @@ SEPARATE FLAG -- "work_finished":
 EXTRACTION & NORMALIZATION RULES:
 1. Location Extraction:
    - Match facility mentions to the KNOWN VALID CODES provided whenever possible.
+   - A token that IS one of the KNOWN VALID CODES is a location, never a trailer number, however bare it looks. "7634 unloading finished" means the facility 7634, not trailer 7634. Only assign trailer_number from a value that is NOT a known code.
+   - In "<A> ... to <B>" the first facility is the origin and the second the destination, even when other words separate them.
    - If a driver uses a shorthand code (e.g., "200" for "200F"), extract the raw shorthand code (e.g., "200").
    - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
 

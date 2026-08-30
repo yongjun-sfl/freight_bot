@@ -1038,3 +1038,140 @@ async def test_bare_200_in_a_dock_field_is_also_rejected(pool):
     leg = await get_leg(pool, res["leg_id"])
     assert leg["origin_dock"] is None
     assert leg["origin_location"] == "200F"
+
+
+async def test_the_same_drop_reported_twice_is_one_leg(pool):
+    """From live data: Ilpyo Hong reported dropping trailer 77208 in the 200
+    yard twice, eight minutes apart -- once with the signed BOL, once with a
+    photo of the parked trailer. One event, one leg.
+
+    Note the captions resolved to 200F and 200R, so the match is on site."""
+    await seed_network(pool)
+    # the delivery he had just completed, still awaiting its signed paperwork
+    delivery = await insert_leg(
+        pool, origin_location="SDS", destination_location="7634",
+        trailer_number="77208", bol_number=None, bol_image=None,
+        leg_status="COMPLETED",
+    )
+    first = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Hong il pyo drop empty 200 yard",
+               origin_location="200", destination_location="200",
+               destination_dock="YARD", load_status="EMPTY",
+               bol_number="0872726355", primary_image_blob=IMG,
+               receiver_signed=True),
+    )
+    second = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Hong il pyo drop empty 200 r yard",
+               origin_location="200R", destination_location="200R",
+               destination_dock="YARD", ocr_trailer="77208",
+               load_status="EMPTY"),
+    )
+    assert second["leg_id"] == first["leg_id"], "one drop, one leg"
+
+    positioning = [l for l in await all_legs(pool) if l["is_positioning_leg"] == 1]
+    assert len(positioning) == 1
+
+    leg = positioning[0]
+    assert leg["trailer_number"] == "77208", "trailer from the second report"
+    assert leg["destination_dock"] == "YARD"
+    assert leg["bol_number"] is None, "a yard drop has no paperwork of its own"
+
+    # the signed BOL belongs to the delivery he had just finished
+    delivered = await get_leg(pool, delivery)
+    assert delivered["bol_number"] == "0872726355"
+    assert delivered["bol_image"] == IMG
+    assert delivered["receiver_signed"] == 1
+    assert delivered["paperwork_time"] is not None
+
+
+async def test_a_genuinely_different_move_still_gets_its_own_leg(pool):
+    """Two drops to different positions are two events."""
+    await seed_network(pool)
+    first = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", origin_location="200F",
+               destination_location="200F", origin_dock="13",
+               destination_dock="47", load_status="EMPTY"),
+    )
+    second = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", origin_location="200F",
+               destination_location="200F", origin_dock="4",
+               destination_dock="13", load_status="EMPTY"),
+    )
+    assert second["leg_id"] != first["leg_id"]
+    assert len([l for l in await all_legs(pool) if l["is_positioning_leg"]]) == 2
+
+
+async def test_a_different_trailer_is_a_different_move(pool):
+    await seed_network(pool)
+    first = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", origin_location="200F",
+               destination_location="200F", destination_dock="YARD",
+               ocr_trailer="77208", load_status="EMPTY"),
+    )
+    second = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", origin_location="200F",
+               destination_location="200F", destination_dock="YARD",
+               ocr_trailer="53012", load_status="EMPTY"),
+    )
+    assert second["leg_id"] != first["leg_id"]
+
+
+async def test_finished_plus_departure_records_the_trip(pool):
+    """From live data, and the worst kind of miss: "7634 unloading finished
+    Empty to 200R" was classified as a completion, so the departure was never
+    recorded at all. A completion stamps a time; a departure records a trip.
+    Losing the trip loses the movement entirely."""
+    await seed_network(pool)
+    previous = await insert_leg(
+        pool, origin_location="SDS", destination_location="7634",
+        trailer_number="77208", leg_status="UNLOADING",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", work_finished=True,
+               raw_text="7634 unloading finished Empty to 200R",
+               origin_location="7634", destination_location="200R",
+               load_status="EMPTY"),
+    )
+    assert res["leg_id"] is not None, "the departure must be recorded"
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "7634"
+    assert leg["destination_location"] == "200R"
+    assert leg["load_status"] == "EMPTY"
+    assert (await get_leg(pool, previous))["finished_time"] is not None
+
+
+async def test_a_facility_code_is_never_stored_as_a_trailer(pool):
+    """7634 read as a trailer number lost the origin and would have corrupted
+    that trailer's history."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="7634 unloading finished Empty to 200R",
+               origin_location="7634", destination_location="200R",
+               text_trailer="7634", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["trailer_number"] != "7634"
+    assert leg["origin_location"] == "7634"
+
+
+async def test_a_real_trailer_number_is_still_kept(pool):
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", origin_location="7634",
+               destination_location="200R", text_trailer="77208",
+               load_status="EMPTY"),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["trailer_number"] == "77208"

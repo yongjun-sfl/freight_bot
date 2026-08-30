@@ -9,6 +9,11 @@ from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
 
+# A within-facility move re-reported inside this window is treated as the same
+# event rather than a second drop. Drivers routinely send the paperwork and a
+# photo of the parked trailer minutes apart, both describing one drop.
+REPEAT_MOVE_MINUTES = 30
+
 # Word-boundary matched: a bare `"bt" in text` substring test fires on ordinary
 # words like "doubt", "debt" and "subtotal", which forced load_status to EMPTY
 # and silently skipped the outbound BOL compliance guard.
@@ -29,8 +34,25 @@ async def commit_trip_leg(
     intent: dict
 ) -> dict:
     case_type = intent.get("case_type", "NONE_WORK_RELATED")
-    text_trailer = intent.get("trailer_number") or intent.get("text_trailer")
-    ocr_trailer = intent.get("ocr_trailer")
+    def _not_a_facility(value):
+        """Drop a trailer number that is really a facility code.
+
+        Bare numeric sites like 7634 read as trailers, and a facility stored
+        as a trailer both loses the location and corrupts trailer history.
+        """
+        if not value:
+            return value
+        clean = str(value).strip().upper()
+        known = set(LOCATION_CACHE.get("codes") or [])
+        known |= set(LOCATION_CACHE.get("alias_map") or {})
+        if clean in known or normalize_location(clean) in known:
+            logger.info(f"Ignoring facility code {clean!r} given as a trailer number.")
+            return None
+        return value
+
+    text_trailer = _not_a_facility(
+        intent.get("trailer_number") or intent.get("text_trailer"))
+    ocr_trailer = _not_a_facility(intent.get("ocr_trailer"))
     bol_number = intent.get("bol_number")
     document_type = intent.get("document_type", "UNKNOWN")
     action_type = intent.get("action")
@@ -819,6 +841,42 @@ async def commit_trip_leg(
                 case "CASE_3_INTRA_FACILITY_MOVE":
                     display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
 
+                    # A signed BOL sent with a yard-move caption is proof for the
+                    # trip the driver just finished, not for the move they are
+                    # describing. Positioning legs carry no paperwork, so it is
+                    # attached to the delivery instead of being discarded.
+                    if primary_image_blob and bol_number:
+                        await cur.execute(
+                            f"""SELECT id 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND is_positioning_leg = 0 
+                                   AND (bol_image IS NULL OR bol_number IS NULL) 
+                                   AND DATE(departure_time) = CURRENT_DATE() 
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did,)
+                        )
+                        delivery = await cur.fetchone()
+                        if delivery:
+                            await cur.execute(
+                                f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                                       SET bol_number = COALESCE(bol_number, %s),
+                                           bol_image = COALESCE(bol_image, %s),
+                                           document_type = IF(%s != 'UNKNOWN', %s, document_type),
+                                           paperwork_time = COALESCE(paperwork_time, %s),
+                                           receiver_signed = COALESCE(%s, receiver_signed)
+                                     WHERE id = %s;""",
+                                (bol_number, primary_image_blob,
+                                 document_type, document_type, msg_timestamp,
+                                 1 if receiver_signed else None, delivery[0])
+                            )
+                            await conn.commit()
+                            logger.info(
+                                f"Paperwork {bol_number} sent with a yard-move "
+                                f"caption; attached to delivery Leg #{delivery[0]}."
+                            )
+
                     def as_dock(value):
                         """A dock position, or None if this is really a facility.
 
@@ -868,6 +926,52 @@ async def commit_trip_leg(
                         facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
 
                     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
+
+                    # Drivers report one move more than once -- typically the
+                    # signed paperwork first and a photo of the parked trailer a
+                    # few minutes later, both captioned with the same drop. Those
+                    # are one event, so a matching recent move is completed
+                    # rather than duplicated.
+                    await cur.execute(
+                        f"""SELECT id, trailer_number, origin_dock, destination_dock 
+                              FROM {TABLE_SHUTTLE_LEGS} 
+                             WHERE user_id = %s 
+                               AND is_positioning_leg = 1 
+                               AND arrival_time >= %s - INTERVAL %s MINUTE 
+                          ORDER BY id DESC 
+                             LIMIT 5;""",
+                        (did, msg_timestamp, REPEAT_MOVE_MINUTES)
+                    )
+                    for row in await cur.fetchall():
+                        prior_id, prior_trailer, prior_from, prior_to = row
+                        if to_dock and prior_to and to_dock != prior_to:
+                            continue
+                        if (display_trailer and prior_trailer
+                                and display_trailer != prior_trailer):
+                            continue
+                        await cur.execute(
+                            f"""SELECT origin_location FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE id = %s;""",
+                            (prior_id,)
+                        )
+                        (prior_site,) = await cur.fetchone()
+                        if site_of(prior_site or "") != site_of(facility):
+                            continue
+
+                        await cur.execute(
+                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                                   SET trailer_number = COALESCE(trailer_number, %s),
+                                       origin_dock = COALESCE(origin_dock, %s),
+                                       destination_dock = COALESCE(destination_dock, %s)
+                                 WHERE id = %s;""",
+                            (display_trailer, from_dock, to_dock, prior_id)
+                        )
+                        await conn.commit()
+                        logger.info(
+                            f"Driver #{did} re-reported the move {move_desc} at "
+                            f"{facility}; folded into positioning Leg #{prior_id}."
+                        )
+                        return {"is_clean": True, "leg_id": prior_id, "card_text": None}
 
                     # Every internal move gets its own row. Drivers never label
                     # these, and billing is by shift rather than by move, so no

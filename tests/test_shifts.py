@@ -10,6 +10,15 @@ from conftest import (DRIVER_ID, commit, eastern_now, get_leg, insert_leg,
                       intent, seed_network, ts)
 
 
+def _collector():
+    cards = []
+
+    async def send(text):
+        cards.append(text)
+
+    return cards, send
+
+
 async def _shift(pool):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -151,3 +160,81 @@ async def test_dwell_stops_once_the_driver_clocks_out(pool):
         async with conn.cursor() as cur:
             await cur.execute("UPDATE shuttle_legs SET dwell_alert_level = 0;")
     assert await dwell.sweep_dwells(pool, send) == 0, "gone home"
+
+
+# --------------------------------------------------------------------------
+# lunch
+# --------------------------------------------------------------------------
+
+async def test_lunch_is_recorded_at_both_ends(pool):
+    await commit(pool, intent(case_type="CASE_LUNCH_START", lunch="START",
+                              raw_text="Kisoo Han Lunch break on 200"),
+                 when=ts(eastern_now() - timedelta(minutes=52)))
+    res = await commit(pool, intent(case_type="CASE_LUNCH_END", lunch="END",
+                                    raw_text="Lunch off"))
+    row = await _shift(pool)
+    assert row["lunch_start"] is not None and row["lunch_end"] is not None
+    assert row["lunch_minutes"] == 52
+    assert "Lunch ended" in res["reply_text"]
+
+
+async def test_lunch_reported_with_a_departure_keeps_both(pool):
+    """From live chat: "jung kim off lunch 200 to 7634". Losing the trip to
+    the lunch report would be the same failure as the completion case."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", lunch="END",
+               raw_text="jung kim off lunch 200 to 7634",
+               origin_location="200", destination_location="7634",
+               text_trailer="77344", load_status="EMPTY"),
+    )
+    assert res["leg_id"] is not None, "the departure must still be recorded"
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "7634"
+    assert (await _shift(pool))["lunch_end"] is not None
+
+
+async def test_lunch_reported_with_a_yard_move_keeps_both(pool):
+    """From live chat: "off lunch ,empty yard move e1 yard to e1 #4"."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE", lunch="END",
+               raw_text="off lunch ,empty yard move e1 yard to e1 #4",
+               origin_location="E1", destination_location="E1",
+               origin_dock="YARD", destination_dock="4", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 1
+    assert leg["destination_dock"] == "4"
+    assert (await _shift(pool))["lunch_end"] is not None
+
+
+async def test_a_driver_on_lunch_is_not_reported_as_delayed(pool):
+    """They are eating, not stuck."""
+    arrived = eastern_now() - timedelta(minutes=50)
+    await insert_leg(pool, destination_location="200F",
+                     departure_time=ts(arrived - timedelta(minutes=20)),
+                     arrival_time=ts(arrived), leg_status="COMPLETED")
+    await commit(pool, intent(case_type="CASE_LUNCH_START", lunch="START"),
+                 when=ts(eastern_now() - timedelta(minutes=40)))
+
+    cards, send = _collector()
+    assert await dwell.sweep_dwells(pool, send) == 0
+
+
+async def test_lunch_taken_during_a_stop_is_subtracted(pool):
+    """A 70 minute stop containing a 60 minute lunch is a 10 minute stop."""
+    arrived = eastern_now() - timedelta(minutes=70)
+    await insert_leg(pool, destination_location="200F",
+                     departure_time=ts(arrived - timedelta(minutes=20)),
+                     arrival_time=ts(arrived), leg_status="COMPLETED")
+    await commit(pool, intent(case_type="CASE_LUNCH_START", lunch="START"),
+                 when=ts(arrived + timedelta(minutes=2)))
+    await commit(pool, intent(case_type="CASE_LUNCH_END", lunch="END"),
+                 when=ts(arrived + timedelta(minutes=62)))
+
+    cards, send = _collector()
+    assert await dwell.sweep_dwells(pool, send) == 0, "10 minutes is under the threshold"

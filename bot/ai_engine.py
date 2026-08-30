@@ -296,6 +296,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 
     dynamic_vision_prompt = """Analyze this image.
 
+0. "is_manifest": Set to True ONLY if the page header reads "SHUTTLE DRIVER MANIFEST" -- a hand-filled grid of a driver's trips for one shift. It is not a Bill of Lading and carries no BOL or reservation number. When true, return null for every other field.
 1. "is_paper_document": Set to True ONLY if this image is a paper document (Bill of Lading, shipping paper, manifest, reservation instruction sheet, signature paper). Set to False if it is a photo of a trailer, truck, container body, or license plate.
 2. "bol_number": Read the entire document semantically. Identify the primary tracking, BOL, delivery, reservation, or manifest number.
    - Look explicitly for terms like: "Reservation No.", "Reservation #", "Res #", "BOL", "Bill of Lading", "B/L", "Delivery #", "Shipment #", "DO #", "Ref #", "Tracking #".
@@ -324,6 +325,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 
 Return raw JSON ONLY:
 {
+  "is_manifest": boolean,
   "is_paper_document": boolean,
   "bol_number": string or null,
   "document_type": "FG" | "RM" | "UNKNOWN",
@@ -351,6 +353,8 @@ Return raw JSON ONLY:
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
+        "is_manifest": False,
+        "manifest_image": None,
         "is_paper_document": False,
         # True only when every image errored, i.e. the vision API is down.
         # Distinct from "scanned fine, found no document".
@@ -369,6 +373,12 @@ Return raw JSON ONLY:
                 config=json_config()
             )
             data = json.loads(response.text)
+
+            if data.get("is_manifest"):
+                result["is_manifest"] = True
+                # The sheet IS the record, so the original is kept whether or
+                # not the handwriting can be read.
+                result["manifest_image"] = img_bytes
 
             is_doc = data.get("is_paper_document", False)
             if is_doc:
@@ -433,6 +443,7 @@ async def prepare_text_intent(text: str) -> dict:
         "rm_seq": None,
         "materials": [],
         "work_finished": bool(llm_parsed.get("work_finished")),
+        "lunch": llm_parsed.get("lunch"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -442,6 +453,7 @@ async def prepare_text_intent(text: str) -> dict:
 
 
 async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> dict:
+    from manifests import read_manifest
     has_caption = bool(caption_text and caption_text.strip())
 
     # Both calls are blocking; neither may run on the event loop.
@@ -451,8 +463,14 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
     )
     ocr_data = await loop.run_in_executor(None, extract_bol_locally, images)
 
-    if has_caption:
+    if ocr_data.get("is_manifest"):
+        case_type = "CASE_MANIFEST"
+    elif has_caption:
         case_type = llm_parsed.get("case_type", "CASE_1_ORIGIN_DEPARTURE")
+    elif ocr_data.get("is_manifest"):
+        # End-of-shift sheets are captioned with just the driver's name, so
+        # the image has to decide this, not the text.
+        case_type = "CASE_MANIFEST"
     elif ocr_data.get("ocr_failed"):
         # Vision was unreachable for every image. Do not pretend the driver
         # posted something irrelevant -- surface it instead.
@@ -481,9 +499,16 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "rm_seq": ocr_data.get("rm_seq"),
         "materials": ocr_data.get("materials") or [],
         "work_finished": bool(llm_parsed.get("work_finished")),
+        "lunch": llm_parsed.get("lunch"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),
         "receiver_signed": ocr_data.get("receiver_signed", False),
-        "primary_image_blob": ocr_data.get("bol_image_blob")
+        "primary_image_blob": ocr_data.get("bol_image_blob"),
+        "is_manifest": ocr_data.get("is_manifest", False),
+        "manifest_image": ocr_data.get("manifest_image"),
+        "manifest_parsed": (
+            read_manifest(ocr_data["manifest_image"])
+            if ocr_data.get("manifest_image") else None
+        ),
     }

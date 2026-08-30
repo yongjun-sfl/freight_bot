@@ -3,8 +3,10 @@ import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
 from ai_engine import LOCATION_CACHE, normalize_location, site_of
 from load_types import classify as classify_load
+from manifests import read_manifest, store_manifest
 from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
-from shifts import format_worked, record_clock_in, record_clock_out
+from shifts import (format_worked, record_clock_in, record_clock_out,
+                    record_lunch)
 from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
 
 logger = logging.getLogger(__name__)
@@ -316,7 +318,33 @@ async def commit_trip_leg(
                 await finish_rm_load(cur, target_leg, msg_timestamp)
                 return target_leg
 
+            lunch_boundary = intent.get("lunch")
+            if lunch_boundary in ("START", "END"):
+                # Recorded regardless of the case: drivers routinely report
+                # lunch in the same breath as a departure or a yard move, and
+                # the work must not be lost to the lunch or the other way round.
+                await record_lunch(cur, did, msg_timestamp, lunch_boundary)
+                await conn.commit()
+
             match case_type:
+
+                # =========================================================
+                # LUNCH (reported on its own)
+                # =========================================================
+                case "CASE_LUNCH_START":
+                    return {
+                        "is_clean": True, "leg_id": None, "card_text": None,
+                        "reply_text": "🍽 Lunch started",
+                    }
+
+                case "CASE_LUNCH_END":
+                    _, _, minutes = await record_lunch(cur, did, msg_timestamp, "END")
+                    await conn.commit()
+                    taken = f" · {minutes} min" if minutes else ""
+                    return {
+                        "is_clean": True, "leg_id": None, "card_text": None,
+                        "reply_text": f"🍽 Lunch ended{taken}",
+                    }
 
                 # =========================================================
                 # SHIFT BOUNDARIES
@@ -1028,6 +1056,33 @@ async def commit_trip_leg(
                         }
 
                     return {"is_clean": True, "leg_id": leg_id, "card_text": None}
+
+                # =========================================================
+                # END-OF-SHIFT MANIFEST
+                # =========================================================
+                case "CASE_MANIFEST":
+                    image = intent.get("manifest_image") or primary_image_blob
+                    if not image:
+                        return {"is_clean": True, "leg_id": None, "card_text": None}
+
+                    parsed = intent.get("manifest_parsed") or {}
+                    manifest_id, rows = await store_manifest(
+                        cur, did, user_name, msg_timestamp, image, parsed)
+                    await conn.commit()
+                    if not manifest_id:
+                        return {"is_clean": True, "leg_id": None, "card_text": None}
+
+                    logger.info(
+                        f"\U0001f4cb Manifest #{manifest_id} stored for Driver "
+                        f"#{did} with {rows} row(s) read."
+                    )
+                    note = f" · {rows} trips read" if rows else " · not readable"
+                    return {
+                        "is_clean": True,
+                        "leg_id": None,
+                        "card_text": None,
+                        "reply_text": f"\U0001f4cb Manifest received{note}",
+                    }
 
                 # =========================================================
                 # PARSE FAILURE: surface, never swallow

@@ -15,6 +15,8 @@ from config import (
     TABLE_RM_LOADS,
     TABLE_RM_LOAD_ITEMS,
     TABLE_SHIFTS,
+    TABLE_MANIFESTS,
+    TABLE_MANIFEST_ROWS,
     INDEX_UNIQUE_BOL,
 )
 
@@ -206,16 +208,60 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHIFTS} (
     reported_clock_in DATETIME DEFAULT NULL,
     expected_clock_out DATETIME DEFAULT NULL,
     reported_clock_out DATETIME DEFAULT NULL,
+    -- One hour, taken whenever they like and reported at both ends.
+    lunch_start DATETIME DEFAULT NULL,
+    lunch_end DATETIME DEFAULT NULL,
+    lunch_minutes INT DEFAULT NULL,
     worked_minutes INT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE INDEX idx_shift_driver_date (user_id, shift_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+# The photo is the record; Telegram is not an archive. Keyed on the image
+# digest so a resent photo does not become a second manifest.
+DDL_MANIFESTS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_MANIFESTS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    driver_name VARCHAR(128) DEFAULT NULL,
+    manifest_date VARCHAR(32) DEFAULT NULL,
+    team VARCHAR(32) DEFAULT NULL,
+    image_sha256 CHAR(64) NOT NULL,
+    image MEDIUMBLOB DEFAULT NULL,
+    received_at DATETIME DEFAULT NULL,
+    row_count INT DEFAULT 0,
+    flagged_rows INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_manifest_digest (image_sha256),
+    INDEX idx_manifest_driver (user_id, received_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+# Rows read off the handwriting. A hint for reconciliation, never a source:
+# on a real sheet the trailer column read "11" for eight of nine rows because
+# the driver used ditto marks. `problems` records why a row is doubtful.
+DDL_MANIFEST_ROWS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_MANIFEST_ROWS} (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    manifest_id INT NOT NULL,
+    row_no INT NOT NULL,
+    origin VARCHAR(64) DEFAULT NULL,
+    depart_time VARCHAR(32) DEFAULT NULL,
+    destination VARCHAR(64) DEFAULT NULL,
+    arrive_time VARCHAR(32) DEFAULT NULL,
+    load_status VARCHAR(16) DEFAULT NULL,
+    trailer_number VARCHAR(32) DEFAULT NULL,
+    problems VARCHAR(255) DEFAULT NULL,
+    matched_leg_id INT DEFAULT NULL,
+    INDEX idx_row_manifest (manifest_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 ALL_TABLES = (DDL_DRIVERS, DDL_LOCATION_CODES, DDL_SHUTTLE_LEGS,
               DDL_ROUTES, DDL_ROUTE_MEMBERS, DDL_DISTANCES,
               DDL_UNKNOWN_SENDERS, DDL_RM_LOADS, DDL_RM_LOAD_ITEMS,
-              DDL_SHIFTS)
+              DDL_SHIFTS, DDL_MANIFESTS, DDL_MANIFEST_ROWS)
 
 # Columns introduced after the table first shipped. CREATE TABLE IF NOT EXISTS
 # is a no-op against an existing database, so these must be applied separately
@@ -278,6 +324,16 @@ ADDITIVE_DRIVER_COLUMNS = (
      f"ALTER TABLE {TABLE_DRIVERS} ADD COLUMN is_active TINYINT(1) DEFAULT 1"),
 )
 
+# driver_shifts already shipped, so lunch has to reach it by ALTER.
+ADDITIVE_SHIFT_COLUMNS = (
+    ("lunch_start",
+     f"ALTER TABLE {TABLE_SHIFTS} ADD COLUMN lunch_start DATETIME DEFAULT NULL"),
+    ("lunch_end",
+     f"ALTER TABLE {TABLE_SHIFTS} ADD COLUMN lunch_end DATETIME DEFAULT NULL"),
+    ("lunch_minutes",
+     f"ALTER TABLE {TABLE_SHIFTS} ADD COLUMN lunch_minutes INT DEFAULT NULL"),
+)
+
 ADDITIVE_LOCATION_COLUMNS = (
     ("site_code",
      f"ALTER TABLE {TABLE_LOCATION_CODES} "
@@ -297,7 +353,8 @@ ADDITIVE_LOCATION_COLUMNS = (
 # Every table holding per-run state. Anything omitted leaks between tests and
 # produces failures that look like logic bugs -- driver_shifts did exactly
 # that, leaving one test's clock-in visible to the next.
-TRUNCATABLE = (TABLE_RM_LOAD_ITEMS, TABLE_RM_LOADS, TABLE_SHIFTS,
+TRUNCATABLE = (TABLE_MANIFEST_ROWS, TABLE_MANIFESTS,
+               TABLE_RM_LOAD_ITEMS, TABLE_RM_LOADS, TABLE_SHIFTS,
                TABLE_SHUTTLE_LEGS, TABLE_LOCATION_CODES, TABLE_DRIVERS)
 
 
@@ -341,7 +398,8 @@ async def apply_schema(cur, db_name: str, logger=None):
 
     for table, columns in ((TABLE_SHUTTLE_LEGS, ADDITIVE_COLUMNS),
                            (TABLE_LOCATION_CODES, ADDITIVE_LOCATION_COLUMNS),
-                           (TABLE_DRIVERS, ADDITIVE_DRIVER_COLUMNS)):
+                           (TABLE_DRIVERS, ADDITIVE_DRIVER_COLUMNS),
+                           (TABLE_SHIFTS, ADDITIVE_SHIFT_COLUMNS)):
         for column, alter in columns:
             await cur.execute(
                 """SELECT COUNT(*)

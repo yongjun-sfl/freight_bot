@@ -16,7 +16,7 @@ looked like, so like can be compared with like rather than silently averaged.
 
 import logging
 
-from config import TABLE_DRIVERS, TABLE_SHIFTS, TABLE_SHUTTLE_LEGS
+from config import TABLE_DRIVERS, TABLE_SHIFTS, TABLE_SHUTTLE_LEGS  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +58,17 @@ async def open_dwells(pool):
                            l.paperwork_time,
                            l.arrival_at_dock,
                            l.dwell_alert_level,
-                           TIMESTAMPDIFF(MINUTE, l.arrival_time, NOW()) AS minutes
+                           TIMESTAMPDIFF(MINUTE, l.arrival_time, NOW()) AS minutes,
+                           -- Lunch is reported at both ends, so it is
+                           -- subtracted rather than guessed at. A driver
+                           -- still on lunch is not delayed at all.
+                           s.lunch_start,
+                           s.lunch_end
                       FROM {TABLE_SHUTTLE_LEGS} l
                       JOIN {TABLE_DRIVERS} d ON d.user_id = l.user_id
+                      LEFT JOIN {TABLE_SHIFTS} s
+                             ON s.user_id = l.user_id
+                            AND s.shift_date = CURRENT_DATE()
                      WHERE l.is_positioning_leg = 0
                        AND l.arrival_time IS NOT NULL
                        AND l.id = (
@@ -99,7 +107,7 @@ async def record_alert(pool, leg_id: int, threshold: int):
 
 
 def dwell_card(driver_name, facility, minutes, label, paperwork_time,
-               arrival_at_dock) -> str:
+               arrival_at_dock, maybe_lunch=False) -> str:
     if paperwork_time:
         detail = "📄 Paperwork signed — the delay is after the work finished."
     else:
@@ -109,6 +117,8 @@ def dwell_card(driver_name, facility, minutes, label, paperwork_time,
     if arrival_at_dock:
         caveat = ("\nℹ️ Arrival was reported at a door, so real time on site "
                   "is likely longer than this.")
+    if maybe_lunch:
+        caveat += "\n🍽 May include their lunch hour."
 
     return (
         f"{label}: **{minutes} min on site**\n"
@@ -125,8 +135,16 @@ async def sweep_dwells(pool, send_card):
     """
     sent = 0
     for row in await open_dwells(pool):
-        (leg_id, _user_id, driver_name, facility, _arrival, paperwork_time,
-         at_dock, alerted, minutes) = row
+        (leg_id, _user_id, driver_name, facility, arrival, paperwork_time,
+         at_dock, alerted, minutes, lunch_start, lunch_end) = row
+
+        # Still eating: not a delay.
+        if lunch_start and not lunch_end:
+            continue
+        # Lunch taken during this stop does not count against it.
+        if lunch_start and lunch_end and arrival and lunch_start >= arrival:
+            minutes = (minutes or 0) - max(
+                0, int((lunch_end - lunch_start).total_seconds() // 60))
 
         if minutes is None:
             continue
@@ -140,6 +158,7 @@ async def sweep_dwells(pool, send_card):
 
         await record_alert(pool, leg_id, threshold)
         await send_card(dwell_card(driver_name, facility, int(minutes), label,
-                                   paperwork_time, at_dock))
+                                   paperwork_time, at_dock,
+                                   maybe_lunch=False))
         sent += 1
     return sent

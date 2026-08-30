@@ -60,6 +60,30 @@ async def record_clock_out(cur, user_id, when):
     return await cur.fetchone()
 
 
+async def record_lunch(cur, user_id, when, boundary):
+    """Record going on or coming off lunch. Returns (start, end, minutes)."""
+    column = "lunch_start" if boundary == "START" else "lunch_end"
+    await cur.execute(
+        f"""INSERT INTO {TABLE_SHIFTS} (user_id, shift_date, {column})
+            VALUES (%s, DATE(%s), %s)
+            ON DUPLICATE KEY UPDATE {column} = VALUES({column});""",
+        (user_id, when, when),
+    )
+    await cur.execute(
+        f"""UPDATE {TABLE_SHIFTS}
+               SET lunch_minutes = TIMESTAMPDIFF(MINUTE, lunch_start, lunch_end)
+             WHERE user_id = %s AND shift_date = DATE(%s)
+               AND lunch_start IS NOT NULL AND lunch_end IS NOT NULL;""",
+        (user_id, when),
+    )
+    await cur.execute(
+        f"""SELECT lunch_start, lunch_end, lunch_minutes FROM {TABLE_SHIFTS}
+             WHERE user_id = %s AND shift_date = DATE(%s);""",
+        (user_id, when),
+    )
+    return await cur.fetchone()
+
+
 async def is_clocked_out(cur, user_id) -> bool:
     """Whether the driver has finished for the day.
 

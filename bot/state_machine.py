@@ -1,7 +1,7 @@
 import logging
 import re
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
-from ai_engine import normalize_location, site_of
+from ai_engine import LOCATION_CACHE, normalize_location, site_of
 from load_types import classify as classify_load
 from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
 from shifts import format_worked, record_clock_in, record_clock_out
@@ -819,9 +819,40 @@ async def commit_trip_leg(
                 case "CASE_3_INTRA_FACILITY_MOVE":
                     display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
 
-                    # Drivers almost never name the facility on an internal move
-                    # ("empty move #13 to #47"), so infer it from where they were
-                    # last recorded.
+                    def as_dock(value):
+                        """A dock position, or None if this is really a facility.
+
+                        The parser occasionally puts a facility code in a dock
+                        field when the driver names the site ("drop empty 200 r
+                        yard"). A facility is never a dock, so it is rejected
+                        here rather than stored as one.
+                        """
+                        clean = (value or "").strip().upper()
+                        if not clean:
+                            return None
+                        if clean == "YARD":
+                            return clean
+                        if normalize_location(clean) in known_codes or clean in known_codes:
+                            logger.info(
+                                f"Ignoring facility code {clean!r} in a dock field."
+                            )
+                            return None
+                        return clean
+
+                    known_codes = set(LOCATION_CACHE.get("codes") or [])
+                    known_codes |= set(LOCATION_CACHE.get("alias_map") or {})
+
+                    misplaced = [c for c in (origin_dock, destination_dock)
+                                 if c and as_dock(c) is None and c.strip().upper() != "YARD"]
+                    from_dock = as_dock(origin_dock) or as_dock(door_num)
+                    to_dock = as_dock(destination_dock)
+
+                    # If a facility arrived in a dock field and none was given
+                    # as a location, that is where the move happened.
+                    if misplaced and origin_loc == "UNKNOWN" and dest_loc == "UNKNOWN":
+                        origin_loc = dest_loc = normalize_location(misplaced[0])
+                    # Usually no facility is named ("empty move #13 to #47"),
+                    # so fall back to where the driver was last recorded.
                     facility = origin_loc if origin_loc != "UNKNOWN" else dest_loc
                     if facility == "UNKNOWN":
                         await cur.execute(
@@ -836,8 +867,6 @@ async def commit_trip_leg(
                         last_seen = await cur.fetchone()
                         facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
 
-                    from_dock = (origin_dock or door_num or "").strip().upper() or None
-                    to_dock = (destination_dock or "").strip().upper() or None
                     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
 
                     # Every internal move gets its own row. Drivers never label

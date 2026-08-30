@@ -233,7 +233,9 @@ EXTRACTION & NORMALIZATION RULES:
    - Strip the leading "#": "#13" -> "13".
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
    - SDS uses a yard slot written "DO# 34", "DO 34" or "do34". Put just the number in do_number (e.g. "34"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
-   - Leave origin_location and destination_location null for CASE_3; drivers rarely name the facility on an internal move and it is inferred from their last known position.
+   - origin_dock and destination_dock hold POSITIONS ONLY: a door number, or the literal "YARD". A facility code such as 200, 200R, E2F or SDS is NEVER a dock, however the driver phrases it.
+   - If the driver names the facility on an internal move ("drop empty 200 r yard", "moved to yard at E2F"), put that facility in BOTH origin_location and destination_location -- the move begins and ends there -- and leave the dock fields for the positions only. Here "drop empty 200 r yard" means origin_location="200R", destination_location="200R", destination_dock="YARD", origin_dock=null.
+   - If no facility is named, leave both location fields null; it is inferred from the driver's last known position.
 
 
 3. Load Status & Trailer Details:

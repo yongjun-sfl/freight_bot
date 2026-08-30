@@ -972,3 +972,69 @@ async def test_arrival_without_a_named_facility_is_silent(pool):
     )
     assert res["is_clean"] is True
     assert res["card_text"] is None
+
+
+async def test_named_facility_is_not_stored_as_a_dock(pool):
+    """From a real message: "Hong il pyo drop empty 200 r yard".
+
+    The driver named the site, and the parser put 200R into origin_dock. A
+    facility is never a dock, so it is rejected there and used as the
+    location instead."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Hong il pyo drop empty 200 r yard",
+               origin_dock="200R", destination_dock="YARD",
+               ocr_trailer="77208", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_dock"] is None, "200R is a facility, not a dock"
+    assert leg["destination_dock"] == "YARD"
+    assert leg["origin_location"] == "200R"
+    assert leg["destination_location"] == "200R"
+    assert leg["trailer_number"] == "77208"
+    assert leg["arrival_action"] == "YARD_DROP"
+
+
+async def test_parser_naming_the_facility_properly_also_works(pool):
+    """The same message once the prompt puts the facility where it belongs."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_location="200R", destination_location="200R",
+               destination_dock="YARD", ocr_trailer="77208",
+               load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200R"
+    assert leg["destination_dock"] == "YARD"
+    assert leg["origin_dock"] is None
+
+
+async def test_real_dock_numbers_are_still_kept(pool):
+    """The guard must not reject genuine positions."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="200F", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_dock="74", destination_dock="47", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_dock"] == "74"
+    assert leg["destination_dock"] == "47"
+
+
+async def test_bare_200_in_a_dock_field_is_also_rejected(pool):
+    """200 is an alias for 200F, so it must be caught as a facility too."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               origin_dock="200", destination_dock="YARD", load_status="EMPTY"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_dock"] is None
+    assert leg["origin_location"] == "200F"

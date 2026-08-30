@@ -34,28 +34,53 @@ async def record_clock_in(cur, user_id, when):
     return await cur.fetchone()
 
 
+async def open_shift_date(cur, user_id, when):
+    """The shift a report at `when` belongs to.
+
+    Normally today, but a driver clocking out after midnight is still on the
+    shift they started, so an open one within the last 18 hours wins.
+    """
+    await cur.execute(
+        f"""SELECT shift_date FROM {TABLE_SHIFTS}
+             WHERE user_id = %s
+               AND (
+                     (reported_clock_in IS NOT NULL
+                      AND reported_clock_out IS NULL
+                      AND reported_clock_in >= %s - INTERVAL 18 HOUR)
+                  OR (lunch_start IS NOT NULL
+                      AND lunch_end IS NULL
+                      AND lunch_start >= %s - INTERVAL 18 HOUR)
+               )
+          ORDER BY COALESCE(reported_clock_in, lunch_start) DESC LIMIT 1;""",
+        (user_id, when, when),
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def record_clock_out(cur, user_id, when):
     """Last report wins: a driver correcting their finish should update it."""
+    shift_date = await open_shift_date(cur, user_id, when)
     await cur.execute(
         f"""INSERT INTO {TABLE_SHIFTS} (user_id, shift_date, reported_clock_out)
-            VALUES (%s, DATE(%s), %s)
+            VALUES (%s, COALESCE(%s, DATE(%s)), %s)
             ON DUPLICATE KEY UPDATE
                 reported_clock_out = VALUES(reported_clock_out);""",
-        (user_id, when, when),
+        (user_id, shift_date, when, when),
     )
     await cur.execute(
         f"""UPDATE {TABLE_SHIFTS}
                SET worked_minutes = TIMESTAMPDIFF(
                        MINUTE, reported_clock_in, reported_clock_out)
-             WHERE user_id = %s AND shift_date = DATE(%s)
+             WHERE user_id = %s AND shift_date = COALESCE(%s, DATE(%s))
                AND reported_clock_in IS NOT NULL;""",
-        (user_id, when),
+        (user_id, shift_date, when),
     )
     await cur.execute(
         f"""SELECT reported_clock_in, reported_clock_out, worked_minutes
               FROM {TABLE_SHIFTS}
-             WHERE user_id = %s AND shift_date = DATE(%s);""",
-        (user_id, when),
+             WHERE user_id = %s AND shift_date = COALESCE(%s, DATE(%s));""",
+        (user_id, shift_date, when),
     )
     return await cur.fetchone()
 
@@ -63,23 +88,24 @@ async def record_clock_out(cur, user_id, when):
 async def record_lunch(cur, user_id, when, boundary):
     """Record going on or coming off lunch. Returns (start, end, minutes)."""
     column = "lunch_start" if boundary == "START" else "lunch_end"
+    shift_date = await open_shift_date(cur, user_id, when)
     await cur.execute(
         f"""INSERT INTO {TABLE_SHIFTS} (user_id, shift_date, {column})
-            VALUES (%s, DATE(%s), %s)
+            VALUES (%s, COALESCE(%s, DATE(%s)), %s)
             ON DUPLICATE KEY UPDATE {column} = VALUES({column});""",
-        (user_id, when, when),
+        (user_id, shift_date, when, when),
     )
     await cur.execute(
         f"""UPDATE {TABLE_SHIFTS}
                SET lunch_minutes = TIMESTAMPDIFF(MINUTE, lunch_start, lunch_end)
-             WHERE user_id = %s AND shift_date = DATE(%s)
+             WHERE user_id = %s AND shift_date = COALESCE(%s, DATE(%s))
                AND lunch_start IS NOT NULL AND lunch_end IS NOT NULL;""",
-        (user_id, when),
+        (user_id, shift_date, when),
     )
     await cur.execute(
         f"""SELECT lunch_start, lunch_end, lunch_minutes FROM {TABLE_SHIFTS}
-             WHERE user_id = %s AND shift_date = DATE(%s);""",
-        (user_id, when),
+             WHERE user_id = %s AND shift_date = COALESCE(%s, DATE(%s));""",
+        (user_id, shift_date, when),
     )
     return await cur.fetchone()
 

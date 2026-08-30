@@ -68,7 +68,7 @@ async def open_dwells(pool):
                       JOIN {TABLE_DRIVERS} d ON d.user_id = l.user_id
                       LEFT JOIN {TABLE_SHIFTS} s
                              ON s.user_id = l.user_id
-                            AND s.shift_date = CURRENT_DATE()
+                            AND s.shift_date = DATE(l.arrival_time)
                      WHERE l.is_positioning_leg = 0
                        AND l.arrival_time IS NOT NULL
                        AND l.id = (
@@ -88,7 +88,7 @@ async def open_dwells(pool):
                        AND NOT EXISTS (
                            SELECT 1 FROM {TABLE_SHIFTS} s
                             WHERE s.user_id = l.user_id
-                              AND s.shift_date = CURRENT_DATE()
+                              AND s.shift_date = DATE(l.arrival_time)
                               AND s.reported_clock_out IS NOT NULL
                        );"""
             )

@@ -186,8 +186,23 @@ def parse_text_with_llm(text: str) -> dict:
         }
 
     if LOCATION_CACHE["codes"]:
-        known_locations = ", ".join(LOCATION_CACHE["codes"])
-        location_rule = f"KNOWN VALID CODES: [{known_locations}]"
+        # Aliases go in too. Drivers say "pactra" for 7634, and a model shown
+        # only canonical codes drops the word or, worse, substitutes a code it
+        # does recognise -- it answered SDS and 3551 for pactra before this.
+        aliases = {}
+        for spoken, canonical in (LOCATION_CACHE.get("alias_map") or {}).items():
+            if spoken != canonical:
+                aliases.setdefault(canonical, []).append(spoken)
+        listed = []
+        for code in sorted(LOCATION_CACHE["codes"]):
+            spoken = aliases.get(code)
+            listed.append(f"{code} (also called: {', '.join(sorted(spoken))})"
+                          if spoken else code)
+        location_rule = (
+            "KNOWN VALID CODES, with the words drivers use for them:\n  "
+            + "\n  ".join(listed)
+            + "\nAlways return the CODE, never the spoken word."
+        )
     else:
         location_rule = "KNOWN VALID CODES: [Extract short alphanumeric location names dynamically]"
     
@@ -218,6 +233,7 @@ CASE CLASSIFICATION RULES:
    - "7634 unloading finished Empty to 200R" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200R", load_status="EMPTY", work_finished=true.
    - "jung kim finished live unloading empty 7634 to 200" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200", load_status="EMPTY", work_finished=true.
    - "live unloading finished" alone is CASE_WORK_FINISHED.
+   - Tense matters. Only a word meaning COMPLETED -- finished, done, complete, off, 완료 -- sets work_finished. "Live unloading at pactra #3" is work in progress: that is CASE_2_DESTINATION_ARRIVAL with action LIVE_UNLOAD and work_finished false. Stamping a completion early is worse than missing one, because the real completion will not overwrite it and the recorded unload time becomes wrong.
 8. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
    - ALSO a status report describing where OTHER trailers are sitting, or counting them. Every other case records one movement by the sender; a message about several trailers is information for the dispatcher, not a trip.
    - "200R 닥에 4대 야드에 8대 (지금 드랍하신분 포함) 200F에는 한분 언로드중" -- four at the 200R dock, eight in the yard, one unloading at 200F -- is NONE_WORK_RELATED. It names facilities but reports no movement of its own.
@@ -241,7 +257,7 @@ EXTRACTION & NORMALIZATION RULES:
    - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
    - Strip the leading "#": "#13" -> "13".
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
-   - SDS uses a yard slot written "DO# 34", "DO 34" or "do34". Put just the number in do_number (e.g. "34"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
+   - SDS uses a yard slot, written "DO# 34", "DO 34", "do34", or as a single token like "D021", "D027", "D005". Put just the digits in do_number, dropping leading zeros ("D021" -> "21"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
    - origin_dock and destination_dock hold POSITIONS ONLY: a door number, or the literal "YARD". A facility code such as 200, 200R, E2F or SDS is NEVER a dock, however the driver phrases it.
    - If the driver names the facility on an internal move ("drop empty 200 r yard", "moved to yard at E2F"), put that facility in BOTH origin_location and destination_location -- the move begins and ends there -- and leave the dock fields for the positions only. Here "drop empty 200 r yard" means origin_location="200R", destination_location="200R", destination_dock="YARD", origin_dock=null.
    - If no facility is named, leave both location fields null; it is inferred from the driver's last known position.
@@ -304,7 +320,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
    - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
 4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
-4b. "do_number": ONLY if the letters "DO" or "D.O." literally appear next to a number, as in "DO# 34" or "D.O. 34". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
+4b. "do_number": ONLY if "DO", "D.O." or a "D021" style token appears as or beside the number, as in "DO# 34", "D.O. 34" or "D021". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
 
 4c. "dock_number": a hand-written "#NN" with no other label is the dock the trailer was loaded at or delivered to. Return just the digits, e.g. "#47" -> "47". Return null if absent.
 

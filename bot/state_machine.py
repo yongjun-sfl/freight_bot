@@ -141,30 +141,18 @@ async def commit_trip_leg(
                 )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
-            # 1. SAME-FACILITY DEPARTURE IS A MISPARSE
-            # Genuine within-facility repositioning arrives as
-            # CASE_3_INTRA_FACILITY_MOVE. A departure whose origin equals its
-            # destination therefore means the parser mislabelled such a move --
-            # surface it rather than discard what may be billable work.
+            # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
+            # "200F to 200R" is front to rear in one yard, not a trip. Compared
+            # by site, so E2F to E2R counts too. Recorded as the move it is
+            # rather than carded for the dispatcher to correct by hand.
             if (case_type == "CASE_1_ORIGIN_DEPARTURE"
                     and origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
-                    and origin_loc == dest_loc):
-                logger.warning(
-                    f"Driver #{did} sent a same-facility departure at {origin_loc}; "
-                    f"likely a mis-parsed internal move."
+                    and site_of(origin_loc) == site_of(dest_loc)):
+                logger.info(
+                    f"Driver #{did} reported {origin_loc} to {dest_loc}: one site, "
+                    f"recording as a within-facility move."
                 )
-                return {
-                    "is_clean": False,
-                    "leg_id": None,
-                    "card_text": (
-                        f"⚠️ **MANUAL RECONCILE: Same-Facility Departure**\n"
-                        f"👤 Driver: {user_name}\n"
-                        f"💬 Message: `{raw_text}`\n"
-                        f"📍 Both ends read as `{origin_loc}`.\n"
-                        f"👉 If this was an internal dock move it was not recorded "
-                        f"correctly. Confirm with the driver and enter it manually."
-                    )
-                }
+                case_type = "CASE_3_INTRA_FACILITY_MOVE"
 
             # 2. DUPLICATE BOL LOOKUP
             # Deliberately NOT run ahead of the match block. The patch paths --
@@ -1040,7 +1028,10 @@ async def commit_trip_leg(
                         f"recorded as positioning Leg #{leg_id}."
                     )
 
-                    if facility == "UNKNOWN" or not to_dock:
+                    # A known facility is enough to record the move. "200F to
+                    # 200R" says front to rear without naming a dock, and
+                    # demanding one would card a perfectly clear report.
+                    if facility == "UNKNOWN":
                         return {
                             "is_clean": False,
                             "leg_id": leg_id,

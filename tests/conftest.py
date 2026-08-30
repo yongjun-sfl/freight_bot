@@ -52,6 +52,17 @@ def eastern_now() -> datetime:
     return datetime.now(EASTERN).replace(tzinfo=None)
 
 
+def midday() -> datetime:
+    """Today at noon Eastern.
+
+    Tests that reach hours backwards ("clocked in nine hours ago") must not
+    depend on when the suite happens to run. Anchored at noon, a nine hour
+    shift stays inside one day whether the suite runs at 09:00 or 00:20.
+    Drivers work 08:30 to 17:30, so noon is also where the real data sits.
+    """
+    return eastern_now().replace(hour=12, minute=0, second=0, microsecond=0)
+
+
 def ts(dt: datetime = None) -> str:
     return (dt or eastern_now()).strftime("%Y-%m-%d %H:%M:%S")
 

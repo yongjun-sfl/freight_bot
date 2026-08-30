@@ -140,3 +140,16 @@ def test_uncertain_ownership_is_visible_not_guessed():
     """1380 is named CTV FNS but was not confirmed, so it is flagged rather
     than silently assigned to either party."""
     assert _locations()["1380"]["owner"] == "FNS?"
+
+
+def test_pactra_is_200_not_7634():
+    """SDS bought 200 Momeni Lane from Pactra, and drivers who worked there
+    for a decade still call it pactra. 7634's official name is EPC PACTRA,
+    which makes the wrong answer look right -- so it is pinned.
+
+    Evidence: an RM BOL reads "Pick-Up At: PACTRA RE PLUS INC, 200 Momeni
+    Lane SE", and "Live unloading at pactra #3" uses a dock in 200's inbound
+    range of 3-21."""
+    rows = _locations()
+    assert "PACTRA" in (rows["200F"]["aliases"] or "").upper()
+    assert "PACTRA" not in (rows["7634"]["aliases"] or "").upper()

@@ -33,5 +33,29 @@ services:
       sh -c "pip install --no-cache-dir -q -r requirements-dev.txt &&
              pytest"
 
+  # Replays a real day of Telegram messages through the bot and compares the
+  # legs against the dispatcher's hand-entered log. Writes to a scratch
+  # database; never touches production.
+  #   docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm replay
+  replay:
+    build: ./bot
+    depends_on:
+      mysql_db:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TEST_MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REPLAY_SHEET=${REPLAY_SHEET:-08282026}
+      - REPLAY_PHOTOS=${REPLAY_PHOTOS:-0}
+      - REPLAY_DRIVER=${REPLAY_DRIVER:-}
+    volumes:
+      - ./bot:/src/bot:ro
+      - ./tools:/tools:ro
+      - ./data:/data:ro
+    working_dir: /src
+    command: >
+      sh -c "pip install --no-cache-dir -q openpyxl && python /tools/replay.py"
+
 volumes:
   mysql_test_data:

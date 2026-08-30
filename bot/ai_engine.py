@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import time
 import random
 import asyncio
@@ -10,7 +11,7 @@ from pdf2image import convert_from_bytes
 from google import genai
 from google.genai import types
 
-from config import TABLE_LOCATION_CODES
+from config import TABLE_LOCATION_CODES, TABLE_LOCATION_DOCKS
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,10 @@ LOCATION_CACHE = {
     # deciding whether a driver has returned and closed a round.
     "site_map": {},
     "official_name": {},
+    # Door bands, as (first, last, facility, use). At 200 the front building
+    # runs 3-21 FG inbound and 22-45 RM inbound, the rear 47-66 RM outbound and
+    # 67-99 FG outbound -- so a door number says which building is meant.
+    "dock_bands": [],
 }
 
 
@@ -93,6 +98,16 @@ async def refresh_location_cache(pool):
             LOCATION_CACHE["alias_map"] = alias_map
             LOCATION_CACHE["site_map"] = site_map
             LOCATION_CACHE["official_name"] = official
+
+            await cur.execute(
+                f"""SELECT facility_code, first_dock, last_dock, dock_use 
+                      FROM {TABLE_LOCATION_DOCKS} 
+                  ORDER BY first_dock;"""
+            )
+            LOCATION_CACHE["dock_bands"] = [
+                (first, last, facility.strip().upper(), (use or "").strip() or None)
+                for facility, first, last, use in await cur.fetchall()
+            ]
             logger.info(f"Location cache refreshed: {len(codes)} valid codes loaded.")
 
 
@@ -114,6 +129,48 @@ def site_of(location: str) -> str:
         return location
     clean = location.strip().upper()
     return LOCATION_CACHE["site_map"].get(clean, clean)
+
+
+def _dock_band(dock, site: str = None):
+    """The door band a number falls in, or None if it cannot be told.
+
+    Door numbers repeat across sites, so `site` narrows the search; without it
+    a number matching bands at more than one site resolves to nothing. Bands
+    are the dispatcher's own numbers and some upper bounds are approximate, so
+    a door outside every band gives None and callers keep what they had.
+    """
+    digits = re.sub(r"\D", "", str(dock or ""))
+    if not digits:
+        return None
+    number = int(digits)
+    hits = [
+        band for band in LOCATION_CACHE["dock_bands"]
+        if band[0] <= number <= band[1]
+        and (site is None or site_of(band[2]) == site)
+    ]
+    if len({band[2] for band in hits}) != 1:
+        return None
+    return hits[0]
+
+
+def facility_for_dock(dock, site: str = None) -> str:
+    """The building a numbered door belongs to, or None.
+
+    200F takes doors 3-45 and 200R doors 47-99, so "moved #3 to #47" crosses
+    from the front building to the rear rather than shuffling within one yard.
+    """
+    band = _dock_band(dock, site)
+    return band[2] if band else None
+
+
+def dock_use(dock, site: str = None) -> str:
+    """What a door is for -- "FG INBOUND", "RM OUTBOUND" -- or None.
+
+    Recorded, not yet acted on. It is what makes an empty parked on 47-66 a
+    trailer staged for the next RM round rather than an idle one.
+    """
+    band = _dock_band(dock, site)
+    return band[3] if band else None
 
 
 def convert_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:
@@ -186,8 +243,23 @@ def parse_text_with_llm(text: str) -> dict:
         }
 
     if LOCATION_CACHE["codes"]:
-        known_locations = ", ".join(LOCATION_CACHE["codes"])
-        location_rule = f"KNOWN VALID CODES: [{known_locations}]"
+        # Aliases go in too. Drivers say "pactra" for 7634, and a model shown
+        # only canonical codes drops the word or, worse, substitutes a code it
+        # does recognise -- it answered SDS and 3551 for pactra before this.
+        aliases = {}
+        for spoken, canonical in (LOCATION_CACHE.get("alias_map") or {}).items():
+            if spoken != canonical:
+                aliases.setdefault(canonical, []).append(spoken)
+        listed = []
+        for code in sorted(LOCATION_CACHE["codes"]):
+            spoken = aliases.get(code)
+            listed.append(f"{code} (also called: {', '.join(sorted(spoken))})"
+                          if spoken else code)
+        location_rule = (
+            "KNOWN VALID CODES, with the words drivers use for them:\n  "
+            + "\n  ".join(listed)
+            + "\nAlways return the CODE, never the spoken word."
+        )
     else:
         location_rule = "KNOWN VALID CODES: [Extract short alphanumeric location names dynamically]"
     
@@ -211,10 +283,19 @@ CASE CLASSIFICATION RULES:
    - "loaded move #4 to #13"      -> origin_dock="4",  destination_dock="13", load_status="LOADED"
    - "empty dropped yard"         -> origin_dock=null, destination_dock="YARD", load_status="EMPTY"
    - "moved 44821 door 7 to yard" -> origin_dock="7",  destination_dock="YARD"
+   - "Finish live unloading at pactra #3 move to Dock 47" -> origin_location="200F", destination_location="200F", origin_dock="3", destination_dock="47", work_finished=true. Moving TO A DOOR is not travel: a door is a position inside the facility the driver is already at, so this stays CASE_3 however much it sounds like a departure. Drivers do this constantly -- park the empty on a free door for the next load -- and reading it as a trip invents a leg to nowhere.
 5. "CASE_CLOCK_IN": Driver is starting their shift. "clock in", "clocked in", "clocking in", "출근".
 6. "CASE_CLOCK_OUT": Driver is ending their shift. "clock out", "clocked out", "clocking out", "퇴근".
-7. "CASE_WORK_FINISHED": Driver reports a live load or unload is complete WITHOUT also announcing a departure. "live unloading finished", "unload done", "loading finished", "finished unloading".
+7. "CASE_WORK_FINISHED": ONLY when a driver reports a live load or unload complete and names NO destination and NO onward movement whatsoever. "live unloading finished", "unload done", "finished unloading".
+   - If ANY destination or onward movement appears, however briefly, the case is CASE_1_ORIGIN_DEPARTURE and work_finished is true. A destination means ANOTHER FACILITY. A door, dock or yard position at the facility they are already at is not one -- that is CASE_3_INTRA_FACILITY_MOVE with work_finished true. Movement always wins over completion, because a completion records a time while a departure records a trip -- choosing wrongly loses the trip entirely.
+   - "7634 unloading finished Empty to 200R" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200R", load_status="EMPTY", work_finished=true.
+   - "jung kim finished live unloading empty 7634 to 200" is CASE_1_ORIGIN_DEPARTURE, origin_location="7634", destination_location="200", load_status="EMPTY", work_finished=true.
+   - "live unloading finished" alone is CASE_WORK_FINISHED.
+   - Tense matters. Only a word meaning COMPLETED -- finished, done, complete, off, 완료 -- sets work_finished. "Live unloading at pactra #3" is work in progress: that is CASE_2_DESTINATION_ARRIVAL with action LIVE_UNLOAD and work_finished false. Stamping a completion early is worse than missing one, because the real completion will not overwrite it and the recorded unload time becomes wrong.
 8. "NONE_WORK_RELATED": Casual chat, non-shuttle messages, or non-logistics updates.
+   - ALSO a status report describing where OTHER trailers are sitting, or counting them. Every other case records one movement by the sender; a message about several trailers is information for the dispatcher, not a trip.
+   - "200R 닥에 4대 야드에 8대 (지금 드랍하신분 포함) 200F에는 한분 언로드중" -- four at the 200R dock, eight in the yard, one unloading at 200F -- is NONE_WORK_RELATED. It names facilities but reports no movement of its own.
+   - The test is whether the sender is describing something THEY did or are doing. If not, it is NONE_WORK_RELATED.
 
 SEPARATE FLAG -- "work_finished":
 - Set true whenever the message says a live load or unload has been completed, INCLUDING when the driver announces a departure in the same breath ("live loading finished load 200 to E2F"). In that case the case_type is still CASE_1_ORIGIN_DEPARTURE and work_finished is true; the completion belongs to the trip they are ending, the departure starts the next one.
@@ -223,17 +304,21 @@ SEPARATE FLAG -- "work_finished":
 EXTRACTION & NORMALIZATION RULES:
 1. Location Extraction:
    - Match facility mentions to the KNOWN VALID CODES provided whenever possible.
+   - A token that IS one of the KNOWN VALID CODES is a location, never a trailer number, however bare it looks. "7634 unloading finished" means the facility 7634, not trailer 7634. Only assign trailer_number from a value that is NOT a known code.
+   - In "<A> ... to <B>" the first facility is the origin and the second the destination, even when other words separate them.
    - If a driver uses a shorthand code (e.g., "200" for "200F"), extract the raw shorthand code (e.g., "200").
    - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
 
 2. Door Numbers vs Locations:
-   - Door, bay, or spot identifiers (starting with "#", "door", "bay", "spot") are NEVER locations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.
+   - Door, bay, or spot identifiers (starting with "#", "door", "dock", "bay", "spot") are NEVER locations, and never destinations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.
    - For CASE_1 and CASE_2 a single door goes in door_number (e.g. "#47" or "door 47" -> door_number="47").
    - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
    - Strip the leading "#": "#13" -> "13".
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
-   - SDS uses a yard slot written "DO# 34", "DO 34" or "do34". Put just the number in do_number (e.g. "34"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
-   - Leave origin_location and destination_location null for CASE_3; drivers rarely name the facility on an internal move and it is inferred from their last known position.
+   - SDS uses a yard slot, written "DO# 34", "DO 34", "do34", or as a single token like "D021", "D027", "D005". Put just the digits in do_number, dropping leading zeros ("D021" -> "21"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
+   - origin_dock and destination_dock hold POSITIONS ONLY: a door number, or the literal "YARD". A facility code such as 200, 200R, E2F or SDS is NEVER a dock, however the driver phrases it.
+   - If the driver names the facility on an internal move ("drop empty 200 r yard", "moved to yard at E2F"), put that facility in BOTH origin_location and destination_location -- the move begins and ends there -- and leave the dock fields for the positions only. Here "drop empty 200 r yard" means origin_location="200R", destination_location="200R", destination_dock="YARD", origin_dock=null.
+   - If no facility is named, leave both location fields null; it is inferred from the driver's last known position.
 
 
 3. Load Status & Trailer Details:
@@ -285,6 +370,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 
     dynamic_vision_prompt = """Analyze this image.
 
+0. "is_manifest": Set to True ONLY if the page header reads "SHUTTLE DRIVER MANIFEST" -- a hand-filled grid of a driver's trips for one shift. It is not a Bill of Lading and carries no BOL or reservation number. When true, return null for every other field.
 1. "is_paper_document": Set to True ONLY if this image is a paper document (Bill of Lading, shipping paper, manifest, reservation instruction sheet, signature paper). Set to False if it is a photo of a trailer, truck, container body, or license plate.
 2. "bol_number": Read the entire document semantically. Identify the primary tracking, BOL, delivery, reservation, or manifest number.
    - Look explicitly for terms like: "Reservation No.", "Reservation #", "Res #", "BOL", "Bill of Lading", "B/L", "Delivery #", "Shipment #", "DO #", "Ref #", "Tracking #".
@@ -292,7 +378,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
    - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
 4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
-4b. "do_number": ONLY if the letters "DO" or "D.O." literally appear next to a number, as in "DO# 34" or "D.O. 34". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
+4b. "do_number": ONLY if "DO", "D.O." or a "D021" style token appears as or beside the number, as in "DO# 34", "D.O. 34" or "D021". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
 
 4c. "dock_number": a hand-written "#NN" with no other label is the dock the trailer was loaded at or delivered to. Return just the digits, e.g. "#47" -> "47". Return null if absent.
 
@@ -313,6 +399,7 @@ def extract_bol_locally(files: list[bytes]) -> dict:
 
 Return raw JSON ONLY:
 {
+  "is_manifest": boolean,
   "is_paper_document": boolean,
   "bol_number": string or null,
   "document_type": "FG" | "RM" | "UNKNOWN",
@@ -340,6 +427,8 @@ Return raw JSON ONLY:
         "shipper_signed": False,
         "receiver_signed": False,
         "bol_image_blob": None,
+        "is_manifest": False,
+        "manifest_image": None,
         "is_paper_document": False,
         # True only when every image errored, i.e. the vision API is down.
         # Distinct from "scanned fine, found no document".
@@ -358,6 +447,12 @@ Return raw JSON ONLY:
                 config=json_config()
             )
             data = json.loads(response.text)
+
+            if data.get("is_manifest"):
+                result["is_manifest"] = True
+                # The sheet IS the record, so the original is kept whether or
+                # not the handwriting can be read.
+                result["manifest_image"] = img_bytes
 
             is_doc = data.get("is_paper_document", False)
             if is_doc:
@@ -422,6 +517,7 @@ async def prepare_text_intent(text: str) -> dict:
         "rm_seq": None,
         "materials": [],
         "work_finished": bool(llm_parsed.get("work_finished")),
+        "lunch": llm_parsed.get("lunch"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": False,
@@ -431,6 +527,7 @@ async def prepare_text_intent(text: str) -> dict:
 
 
 async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> dict:
+    from manifests import read_manifest
     has_caption = bool(caption_text and caption_text.strip())
 
     # Both calls are blocking; neither may run on the event loop.
@@ -440,8 +537,14 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
     )
     ocr_data = await loop.run_in_executor(None, extract_bol_locally, images)
 
-    if has_caption:
+    if ocr_data.get("is_manifest"):
+        case_type = "CASE_MANIFEST"
+    elif has_caption:
         case_type = llm_parsed.get("case_type", "CASE_1_ORIGIN_DEPARTURE")
+    elif ocr_data.get("is_manifest"):
+        # End-of-shift sheets are captioned with just the driver's name, so
+        # the image has to decide this, not the text.
+        case_type = "CASE_MANIFEST"
     elif ocr_data.get("ocr_failed"):
         # Vision was unreachable for every image. Do not pretend the driver
         # posted something irrelevant -- surface it instead.
@@ -470,9 +573,16 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "rm_seq": ocr_data.get("rm_seq"),
         "materials": ocr_data.get("materials") or [],
         "work_finished": bool(llm_parsed.get("work_finished")),
+        "lunch": llm_parsed.get("lunch"),
         "action": llm_parsed.get("action"),
         "load_status": llm_parsed.get("load_status"),
         "shipper_signed": ocr_data.get("shipper_signed", False),
         "receiver_signed": ocr_data.get("receiver_signed", False),
-        "primary_image_blob": ocr_data.get("bol_image_blob")
+        "primary_image_blob": ocr_data.get("bol_image_blob"),
+        "is_manifest": ocr_data.get("is_manifest", False),
+        "manifest_image": ocr_data.get("manifest_image"),
+        "manifest_parsed": (
+            read_manifest(ocr_data["manifest_image"])
+            if ocr_data.get("manifest_image") else None
+        ),
     }

@@ -140,3 +140,68 @@ def test_uncertain_ownership_is_visible_not_guessed():
     """1380 is named CTV FNS but was not confirmed, so it is flagged rather
     than silently assigned to either party."""
     assert _locations()["1380"]["owner"] == "FNS?"
+
+
+def test_pactra_is_200_not_7634():
+    """SDS bought 200 Momeni Lane from Pactra, and drivers who worked there
+    for a decade still call it pactra. 7634's official name is EPC PACTRA,
+    which makes the wrong answer look right -- so it is pinned.
+
+    Evidence: an RM BOL reads "Pick-Up At: PACTRA RE PLUS INC, 200 Momeni
+    Lane SE", and "Live unloading at pactra #3" uses a dock in 200's inbound
+    range of 3-21."""
+    rows = _locations()
+    assert "PACTRA" in (rows["200F"]["aliases"] or "").upper()
+    assert "PACTRA" not in (rows["7634"]["aliases"] or "").upper()
+
+
+# ==========================================================================
+# Door bands
+# ==========================================================================
+
+def _bands():
+    return seed_network.read_docks_csv()
+
+
+def test_dock_bands_parse():
+    bands = _bands()
+    assert bands, "docks.csv should be readable"
+    assert [(b["facility"], b["first"], b["last"], b["use"]) for b in bands] == [
+        ("200F", 3, 21, "FG INBOUND"),
+        ("200F", 22, 45, "RM INBOUND"),
+        ("200R", 47, 66, "RM OUTBOUND"),
+        ("200R", 67, 99, "FG OUTBOUND"),
+    ]
+
+
+def test_the_band_hanjin_works_is_marked():
+    """200F 22-45 is Hanjin's RM inbound, not our traffic. Recorded so a door
+    in that band is never read as one of ours by default."""
+    hanjin = [b for b in _bands() if b["operator"] == "HANJIN"]
+    assert [(b["facility"], b["first"], b["last"]) for b in hanjin] == [("200F", 22, 45)]
+    assert all(b["operator"] == "SFL" for b in _bands() if b not in hanjin)
+
+
+def test_every_dock_band_names_a_real_facility():
+    rows = _locations()
+    for band in _bands():
+        assert band["facility"] in rows, f"{band['facility']} is not a facility"
+        assert rows[band["facility"]]["active"]
+
+
+def test_dock_bands_do_not_overlap():
+    """Two bands over one door would make the door ambiguous, and the resolver
+    answers None rather than pick -- so the data must not create that."""
+    by_facility = {}
+    for band in _bands():
+        by_facility.setdefault(band["facility"], []).append(band)
+    for facility, bands in by_facility.items():
+        bands.sort(key=lambda b: b["first"])
+        for earlier, later in zip(bands, bands[1:]):
+            assert earlier["last"] < later["first"], (
+                f"{facility} bands {earlier['first']}-{earlier['last']} and "
+                f"{later['first']}-{later['last']} overlap")
+
+
+def test_missing_docks_file_degrades_quietly():
+    assert seed_network.read_docks_csv("/nonexistent/docks.csv") == []

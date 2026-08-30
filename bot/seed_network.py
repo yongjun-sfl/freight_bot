@@ -13,13 +13,15 @@ import csv
 import logging
 import os
 
-from config import TABLE_DISTANCES, TABLE_DRIVERS, TABLE_LOCATION_CODES
+from config import (TABLE_DISTANCES, TABLE_DRIVERS, TABLE_LOCATION_CODES,
+                    TABLE_LOCATION_DOCKS)
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CSV_PATH = os.path.join(DATA_DIR, "location_distance.csv")
 LOCATIONS_PATH = os.path.join(DATA_DIR, "locations.csv")
+DOCKS_PATH = os.path.join(DATA_DIR, "docks.csv")
 DRIVERS_PATH = os.path.join(DATA_DIR, "drivers.csv")
 
 def read_locations_csv(path=LOCATIONS_PATH):
@@ -29,6 +31,8 @@ def read_locations_csv(path=LOCATIONS_PATH):
     code is our shorthand. Reports aimed at their accounting team should use
     the former. site_code groups front/rear pairs that share an address, which
     is what lets a round opened at 200R close on return to 200F.
+    Doors are not here: they live in docks.csv, because one facility has
+    several bands with different uses.
     """
     if not os.path.exists(path):
         return []
@@ -50,6 +54,42 @@ def read_locations_csv(path=LOCATIONS_PATH):
                 "active": (row.get("is_active") or "YES").strip().upper() == "YES",
             })
     return rows
+
+
+def read_docks_csv(path=DOCKS_PATH):
+    """Door bands per facility: which doors, what they are for, who works them.
+
+    Doors are numbered in bands and the band carries the meaning. At 200 the
+    front building runs 3-21 FG inbound and 22-45 RM inbound (Hanjin's, not
+    ours); the rear runs 47-66 RM outbound and 67-99 FG outbound for the 7634
+    lane. A driver naming only a door is therefore naming a building, which is
+    what lets "#3 to #47" read as 200F -> 200R.
+
+    Bands are the dispatcher's own numbers and some upper bounds are
+    approximate, so a door outside every band is left unresolved rather than
+    forced into the nearest one.
+    """
+    if not os.path.exists(path):
+        return []
+    bands = []
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            facility = (row.get("facility") or "").strip().upper()
+            first = (row.get("first_dock") or "").strip()
+            last = (row.get("last_dock") or "").strip()
+            if not (facility and first.isdigit() and last.isdigit()):
+                if facility or first or last:
+                    logger.warning(f"Skipping unreadable dock band {row!r}.")
+                continue
+            bands.append({
+                "facility": facility,
+                "first": int(first),
+                "last": int(last),
+                "use": (row.get("use") or "").strip().upper() or None,
+                "operator": (row.get("operator") or "").strip().upper() or None,
+                "note": (row.get("note") or "").strip() or None,
+            })
+    return bands
 
 
 def read_distance_csv(path=CSV_PATH):
@@ -198,6 +238,26 @@ async def seed_network(cur):
             )
             logger.warning(f"{code} has distances but no facility record.")
         seeded_locations = len(seen) + len(set(codes) - seen)
+
+    await cur.execute(f"SELECT COUNT(*) FROM {TABLE_LOCATION_DOCKS};")
+    (has_docks,) = await cur.fetchone()
+    if not has_docks:
+        known = {row["code"] for row in read_locations_csv()}
+        for band in read_docks_csv():
+            if band["facility"] not in known:
+                logger.warning(
+                    f"Dock band {band['first']}-{band['last']} names "
+                    f"{band['facility']}, which is not a facility."
+                )
+                continue
+            await cur.execute(
+                f"""INSERT INTO {TABLE_LOCATION_DOCKS}
+                        (facility_code, first_dock, last_dock, dock_use,
+                         operator, note)
+                    VALUES (%s, %s, %s, %s, %s, %s);""",
+                (band["facility"], band["first"], band["last"],
+                 band["use"], band["operator"], band["note"]),
+            )
 
     await cur.execute(f"SELECT COUNT(*) FROM {TABLE_DISTANCES};")
     (has_distances,) = await cur.fetchone()

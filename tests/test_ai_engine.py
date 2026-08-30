@@ -177,3 +177,73 @@ def test_successful_scan_with_no_document_is_not_a_failure(monkeypatch):
     out = ai_engine.extract_bol_locally([b"a-photo-of-a-truck"])
     assert out["ocr_failed"] is False
     assert out["is_paper_document"] is False
+
+
+# ==========================================================================
+# Dock bands -- which building a door is in, and what it is for
+# ==========================================================================
+
+def _load_dock_bands(cache):
+    """The 200 site as the dispatcher describes it: FG inbound 3-21 and
+    Hanjin's RM inbound 22-45 at the front, RM outbound 47-66 and FG outbound
+    67-99 at the rear."""
+    cache["site_map"].update({"200F": "200", "200R": "200", "E2F": "E2"})
+    cache["dock_bands"].extend([
+        (3, 21, "200F", "FG INBOUND"),
+        (22, 45, "200F", "RM INBOUND"),
+        (47, 66, "200R", "RM OUTBOUND"),
+        (67, 99, "200R", "FG OUTBOUND"),
+    ])
+
+
+def test_dock_resolves_to_its_building(clean_location_cache):
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.facility_for_dock("3", "200") == "200F"
+    assert ai_engine.facility_for_dock("#47", "200") == "200R"
+    assert ai_engine.facility_for_dock("Dock 47", "200") == "200R"
+    assert ai_engine.facility_for_dock("74", "200") == "200R"
+
+
+def test_a_door_says_what_it_is_for(clean_location_cache):
+    """The 7634 lane loads on 67-99; the RM round hooks on 47-66."""
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.dock_use("3", "200") == "FG INBOUND"
+    assert ai_engine.dock_use("47", "200") == "RM OUTBOUND"
+    assert ai_engine.dock_use("74", "200") == "FG OUTBOUND"
+
+
+def test_hanjins_band_is_recorded_not_hidden(clean_location_cache):
+    """22-45 is RM inbound worked by Hanjin. Still 200F, still resolvable --
+    the bot has to be able to say what a door in that band is."""
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.facility_for_dock("30", "200") == "200F"
+    assert ai_engine.dock_use("30", "200") == "RM INBOUND"
+
+
+def test_dock_outside_every_band_resolves_to_nothing(clean_location_cache):
+    """Upper bounds are approximate and 46 sits between two bands, so an
+    unmapped door must not be forced into the nearest one."""
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.facility_for_dock("46", "200") is None
+    assert ai_engine.facility_for_dock("120", "200") is None
+    assert ai_engine.dock_use("46", "200") is None
+
+
+def test_dock_bands_do_not_reach_across_sites(clean_location_cache):
+    """Door numbers repeat everywhere; only 200 has bands recorded, so a door
+    at Eagle 2 must not resolve to a 200 building."""
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.facility_for_dock("3", "E2") is None
+
+
+def test_yard_and_blanks_are_not_docks(clean_location_cache):
+    _load_dock_bands(clean_location_cache)
+    assert ai_engine.facility_for_dock("YARD", "200") is None
+    assert ai_engine.facility_for_dock(None, "200") is None
+    assert ai_engine.facility_for_dock("", "200") is None
+
+
+def test_no_bands_loaded_resolves_to_nothing(clean_location_cache):
+    """Before docks.csv is seeded, every caller falls back."""
+    assert ai_engine.facility_for_dock("3", "200") is None
+    assert ai_engine.dock_use("3", "200") is None

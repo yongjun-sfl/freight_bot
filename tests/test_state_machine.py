@@ -1563,3 +1563,234 @@ async def test_a_real_trailer_number_is_still_kept(pool):
                load_status="EMPTY"),
     )
     assert (await get_leg(pool, res["leg_id"]))["trailer_number"] == "77208"
+
+
+# --------------------------------------------------------------------------
+# The BOL says where the load is going, even when the driver does not
+# --------------------------------------------------------------------------
+
+async def test_pickup_with_no_destination_takes_it_from_the_bol(pool):
+    """From live data, 08/28 14:24. "Load trailer pickup sds dock28 #77209"
+    arrived captioning a BOL consigned to 200 Momeni Lane -- Adairsville, the
+    200 site. The driver named no destination, so the run was carded at best
+    and lost at worst; the paperwork in the same message said where it went."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               destination_location="SDS", door_number="28",
+               text_trailer="77209", load_status="LOADED",
+               bol_number="082728_LFN2OFN213", document_type="FG",
+               primary_image_blob=IMG, bol_destination="200F"),
+    )
+    assert res["is_clean"] is True, res["card_text"]
+
+    inbound = await get_leg(pool, trip)
+    assert inbound["leg_status"] == "COMPLETED", "the run into SDS still ends here"
+    assert inbound["arrival_time"] is not None
+
+    outbound = await get_leg(pool, res["leg_id"])
+    assert outbound["id"] != trip
+    assert outbound["origin_location"] == "SDS"
+    assert outbound["destination_location"] == "200F"
+    assert outbound["load_status"] == "LOADED"
+    assert outbound["trailer_number"] == "77209"
+    assert outbound["bol_number"] == "082728_LFN2OFN213"
+    assert outbound["leg_status"] == "IN_TRANSIT"
+    assert outbound["is_positioning_leg"] == 0
+
+
+async def test_hooked_load_read_as_a_yard_move_also_takes_the_bol_ship_to(pool):
+    """The same message when the parser files it CASE 3 instead of CASE 2."""
+    await seed_network(pool)
+    await insert_leg(pool, destination_location="SDS", leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               origin_location="SDS", destination_location="SDS",
+               destination_dock="28", text_trailer="77209",
+               load_status="LOADED", bol_destination="200F"),
+    )
+    assert res["is_clean"] is True, res["card_text"]
+    leg = await get_leg(pool, res["leg_id"])
+    assert (leg["origin_location"], leg["destination_location"]) == ("SDS", "200F")
+    assert leg["is_positioning_leg"] == 0
+
+
+async def test_orphan_hooked_load_takes_the_bol_ship_to(pool):
+    """No open trip to attach the arrival to, but the departure is still real."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               destination_location="SDS", door_number="28",
+               text_trailer="77209", load_status="LOADED",
+               bol_destination="200F"),
+    )
+    assert res["is_clean"] is True, res["card_text"]
+    leg = await get_leg(pool, res["leg_id"])
+    assert (leg["origin_location"], leg["destination_location"]) == ("SDS", "200F")
+
+
+async def test_case_1_departure_with_no_destination_takes_the_bol_ship_to(pool):
+    """A departure the parser read as CASE 1 but could name no destination for."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               origin_location="SDS", text_trailer="77209",
+               load_status="LOADED", bol_number="B9", document_type="FG",
+               primary_image_blob=IMG, bol_destination="200F"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["destination_location"] == "200F"
+    assert res["is_clean"] is True, res["card_text"]
+
+
+async def test_the_driver_outranks_the_bol_on_where_the_load_is_going(pool):
+    """Paperwork only fills a silence. A stated destination is first-hand."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Load trailer pickup sds to 7634",
+               origin_location="SDS", destination_location="7634",
+               text_trailer="77209", load_status="LOADED",
+               bol_number="B8", document_type="FG", primary_image_blob=IMG,
+               bol_destination="200F"),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["destination_location"] == "7634"
+
+
+async def test_a_duplicate_bol_ship_to_is_not_trusted(pool):
+    """A BOL already on another leg is the previous load's, so its consignee is
+    the previous load's too. Falls back to the card."""
+    await seed_network(pool)
+    await insert_leg(pool, bol_number="B7", destination_location="SDS",
+                     leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load trailer pickup sds dock28 #77209",
+               destination_location="SDS", door_number="28",
+               text_trailer="77209", load_status="LOADED",
+               bol_number="B7", bol_destination="200F"),
+    )
+    assert res["is_clean"] is False
+    assert "Load Picked Up With No Destination" in res["card_text"]
+
+
+async def test_a_ship_to_at_the_site_the_load_was_hooked_is_not_a_trip(pool):
+    """Paperwork consigned to where the driver is standing describes the load
+    that just arrived, not one leaving."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load trailer pickup 200 r #47",
+               destination_location="200R", door_number="47",
+               text_trailer="77209", load_status="LOADED",
+               bol_destination="200F"),
+    )
+    assert res["is_clean"] is False
+    assert "Load Picked Up With No Destination" in res["card_text"]
+
+
+# --------------------------------------------------------------------------
+# A delivered load leaves an empty trailer
+# --------------------------------------------------------------------------
+
+async def test_a_receiver_stamped_pod_departs_empty(pool):
+    """From live data, 08/28 13:38: "Finish live unloading at pactra #10
+    Sokhwanyun heading to sds", captioning a BOL stamped by the receiver. The
+    run to SDS was booked LOADED -- inherited from the leg that had just ended,
+    because nothing in the chain read the completion or the stamp."""
+    await seed_network(pool)
+    # The inbound run carries its own paperwork, as a LOADED departure must.
+    # Without it the CASE 1 auto-heal claims this message's BOL for that leg
+    # and the onward trip is never reached.
+    await insert_leg(pool, origin_location="SDS", destination_location="200F",
+                     load_status="LOADED", leg_status="IN_TRANSIT",
+                     bol_number="082726_LFN2_OFN2_8_IN", bol_image=IMG)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Finish live unloading at pactra #10 heading to sds",
+               origin_location="200F", destination_location="SDS",
+               door_number="10", work_finished=True,
+               receiver_signed=True, primary_image_blob=IMG,
+               bol_number="082726_LFN2_OFN2_8", document_type="FG"),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["load_status"] == "EMPTY"
+
+
+async def test_a_finished_unload_departs_empty_with_no_photo(pool):
+    """The same report with no paperwork attached. Drivers often send one."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="SDS", destination_location="200F",
+                     load_status="LOADED", leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Finish live unloading at pactra #10 heading to sds",
+               origin_location="200F", destination_location="SDS",
+               door_number="10", work_finished=True),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["load_status"] == "EMPTY"
+
+
+async def test_a_finished_live_LOAD_still_departs_loaded(pool):
+    """work_finished says a live job ended, not which kind. Loading fills the
+    trailer; unloading empties it."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="E2F", destination_location="200F",
+                     load_status="EMPTY", leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="live loading finished load 200 to E2F",
+               origin_location="200F", destination_location="E2F",
+               work_finished=True, bol_number="B6", document_type="RM",
+               primary_image_blob=IMG),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["load_status"] == "LOADED"
+
+
+async def test_hooking_the_next_load_cancels_the_delivered_empty(pool):
+    """Unloaded and reloaded at the same door: full again by the end of the
+    message, stamped POD or not."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="SDS", destination_location="200F",
+                     load_status="LOADED", leg_status="IN_TRANSIT")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="finished unloading at 200, pick up load to E2F",
+               origin_location="200F", destination_location="E2F",
+               work_finished=True, receiver_signed=True,
+               bol_number="B5", document_type="RM", primary_image_blob=IMG),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["load_status"] == "LOADED"
+
+
+async def test_the_driver_outranks_the_stamp_on_load_status(pool):
+    """An explicit "loaded" in the message is first-hand and wins."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="unloading finished, loaded 200 to E2F",
+               origin_location="200F", destination_location="E2F",
+               work_finished=True, receiver_signed=True,
+               load_status="LOADED", bol_number="B4", document_type="RM",
+               primary_image_blob=IMG),
+    )
+    assert (await get_leg(pool, res["leg_id"]))["load_status"] == "LOADED"

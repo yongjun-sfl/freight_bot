@@ -58,6 +58,10 @@ LOCATION_CACHE = {
     # deciding whether a driver has returned and closed a round.
     "site_map": {},
     "official_name": {},
+    # Street address key -> the codes at that address, for reading a facility
+    # off a BOL's SHIP TO block. 200F and 200R share one address, so a key can
+    # hold several codes.
+    "address_map": {},
     # Door bands, as (first, last, facility, use). At 200 the front building
     # runs 3-21 FG inbound and 22-45 RM inbound, the rear 47-66 RM outbound and
     # 67-99 FG outbound -- so a door number says which building is meant.
@@ -65,12 +69,55 @@ LOCATION_CACHE = {
 }
 
 
+# House number plus street name, anchored at the start so a zip ("GA 30103")
+# cannot be read as one. Everything after is dropped: city, state and zip
+# separate nothing when the whole network is twelve addresses, and the street
+# suffix drifts between the BOL's print and locations.csv ("LANE SE" vs "Ln").
+_ADDRESS_HEAD = re.compile(r"^\s*(\d+)\s+([A-Za-z0-9-]+)")
+
+
+def address_key(address: str) -> str:
+    """Comparable form of a street address, or None if it has no street.
+
+    A BOL prints "200 Momeni Lane SE, Adairsville GA 30103" and locations.csv
+    records "200 MOMENI LANE SE, ADAIRSVILLE, GA 30103 (FRONT)". Both reduce
+    to "200 MOMENI", which is what makes the two comparable at all.
+    """
+    match = _ADDRESS_HEAD.match(address or "")
+    if not match:
+        return None
+    number, street = match.groups()
+    return f"{number} {re.sub(r'[^A-Z0-9]', '', street.upper())}"
+
+
+def facility_for_address(address: str) -> str:
+    """The facility code at a street address, or None if it cannot be told.
+
+    Front/rear pairs share an address, so a match on 200 Momeni Lane is
+    ambiguous between 200F and 200R. It resolves only when the site has a bare
+    spoken form -- drivers say "200" and mean the front -- and stays None
+    otherwise rather than guessing a building. Guessing would put the leg on
+    the wrong half of a yard, which is the difference between FG and RM work.
+    """
+    key = address_key(address)
+    if not key:
+        return None
+    codes = LOCATION_CACHE["address_map"].get(key) or []
+    if len(codes) == 1:
+        return codes[0]
+    sites = {site_of(code) for code in codes}
+    if len(sites) != 1:
+        return None
+    bare = normalize_location(sites.pop())
+    return bare if bare in set(LOCATION_CACHE["codes"] or []) else None
+
+
 async def refresh_location_cache(pool):
     """Loads canonical location codes and aliases from MySQL into memory."""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                f"""SELECT canonical_code, aliases, site_code, official_name 
+                f"""SELECT canonical_code, aliases, site_code, official_name, address 
                       FROM {TABLE_LOCATION_CODES} 
                      WHERE is_active = TRUE;"""
             )
@@ -80,13 +127,17 @@ async def refresh_location_cache(pool):
             alias_map = {}
             site_map = {}
             official = {}
-            for code, aliases, site, official_name in rows:
+            addresses = {}
+            for code, aliases, site, official_name, address in rows:
                 code_upper = code.strip().upper()
                 codes.append(code_upper)
                 alias_map[code_upper] = code_upper
                 site_map[code_upper] = (site or code).strip().upper()
                 if official_name:
                     official[code_upper] = official_name.strip()
+                key = address_key(address)
+                if key:
+                    addresses.setdefault(key, []).append(code_upper)
                 
                 if aliases:
                     for alias in aliases.split(','):
@@ -98,6 +149,7 @@ async def refresh_location_cache(pool):
             LOCATION_CACHE["alias_map"] = alias_map
             LOCATION_CACHE["site_map"] = site_map
             LOCATION_CACHE["official_name"] = official
+            LOCATION_CACHE["address_map"] = addresses
 
             await cur.execute(
                 f"""SELECT facility_code, first_dock, last_dock, dock_use 
@@ -190,6 +242,10 @@ def convert_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:
 def compress_image(image_bytes: bytes, max_dim: int = 1800) -> bytes:
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        # Screenshots arrive as RGBA PNGs, and JPEG has no alpha channel, so
+        # saving one raised and the whole image was sent uncompressed.
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
         img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         out = io.BytesIO()
         img.save(out, format="JPEG", quality=90)
@@ -378,7 +434,9 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - Set to "RM" if the document explicitly contains "Reservation No.", "Reservation #", "Res #", "Reservation", or raw material component identifiers.
    - Set to "FG" if the document contains standard "Bill of Lading", "BOL #", "Delivery #", or customer finished goods shipment details.
 4. "trailer_number": Search the document, door decals, or bumper prints for trailer or equipment identifiers (e.g., "77344").
-4b. "do_number": ONLY if "DO", "D.O." or a "D021" style token appears as or beside the number, as in "DO# 34", "D.O. 34" or "D021". SDS clerks hand-write this yard slot so a driver can find a trailer in a large yard. Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If the letters DO are not present, return null.
+4b. "do_number": the HAND-WRITTEN yard slot an SDS clerk marks on the page so a driver can find the trailer in a large yard, written "DO# 34", "D.O. 34", "DO33" or as a single token like "D021", "D027". Return JUST THE DIGITS, dropping any leading zeros: "DO# 34" -> "34", "DO33" -> "33", "D021" -> "21".
+   - It must be handwritten. Many of these forms have a PRINTED "Do No." field carrying the shipper's own delivery-order reference, which is typically long and looks like the BOL number ("082726_LFN2_OFN2_13"). That is not a yard slot; return null rather than that value.
+   - Do NOT return a number that merely looks like a slot -- a bare handwritten "#47" is a dock, not a DO number. If no hand-written DO mark is present, return null.
 
 4c. "dock_number": a hand-written "#NN" with no other label is the dock the trailer was loaded at or delivered to. Return just the digits, e.g. "#47" -> "47". Return null if absent.
 
@@ -392,10 +450,14 @@ def extract_bol_locally(files: list[bytes]) -> dict:
    - "batch_no": if the REMARK reads "Batch# 0001836335", return just "0001836335". This is issued separately by the receiving manager and is their reference, so it must not be left inside the remark text.
    - "remark": anything else in REMARK, or null
 
+4f. "ship_from_address" and "ship_to_address": the street addresses printed in the SHIP FROM / SHIPPER block and the SHIP TO / CONSIGNEE block. Copy the street line exactly as printed, e.g. "200 Momeni Lane SE, Adairsville GA 30103". Return null for a block that is absent or blank. Read both even if only one is asked for elsewhere -- the two blocks sit side by side and telling them apart is the whole point.
+   - These describe the CONSIGNMENT, not the driver's current trip. A trailer loaded at one plant is often staged at a warehouse and hauled onward by someone else, so SHIP FROM is frequently NOT where this driver hooked it.
+
 5. "shipper_signed": True only if the ORIGIN or SHIPPER side carries a hand-written signature, initials, or a department/company stamp authorising release (an "RM DEPT" stamp from the pick-up company counts).
-6. "receiver_signed": True only if the DELIVERY or CONSIGNEE section specifically carries a hand-written signature or initials from whoever received the goods.
-   - Be conservative. A stamp from the SHIPPING company, a date, a dock number, or any other handwriting elsewhere on the page is NOT a receiver signature.
-   - Reporting a receipt that did not happen is far worse than missing one: it silently satisfies a compliance check that exists to catch missing proof of delivery. When unsure, return False.
+6. "receiver_signed": True only if the RECEIVER SIGNATURE / RECEIVED BY / CONSIGNEE section carries a mark from whoever took the goods.
+   - A rubber-stamped company name and date inside that block counts, and is now the usual case: the receiving warehouses switched from hand-written signatures to a stamp. A stamp reading e.g. "PACTRA RE PLUS, INC." with a date over the Receiver Signature line IS a receiver signature.
+   - What decides it is WHICH BLOCK the mark sits in, not whether it is handwriting. A stamp or signature over the SHIPPER / carrier / driver line is not a receipt, and neither is a date, a dock number or handwriting anywhere else on the page.
+   - Reporting a receipt that did not happen is far worse than missing one: it silently satisfies a compliance check that exists to catch missing proof of delivery. If the receiver block is blank, return False.
 
 Return raw JSON ONLY:
 {
@@ -407,6 +469,8 @@ Return raw JSON ONLY:
   "do_number": string or null,
   "dock_number": string or null,
   "rm_seq": string or null,
+  "ship_from_address": string or null,
+  "ship_to_address": string or null,
   "materials": [
     {"material_code": string, "description": string, "qty": string,
      "weight": string or null, "cont_no": string or null,
@@ -423,6 +487,12 @@ Return raw JSON ONLY:
         "do_number": None,
         "dock_number": None,
         "rm_seq": None,
+        "ship_to_address": None,
+        # Where the paperwork says the load is going, resolved to a facility
+        # code. Deliberately no ship_from twin: the shipper is where the goods
+        # started, not where this driver hooked them, and offering it invites
+        # it to be used as an origin.
+        "bol_destination": None,
         "materials": [],
         "shipper_signed": False,
         "receiver_signed": False,
@@ -469,7 +539,8 @@ Return raw JSON ONLY:
             if data.get("trailer_number") and not result["trailer_number"]:
                 result["trailer_number"] = data["trailer_number"]
 
-            for field in ("do_number", "dock_number", "rm_seq"):
+            for field in ("do_number", "dock_number", "rm_seq",
+                          "ship_to_address"):
                 if data.get(field) and not result[field]:
                     result[field] = data[field]
 
@@ -492,6 +563,12 @@ Return raw JSON ONLY:
             logger.warning(f"Vision OCR scan error on image {idx+1}: {e}")
 
     result["ocr_failed"] = scan_errors == len(processed_images)
+    result["bol_destination"] = facility_for_address(result["ship_to_address"])
+    if result["ship_to_address"] and not result["bol_destination"]:
+        logger.info(
+            f"BOL ship-to {result['ship_to_address']!r} matches no known "
+            f"facility address; destination not inferred."
+        )
     return result
 
 
@@ -510,6 +587,7 @@ async def prepare_text_intent(text: str) -> dict:
         "document_type": "UNKNOWN",
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
+        "bol_destination": None,
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),
@@ -564,6 +642,9 @@ async def prepare_image_intent(images: list[bytes], caption_text: str, loop) -> 
         "document_type": ocr_data.get("document_type", "UNKNOWN"),
         "origin_location": llm_parsed.get("origin_location"),
         "destination_location": llm_parsed.get("destination_location"),
+        # Read off the SHIP TO block. Only ever a fallback: the driver saying
+        # where they are taking it outranks what the paperwork says.
+        "bol_destination": ocr_data.get("bol_destination"),
         "door_number": llm_parsed.get("door_number"),
         "origin_dock": llm_parsed.get("origin_dock"),
         "destination_dock": llm_parsed.get("destination_dock"),

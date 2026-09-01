@@ -129,6 +129,7 @@ def clean_location_cache():
     ai_engine.LOCATION_CACHE["codes"] = []
     ai_engine.LOCATION_CACHE["alias_map"] = {}
     ai_engine.LOCATION_CACHE["site_map"] = {}
+    ai_engine.LOCATION_CACHE["address_map"] = {}
     ai_engine.LOCATION_CACHE["dock_bands"] = []
     saved_routes = {k: (set(v) if isinstance(v, set) else dict(v))
                     for k, v in routes_mod.ROUTE_CACHE.items()}
@@ -267,6 +268,7 @@ def intent(**overrides) -> dict:
         "document_type": "UNKNOWN",
         "origin_location": None,
         "destination_location": None,
+        "bol_destination": None,
         "door_number": None,
         "action": None,
         "load_status": None,

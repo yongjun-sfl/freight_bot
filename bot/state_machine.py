@@ -34,6 +34,12 @@ PICKUP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Tells a finished unload from a finished load. `work_finished` says a live
+# job completed but not which kind, and the two leave the trailer in opposite
+# states. Matched on a word boundary so "unloading" is never read as loading.
+UNLOAD_PATTERN = re.compile(r"\bunload(?:s|ed|ing)?\b", re.IGNORECASE)
+LOAD_PATTERN = re.compile(r"\bload(?:s|ed|ing)?\b", re.IGNORECASE)
+
 
 async def commit_trip_leg(
     p,
@@ -88,15 +94,44 @@ async def commit_trip_leg(
     # Detect Bobtail Flag
     is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(raw_text) else 0
 
+    # The driver has just handed the load over, so whatever they do next they
+    # do with an empty trailer. Two independent signals because neither is
+    # always present: a receiver-stamped POD is first-hand evidence off the
+    # paperwork (the consignees moved from signing to stamping recently), and
+    # work_finished covers the report that arrives with no photo.
+    #
+    # This replaces a test on action_type for "UNLOAD_COMPLETED" and
+    # "FINISHED_UNLOAD", neither of which the parser can emit -- its action
+    # vocabulary is LIVE_UNLOAD / DROP_DOCK / DROP_YARD / DROP_DOOR /
+    # BOBTAIL_ARRIVE. The branch never once fired, so "Finish live unloading at
+    # pactra #10 heading to sds" fell through to inheriting the load status of
+    # the leg that had just ended, and the empty run to SDS was booked LOADED.
+    #
+    # Hooking the next load in the same breath ("finished unloading, picking up
+    # load to E2F") leaves the trailer full again, so a pickup cancels it.
+    work_finished = bool(intent.get("work_finished"))
+    unload_reported = bool(UNLOAD_PATTERN.search(raw_text))
+    just_delivered = bool(
+        (receiver_signed or (work_finished and unload_reported))
+        and not PICKUP_PATTERN.search(raw_text)
+    )
+    # The mirror: a finished live LOAD sends the trailer out full. This is what
+    # the removed action_type == "LIVE_LOAD" branch was reaching for, and it
+    # never fired either -- so "live loading finished load 200 to E2F" also
+    # inherited its load status from the leg that had just ended, which for a
+    # driver who arrived empty to load meant departing EMPTY with a full trailer.
+    just_loaded = bool(work_finished and not unload_reported
+                       and LOAD_PATTERN.search(raw_text))
+
     # Extended Fallback Logic for Load Status
     if is_bobtail_flag or parsed_load_status == "BOBTAIL":
         load_status_val = "EMPTY"
         is_bobtail_flag = 1
     elif parsed_load_status and parsed_load_status not in ["UNKNOWN", "NULL", "NONE"]:
         load_status_val = parsed_load_status
-    elif action_type in ["UNLOAD_COMPLETED", "FINISHED_UNLOAD"]:
+    elif just_delivered:
         load_status_val = "EMPTY"
-    elif action_type in ["LIVE_LOAD", "HOOK"]:
+    elif just_loaded:
         load_status_val = "LOADED"
     elif "load pickup" in raw_lower or "pick up" in raw_lower:
         load_status_val = "LOADED"
@@ -116,6 +151,12 @@ async def commit_trip_leg(
                 )
                 last_status_row = await cur.fetchone()
                 load_status_val = last_status_row[0] if (last_status_row and last_status_row[0]) else "LOADED"
+
+    # Hooking a load is the start of a trip, never a yard shuffle and never
+    # just an arrival. Which case the parser filed the message under does not
+    # change that, so the test lives here rather than inside one branch.
+    is_load_pickup = bool(load_status_val == "LOADED"
+                          and PICKUP_PATTERN.search(raw_text))
 
     async with p.acquire() as conn:
         async with conn.cursor() as cur:
@@ -316,6 +357,116 @@ async def commit_trip_leg(
                 await finish_rm_load(cur, target_leg, msg_timestamp)
                 return target_leg
 
+            async def open_departure_leg(origin, destination, trailer):
+                """Insert a new IN_TRANSIT leg for a trip that is starting.
+
+                Shared by CASE 1 and by the paths that recognise a hooked load
+                as a departure the driver never announced as one. Reads
+                bol_number, document_type, primary_image_blob and
+                shipper_signed at call time, so a stale BOL cleared above is
+                already gone by the time the row is written.
+                """
+                round_and_route = await resolve_round(origin, destination)
+                await cur.execute(
+                    f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
+                           user_id, 
+                           trailer_number, 
+                           bol_number, 
+                           document_type,
+                           origin_location, 
+                           destination_location, 
+                           departure_time, 
+                           arrival_action, 
+                           bol_image, 
+                           dock_number, 
+                           shipper_signed, 
+                           is_bobtail, 
+                           leg_status, 
+                           load_status,
+                           round_number,
+                           route_code,
+                           load_type,
+                           trip_seq
+                       ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s, %s);""",
+                    (
+                        did, trailer, bol_number, document_type, origin, destination,
+                        msg_timestamp, action_type, primary_image_blob, door_num,
+                        1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
+                        *round_and_route,
+                        classify_load(origin, destination, load_status_val,
+                                      round_and_route[1]),
+                        await next_trip_seq(),
+                    )
+                )
+                await conn.commit()
+                leg_id = cur.lastrowid
+
+                # RM consignments carry line items the receiving departments
+                # at E2F and E2R report on, so they are kept in their own
+                # tables rather than flattened into the leg.
+                await record_rm_load(cur, leg_id, intent, origin, destination,
+                                     trailer, msg_timestamp,
+                                     driver_id=did, driver_name=user_name)
+                await conn.commit()
+                return leg_id
+
+            async def start_hooked_load(where, position, trailer, arrival_leg=None):
+                """Record a load hooked with no destination said aloud.
+
+                The BOL's SHIP TO is the only other statement of where the load
+                is going, and it is the better of the two -- printed by the
+                shipper, not typed one-handed at a dock. It is consulted ONLY
+                when the driver named nowhere, and never when the paperwork is
+                a duplicate: a BOL already sitting on another leg is the
+                previous load's, so its consignee is the previous load's too.
+
+                Falls back to the card when the paperwork cannot say either.
+                """
+                paperwork_dest = intent.get("bol_destination")
+                if paperwork_dest and await find_duplicate_bol_leg():
+                    logger.warning(
+                        f"BOL '{bol_number}' is already recorded on another leg; "
+                        f"not trusting its ship-to as a destination."
+                    )
+                    paperwork_dest = None
+                # A consignee at the site they are standing on is not a trip.
+                if paperwork_dest and site_of(paperwork_dest) == site_of(where):
+                    logger.info(
+                        f"BOL ship-to {paperwork_dest} is the site the load was "
+                        f"hooked at ({where}); not recording a leg."
+                    )
+                    paperwork_dest = None
+
+                if not paperwork_dest:
+                    logger.warning(
+                        f"Driver #{did} picked up a load at {where} without "
+                        f"naming a destination; carding for dispatch."
+                    )
+                    return {
+                        "is_clean": False,
+                        "leg_id": arrival_leg,
+                        "card_text": pickup_with_no_destination(
+                            where, position, trailer),
+                    }
+
+                # Two legs open at once would leave the arrival half-recorded
+                # and skew every dwell measured off it. Hooking a load means
+                # whatever they were doing here is over.
+                if arrival_leg:
+                    await cur.execute(
+                        f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                               SET leg_status = 'COMPLETED' 
+                             WHERE id = %s;""",
+                        (arrival_leg,)
+                    )
+                leg_id = await open_departure_leg(where, paperwork_dest, trailer)
+                logger.info(
+                    f"Driver #{did} hooked a load at {where} without naming a "
+                    f"destination; BOL ship-to gives {paperwork_dest}. "
+                    f"Recorded as Leg #{leg_id}."
+                )
+                return {"is_clean": True, "leg_id": leg_id, "card_text": None}
+
             def pickup_with_no_destination(where, position, trailer):
                 """Card for a load hooked with nowhere recorded to take it.
 
@@ -500,6 +651,19 @@ async def commit_trip_leg(
                     if not dest_loc or dest_loc in ["UNKNOWN", "NONE", "NULL", "MISSING_DEST"]:
                         dest_loc = raw_dest.strip().upper() if raw_dest else "UNKNOWN"
 
+                    # Still nowhere to go, but the load is carrying paperwork
+                    # that says where it is consigned. Only reached when the
+                    # driver named no destination at all, and skipped for a
+                    # duplicate BOL, whose ship-to belongs to the previous load.
+                    if (dest_loc == "UNKNOWN" and not duplicate_of
+                            and intent.get("bol_destination")
+                            and site_of(intent["bol_destination"]) != site_of(origin_loc)):
+                        dest_loc = intent["bol_destination"]
+                        logger.info(
+                            f"Driver #{did} named no destination; BOL ship-to "
+                            f"gives {dest_loc}."
+                        )
+
                     if not display_trailer or display_trailer == "UNKNOWN":
                         display_trailer = last_leg[1] if (last_leg and last_leg[1]) else "UNKNOWN"
 
@@ -518,51 +682,8 @@ async def commit_trip_leg(
                         (msg_timestamp, did)
                     )
 
-                    round_and_route = await resolve_round(origin_loc, dest_loc)
-                    rm_dock = intent.get("dock_number") or door_num
-
-                    # Insert new departure leg
-                    await cur.execute(
-                        f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
-                               user_id, 
-                               trailer_number, 
-                               bol_number, 
-                               document_type,
-                               origin_location, 
-                               destination_location, 
-                               departure_time, 
-                               arrival_action, 
-                               bol_image, 
-                               dock_number, 
-                               shipper_signed, 
-                               is_bobtail, 
-                               leg_status, 
-                               load_status,
-                               round_number,
-                               route_code,
-                               load_type,
-                               trip_seq
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s, %s);""",
-                        (
-                            did, display_trailer, bol_number, document_type, origin_loc, dest_loc,
-                            msg_timestamp, action_type, primary_image_blob, door_num,
-                            1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
-                            *round_and_route,
-                            classify_load(origin_loc, dest_loc, load_status_val,
-                                          round_and_route[1]),
-                            await next_trip_seq(),
-                        )
-                    )
-                    await conn.commit()
-                    leg_id = cur.lastrowid
-
-                    # RM consignments carry line items the receiving departments
-                    # at E2F and E2R report on, so they are kept in their own
-                    # tables rather than flattened into the leg.
-                    await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
-                                         display_trailer, msg_timestamp,
-                                         driver_id=did, driver_name=user_name)
-                    await conn.commit()
+                    leg_id = await open_departure_leg(
+                        origin_loc, dest_loc, display_trailer)
 
                     # ALERT GUARD 0: Stale BOL. Takes precedence over the paperwork
                     # guards below, which would otherwise fire on the fields just
@@ -734,6 +855,20 @@ async def commit_trip_leg(
                         await conn.commit()
                         logger.info(f"✅ Driver #{did} arrived at {dest_loc}. Leg #{leg_id} updated to {target_status}.")
 
+                        # The same message announced an arrival and the next
+                        # hook. "Load trailer pickup sds dock28 #77209" is filed
+                        # as an arrival -- a facility, a door, no travel named --
+                        # so the load leaving again was recorded nowhere at all,
+                        # not even as a card, and the whole SDS -> 200 run
+                        # vanished from the day.
+                        if is_load_pickup:
+                            hooked_at = (dest_loc if dest_loc != "UNKNOWN"
+                                         else booked_destination)
+                            if hooked_at:
+                                return await start_hooked_load(
+                                    hooked_at, door_num,
+                                    text_trailer or ocr_trailer, leg_id)
+
                         if wrong_destination:
                             logger.warning(
                                 f"Driver #{did} was routed to {booked_destination} "
@@ -757,20 +892,16 @@ async def commit_trip_leg(
                     # No open trip. A plain "arrived" with nothing running is
                     # nothing to record, but a LOADED pickup is a departure the
                     # driver forgot to announce.
-                    if (load_status_val == "LOADED"
-                            and PICKUP_PATTERN.search(raw_text)
-                            and origin_loc != "UNKNOWN"):
-                        logger.warning(
-                            f"Driver #{did} picked up a load at {origin_loc} "
-                            f"without naming a destination; carding for dispatch."
-                        )
-                        return {
-                            "is_clean": False,
-                            "leg_id": None,
-                            "card_text": pickup_with_no_destination(
-                                origin_loc, door_num,
-                                text_trailer or ocr_trailer),
-                        }
+                    #
+                    # The single facility a pickup names is where they hooked,
+                    # whichever field the parser put it in: "pickup sds dock28"
+                    # reads as travel TO sds, so it comes back as the
+                    # destination, and testing origin alone left the message
+                    # silently dropped.
+                    hooked_at = origin_loc if origin_loc != "UNKNOWN" else dest_loc
+                    if is_load_pickup and hooked_at != "UNKNOWN":
+                        return await start_hooked_load(
+                            hooked_at, door_num, text_trailer or ocr_trailer)
 
                     return {"is_clean": True, "leg_id": None, "card_text": None}
 
@@ -1019,12 +1150,11 @@ async def commit_trip_leg(
                         origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
                         and origin_loc != dest_loc
                     )
-                    # Hooking a load is the start of a trip, never a yard move:
-                    # the driver just left the destination out.
+                    # A hooked load is a departure, not a yard move: the
+                    # driver just left the destination out.
                     loaded_pickup = bool(
-                        load_status_val == "LOADED" and from_dock is None
+                        is_load_pickup and from_dock is None
                         and not named_two_places
-                        and PICKUP_PATTERN.search(raw_text)
                     )
                     await cur.execute(
                         f"""SELECT id, destination_location
@@ -1091,17 +1221,9 @@ async def commit_trip_leg(
                             # arrival is safe now; the onward trip is not, so it
                             # still has to be raised.
                             if loaded_pickup:
-                                logger.warning(
-                                    f"Driver #{did} picked up a load at {facility} "
-                                    f"without naming a destination; carding."
-                                )
-                                return {
-                                    "is_clean": False,
-                                    "leg_id": trip_id,
-                                    "card_text": pickup_with_no_destination(
-                                        facility, to_dock or door_num,
-                                        display_trailer),
-                                }
+                                return await start_hooked_load(
+                                    facility, to_dock or door_num,
+                                    display_trailer, trip_id)
                             return {"is_clean": True, "leg_id": trip_id,
                                     "card_text": None}
 
@@ -1137,21 +1259,14 @@ async def commit_trip_leg(
                                 f"not end there; completion not stamped."
                             )
 
-                    # Carded rather than recorded: the dispatcher reads the
-                    # destination off the arrival that follows, and only needs to
-                    # know the message happened. A leg to UNKNOWN would instead
-                    # enter a round and a route as if it were a real trip.
+                    # Recorded if the paperwork says where it is consigned,
+                    # carded otherwise -- the dispatcher then reads the
+                    # destination off the arrival that follows and only needs to
+                    # know the message happened. Either way no leg to UNKNOWN is
+                    # written; that would enter a round and a route as if real.
                     if loaded_pickup and facility != "UNKNOWN":
-                        logger.warning(
-                            f"Driver #{did} picked up a load at {facility} "
-                            f"without naming a destination; carding for dispatch."
-                        )
-                        return {
-                            "is_clean": False,
-                            "leg_id": None,
-                            "card_text": pickup_with_no_destination(
-                                facility, to_dock or door_num, display_trailer),
-                        }
+                        return await start_hooked_load(
+                            facility, to_dock or door_num, display_trailer)
 
                     # Drivers report one move more than once -- typically the
                     # signed paperwork first and a photo of the parked trailer a

@@ -247,3 +247,75 @@ def test_no_bands_loaded_resolves_to_nothing(clean_location_cache):
     """Before docks.csv is seeded, every caller falls back."""
     assert ai_engine.facility_for_dock("3", "200") is None
     assert ai_engine.dock_use("3", "200") is None
+
+
+# --------------------------------------------------------------------------
+# Reading a facility off a BOL's SHIP TO block
+# --------------------------------------------------------------------------
+
+def _load_addresses(cache):
+    """The network as locations.csv records it, addresses only."""
+    cache["codes"].extend(["200F", "200R", "E2F", "E2R", "SDS", "7634", "300"])
+    cache["alias_map"].update({c: c for c in cache["codes"]})
+    cache["alias_map"]["200"] = "200F"
+    cache["site_map"].update({
+        "200F": "200", "200R": "200", "E2F": "E2", "E2R": "E2",
+        "SDS": "SDS", "7634": "7634", "300": "300",
+    })
+    cache["address_map"].update({
+        "200 MOMENI": ["200F", "200R"],
+        "310 NEXUS": ["E2F", "E2R"],
+        "128 INNOVATION": ["SDS"],
+        "7634 GA140": ["7634"],
+        "300 INTERNATIONAL": ["300"],
+    })
+
+
+def test_address_key_survives_how_the_two_sides_print_it(clean_location_cache):
+    """The BOL prints "200 Momeni Lane SE, Adairsville GA 30103" and
+    locations.csv records "200 MOMENI LANE SE, ADAIRSVILLE, GA 30103 (FRONT)"."""
+    assert (ai_engine.address_key("200 Momeni Lane SE, Adairsville GA 30103")
+            == ai_engine.address_key(
+                "200 MOMENI LANE SE, ADAIRSVILLE, GA 30103 (FRONT)"))
+    assert ai_engine.address_key("7634 GA-140, Adairsville GA 30103") == "7634 GA140"
+
+
+def test_a_street_number_is_not_enough_on_its_own(clean_location_cache):
+    """300 Nexus Dr and 300 International Pkwy are different places."""
+    assert (ai_engine.address_key("300 NEXUS DR, DALTON, GA 30721")
+            != ai_engine.address_key("300 INTERNATIONAL PKWY, ADAIRSVILLE, GA 30103"))
+
+
+def test_a_zip_is_not_read_as_a_street(clean_location_cache):
+    assert ai_engine.address_key("Adairsville, GA 30103") is None
+    assert ai_engine.address_key("") is None
+    assert ai_engine.address_key(None) is None
+
+
+def test_ship_to_resolves_to_a_facility(clean_location_cache):
+    _load_addresses(clean_location_cache)
+    assert (ai_engine.facility_for_address("128 Innovation Dr, Dalton GA 30721")
+            == "SDS")
+    assert ai_engine.facility_for_address("7634 GA-140, Adairsville GA") == "7634"
+
+
+def test_a_shared_address_resolves_to_the_bare_site(clean_location_cache):
+    """200F and 200R share one street address. Drivers say "200" and mean the
+    front, so that is what a consignment to 200 Momeni Lane means."""
+    _load_addresses(clean_location_cache)
+    assert (ai_engine.facility_for_address("200 Momeni Lane SE, Adairsville GA")
+            == "200F")
+
+
+def test_a_shared_address_with_no_bare_form_stays_unknown(clean_location_cache):
+    """Nobody says "E2" for a building, so a consignment to 310 Nexus Dr cannot
+    be placed at the front or the rear. Guessing would put the leg on the wrong
+    half of the plant, which is the difference between FG and RM work."""
+    _load_addresses(clean_location_cache)
+    assert ai_engine.facility_for_address("310 Nexus Dr Dalton GA 30721") is None
+
+
+def test_an_address_off_the_network_stays_unknown(clean_location_cache):
+    _load_addresses(clean_location_cache)
+    assert ai_engine.facility_for_address("14 Somewhere Rd, Atlanta GA") is None
+    assert ai_engine.facility_for_address(None) is None

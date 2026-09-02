@@ -242,9 +242,10 @@ async def commit_trip_leg(
                          WHERE user_id = %s 
                            AND is_positioning_leg = 0 
                            AND round_number IS NOT NULL 
+                           AND DATE(departure_time) = DATE(%s)
                       ORDER BY id DESC 
                          LIMIT 1;""",
-                    (did,)
+                    (did, msg_timestamp)
                 )
                 row = await cur.fetchone()
 
@@ -253,8 +254,8 @@ async def commit_trip_leg(
                         f"""SELECT COALESCE(MAX(round_number), 0) 
                               FROM {TABLE_SHUTTLE_LEGS} 
                              WHERE user_id = %s 
-                               AND DATE(departure_time) = CURRENT_DATE();""",
-                        (did,)
+                               AND DATE(departure_time) = DATE(%s);""",
+                        (did, msg_timestamp)
                     )
                     (highest_today,) = await cur.fetchone()
                     return (highest_today or 0) + 1
@@ -274,8 +275,9 @@ async def commit_trip_leg(
                          WHERE user_id = %s 
                            AND round_number = %s 
                            AND is_positioning_leg = 0 
+                           AND DATE(departure_time) = DATE(%s)
                       ORDER BY id ASC;""",
-                    (did, current)
+                    (did, current, msg_timestamp)
                 )
                 legs = await cur.fetchall()
                 anchor = legs[0][0] if legs else None
@@ -300,22 +302,6 @@ async def commit_trip_leg(
                     return number, route_code_for(origin, [destination])
                 return number, SPOT_ROUTE_CODE
 
-            async def next_trip_seq() -> int:
-                """Sequential leg number for this driver today.
-
-                Mirrors the Trip Seq column in the dispatcher's sheet, which
-                exists so rounds can be worked out from the leg order.
-                """
-                await cur.execute(
-                    f"""SELECT COALESCE(MAX(trip_seq), 0) 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE user_id = %s 
-                           AND DATE(departure_time) = CURRENT_DATE();""",
-                    (did,)
-                )
-                (highest,) = await cur.fetchone()
-                return (highest or 0) + 1
-
             async def current_round_number():
                 """The round a within-facility move happened during."""
                 await cur.execute(
@@ -323,9 +309,10 @@ async def commit_trip_leg(
                           FROM {TABLE_SHUTTLE_LEGS} 
                          WHERE user_id = %s 
                            AND round_number IS NOT NULL 
+                           AND DATE(departure_time) = DATE(%s)
                       ORDER BY id DESC 
                          LIMIT 1;""",
-                    (did,)
+                    (did, msg_timestamp)
                 )
                 row = await cur.fetchone()
                 return row[0] if row else None
@@ -335,7 +322,12 @@ async def commit_trip_leg(
 
                 Applies to the leg the driver is ending, which on a merged
                 message ("live loading finished load 200 to E2F") is the leg
-                BEFORE the departure being announced.
+                BEFORE the departure being announced. The job is over, so the
+                leg is marked COMPLETED here and now -- earlier this was
+                stamped each time `finish_rm_load` ran, but when work finished
+                on a CASE 3 yard move ("finish live unloading at pactra #3 move
+                to Dock 47") nothing ever closed the trip leg, and it stayed
+                UNLOADING with a finished time stamped on an open leg.
                 """
                 if target_leg is None:
                     await cur.execute(
@@ -350,7 +342,8 @@ async def commit_trip_leg(
                     return None
                 await cur.execute(
                     f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                           SET finished_time = COALESCE(finished_time, %s) 
+                           SET finished_time = COALESCE(finished_time, %s),
+                               leg_status = 'COMPLETED'
                          WHERE id = %s;""",
                     (msg_timestamp, target_leg)
                 )
@@ -385,9 +378,8 @@ async def commit_trip_leg(
                            load_status,
                            round_number,
                            route_code,
-                           load_type,
-                           trip_seq
-                       ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s, %s);""",
+                           load_type
+                       ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s);""",
                     (
                         did, trailer, bol_number, document_type, origin, destination,
                         msg_timestamp, action_type, primary_image_blob, door_num,
@@ -395,7 +387,6 @@ async def commit_trip_leg(
                         *round_and_route,
                         classify_load(origin, destination, load_status_val,
                                       round_and_route[1]),
-                        await next_trip_seq(),
                     )
                 )
                 await conn.commit()

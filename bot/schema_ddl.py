@@ -114,7 +114,6 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     round_number INT DEFAULT NULL,
     route_code VARCHAR(32) DEFAULT NULL,
     load_type VARCHAR(32) DEFAULT NULL,
-    trip_seq INT DEFAULT NULL,
     is_bobtail TINYINT(1) DEFAULT 0,
     leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -309,9 +308,6 @@ ADDITIVE_COLUMNS = (
     ("load_type",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN load_type VARCHAR(32) DEFAULT NULL AFTER route_code"),
-    ("trip_seq",
-     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
-     "ADD COLUMN trip_seq INT DEFAULT NULL AFTER load_type"),
     ("finished_time",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN finished_time DATETIME DEFAULT NULL AFTER arrival_time"),
@@ -435,6 +431,20 @@ async def apply_schema(cur, db_name: str, logger=None):
                 await cur.execute(alter)
                 if logger:
                     logger.info(f"Added column '{column}' to {table}.")
+
+    # `trip_seq` duplicated `round_number` and is gone. The additive list above
+    # only ADDS columns, so a database that already has the stray column needs
+    # its own idempotent migration to be rid of it.
+    await cur.execute(
+        """SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = 'trip_seq';""",
+        (db_name, TABLE_SHUTTLE_LEGS),
+    )
+    (trip_seq_exists,) = await cur.fetchone()
+    if trip_seq_exists:
+        await cur.execute(f"ALTER TABLE {TABLE_SHUTTLE_LEGS} DROP COLUMN trip_seq;")
+        if logger:
+            logger.info("Dropped redundant column 'trip_seq' from shuttle_legs.")
 
     await cur.execute(
         f"""SELECT COUNT(*)

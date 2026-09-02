@@ -4,21 +4,17 @@ origin_site,destination_site,load_type,note
 200F,E2F,RM,RM out of 200 front to Eagle 2
 200F,E2R,RM,RM out of 200 rear to Eagle 2
 E2R,200R,RM Inbound,RM returning from Eagle 2
+E2F,200R,RM Inbound,RM returning from Eagle 2
 E2R,200F,FG Inbound,FG returning from Eagle 2
 SDS,200F,FG STO,finished goods inbound to 200
 200F,SDS,Spot Delivery,loaded 200->SDS is spot work; run by the FG-only team (200<=>SDS) or the SDS<=>7634 team switching via 200 for a load pickup
 E1,210,FG E1,
-210,E1,FG E1,
 200R,7634,FG ES,
 200F,7634,FG ES,
-7634,200,FG ES,
 SDS,7634,FG DS,
-7634,SDS,FG DS,
 3551,E1,RM 3551,
 3551,E2F,RM 3551,
 3551,E2R,RM 3551,
-E1,3551,RM 3551,
-E2F,3551,RM 3551,
-E2R,3551,RM 3551,
 SDS,300,FG SDS,on hold lane
 1380,300,FG CTV,on hold lane
+100,E2R,Spot Delivery,loaded 100->E2R is spot work; 

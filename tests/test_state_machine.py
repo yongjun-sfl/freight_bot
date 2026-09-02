@@ -864,8 +864,13 @@ async def test_dock_move_across_the_site_records_both_buildings(pool):
     assert move["arrival_action"] == "DOCK_MOVE"
     assert move["load_status"] == "EMPTY"
 
-    # the unload it ends belongs to the trip that brought the load in
-    assert (await get_leg(pool, delivery))["finished_time"] is not None
+    # the unload it ends belongs to the trip that brought the load in, and
+    # finishing it closes that trip leg -- "finish live unloading ... move to
+    # Dock 47" ends the unload, so the SDS->200F leg must not stay UNLOADING
+    # with a finished time stamped on an open leg.
+    delivery_row = await get_leg(pool, delivery)
+    assert delivery_row["finished_time"] is not None
+    assert delivery_row["leg_status"] == "COMPLETED"
 
 
 async def test_a_completion_is_not_stamped_on_a_trip_that_ended_elsewhere(pool):

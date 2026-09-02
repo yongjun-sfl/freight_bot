@@ -9,6 +9,11 @@ counting it would overstate the day's work -- one round of E1 -> 210 -> E1
 delivers one FG E1 load, not two. The exception is the RM circuit, where both
 directions are loaded, giving one round with two loads.
 
+Lanes are keyed by exact facility pair (200F -> E2R, not 200 -> E2) because
+the two halves of one site can carry different cargo: E2R -> 200R is RM
+Inbound while E2R -> 200F is FG Inbound. The site pair is only a fallback,
+and only when it resolves to a single type.
+
 OQC Recall and IQC Recall are not derivable. They look identical to RM on the
 wire (200 -> E2R/E2F) and the distinction lives with the dispatcher, who sets
 it from a dropdown.
@@ -52,18 +57,34 @@ def classify(origin: str, destination: str, load_status: str,
              route_code: str = None) -> str:
     """The load type for a leg, or None if it is not carrying a load.
 
-    Matched on sites, so 200F and 200R both count as 200, and E2F and E2R
-    both as E2 -- the lane is the same regardless of which door was used.
+    Exact lanes win: E2R -> 200R is RM Inbound while E2R -> 200F is FG
+    Inbound, so the door-level lane cannot be collapsed. Only when a lane is
+    NOT in the map does it fall back to the site pair (200F/200R -> 200), and
+    then only if that site pair maps to a *single* load type -- (E2, 200) is
+    both RM Inbound and FG Inbound, so it stays untyped rather than guessed.
     """
     if load_status != "LOADED":
         return None
     if not origin or not destination:
         return None
+    origin_u = origin.strip().upper()
+    destination_u = destination.strip().upper()
 
-    lane = (site_of(origin), site_of(destination))
-    known = LANE_CACHE.get(lane)
+    known = LANE_CACHE.get((origin_u, destination_u))
     if known:
         return known
+
+    # Site fallback, guarded against ambiguity. site_of() is read at call
+    # time because the location cache is only guaranteed populated then.
+    lane = (site_of(origin_u), site_of(destination_u))
+    if lane != (origin_u, destination_u):
+        types = {load_type for (origin_site, destination_site), load_type
+                 in LANE_CACHE.items()
+                 if (site_of(origin_site), site_of(destination_site)) == lane}
+        if len(types) == 1:
+            return types.pop()
+        if len(types) > 1:
+            return None   # ambiguous site pair: better untyped than mislabelled
 
     # A loaded leg on no defined lane is spot work, which is its own category
     # in the dispatcher's sheet.

@@ -49,6 +49,7 @@ services:
       - REPLAY_SHEET=${REPLAY_SHEET:-08282026}
       - REPLAY_PHOTOS=${REPLAY_PHOTOS:-0}
       - REPLAY_DRIVER=${REPLAY_DRIVER:-}
+      - REPLAY_DEBUG=${REPLAY_DEBUG:-0}
     volumes:
       - ./bot:/src/bot:ro
       - ./tools:/tools:ro

@@ -362,8 +362,9 @@ EXTRACTION & NORMALIZATION RULES:
    - Match facility mentions to the KNOWN VALID CODES provided whenever possible.
    - A token that IS one of the KNOWN VALID CODES is a location, never a trailer number, however bare it looks. "7634 unloading finished" means the facility 7634, not trailer 7634. Only assign trailer_number from a value that is NOT a known code.
    - In "<A> ... to <B>" the first facility is the origin and the second the destination, even when other words separate them.
+   - Drivers routinely DROP the word "to": "Empty 200 sds" means EMPTY from 200 to sds. When the message pairs TWO KNOWN VALID CODES without "to" (e.g. "Empty 200 sds", "empty 7634 200", "Empty 200 7634"), the first code is the origin and the second the destination, and it is a departure. Only pick two codes when BOTH are valid codes; a code plus a yard/dock is one location, not two.
    - If a driver uses a shorthand code (e.g., "200" for "200F"), extract the raw shorthand code (e.g., "200").
-   - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F").
+   - Extract origin_location and destination_location in uppercase (e.g., "load pickup 200 to e2f" -> origin_location="200", destination_location="E2F"; "empty 200 sds" -> origin_location="200", destination_location="SDS").
 
 2. Door Numbers vs Locations:
    - Door, bay, or spot identifiers (starting with "#", "door", "dock", "bay", "spot") are NEVER locations, and never destinations. A facility is a code like "200", "E2F" or "SDS"; a door is a position inside one.

@@ -197,6 +197,137 @@ async def test_bobtail_departure_is_empty_and_skips_paperwork_rule(pool):
     assert leg["load_status"] == "EMPTY"
 
 
+async def test_bobtail_with_no_trailer_still_records_a_leg(pool):
+    """Live data 08/28, John Shim: \"Empty drop e2r#4, Bobtail to 210\". A
+    bobtail carries no trailer by definition, so the departure must not be
+    rejected for a missing trailer_number -- before this fix GUARD 1 carded
+    it and the manual log's E2R->210 bobtail row never appeared. Origin is
+    inferred from the driver's last known location."""
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="E2F", destination_location="E2R",
+        leg_status="COMPLETED", arrival_time=ts(),
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Empty drop e2r#4 , Bobtail to 210",
+               destination_location="210", load_status="BOBTAIL"),
+    )
+    assert res["is_clean"] is True, res
+    assert res["card_text"] is None, res
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_bobtail"] == 1
+    assert leg["load_status"] == "EMPTY"
+    assert leg["origin_location"] == "E2R", "origin inferred from last leg"
+    assert leg["destination_location"] == "210"
+
+
+async def test_yard_move_with_cross_facility_departure_becomes_a_leg(pool):
+    """Live data 08/28, John Shim: \"Empty drop e1 yard #3, Bobtail to SDs\" is
+    really a drop at E1 (completing the prior leg's arrival) AND a bobtail to
+    SDS. The parser files it as a CASE 3 yard move; the departure to another
+    facility must be recorded as a leg, and the drop half updates the prior
+    leg's arrival."""
+    await seed_network(pool)
+    prior = await insert_leg(
+        pool, origin_location="SDS", destination_location="E1",
+        leg_status="IN_TRANSIT", load_status="EMPTY", departure_time=ts(),
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Empty drop e1 yard #3, Bobtail to SDs",
+               origin_location="E1", destination_location="E1",
+               origin_dock="YARD", destination_dock="YARD",
+               load_status="BOBTAIL"),
+    )
+    assert res["is_clean"] is True, res
+    assert res["card_text"] is None, res
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_bobtail"] == 1
+    assert leg["origin_location"] == "E1"
+    assert leg["destination_location"] == "SDS"
+
+    # the drop half completed the prior leg's arrival
+    prior_row = await get_leg(pool, prior)
+    assert prior_row["leg_status"] == "COMPLETED"
+    assert prior_row["arrival_time"] is not None
+
+
+async def test_yard_move_to_a_dock_stays_a_yard_move(pool):
+    """\"move to Dock 47\" names a dock, not a facility, so it must stay a
+    within-facility move -- the reverse of the cross-facility departure."""
+    await seed_network(pool)
+    await insert_leg(pool, origin_location="200F", destination_location="200F",
+                     leg_status="COMPLETED")
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="move to Dock 47",
+               origin_location="200F", destination_location="200F",
+               origin_dock="3", destination_dock="47", load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 1
+    # door-resolution still resolves door 47 to the rear building; the point is
+    # this never became a cross-facility departure / trip leg
+    assert leg["is_bobtail"] == 0
+    assert leg["departure_time"] == leg["arrival_time"]
+
+
+async def test_work_finished_move_with_typo_origin_uses_last_trip_dest(pool):
+    """Live data 08/28, John Shim 10:17: \"Finished live unloading e2r g, Empty
+    to e2r\" -- the driver typo'd the origin; he meant E2F -> E2R (the first
+    half of the two-part unload finished at E2F, and the trailer moved to E2R
+    for the second half). The manual log records E2F -> E2R dock 3. The parser
+    reads both ends as E2R, so the move must take its origin from the last
+    completed trip leg's destination instead of the typo'd text."""
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="200F", destination_location="E2F",
+        leg_status="COMPLETED", arrival_time=ts(),
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Finished live unloading e2r g, Empty to e2r",
+               origin_location="E2R", destination_location="E2R",
+               door_number="3", load_status="EMPTY", work_finished=True),
+    )
+    assert res["is_clean"] is True, res
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 1
+    assert leg["origin_location"] == "E2F", f"origin from last trip dest, was {leg['origin_location']}"
+    assert leg["destination_location"] == "E2R"
+
+
+async def test_work_finished_with_two_facilities_no_to_records_a_departure(pool):
+    """Live data 08/28, Matthew Cho 09:47: \"Unloading finished / Empty 200
+    sds\" drops the word 'to' -- it means an EMPTY 200 -> sds departure. The
+    parser files it as CASE_WORK_FINISHED; the state machine must recover the
+    two-facility move as a departure instead of just stamping the completion.
+    Compare 14:23 \"Empty 200 to sds\" which parses as a departure already."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_WORK_FINISHED",
+               raw_text="Unloading finished / Empty 200 sds",
+               load_status="EMPTY", work_finished=True),
+    )
+    assert res["is_clean"] is True, res
+    assert res["card_text"] is None, res
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 0
+    assert leg["origin_location"] == "200F", f"was {leg['origin_location']}"
+    assert leg["destination_location"] == "SDS", f"was {leg['destination_location']}"
+    assert leg["load_status"] == "EMPTY"
+
+
 async def test_autoheal_attaches_bol_to_open_leg(pool):
     open_leg = await insert_leg(
         pool, leg_status="IN_TRANSIT", load_status="LOADED",

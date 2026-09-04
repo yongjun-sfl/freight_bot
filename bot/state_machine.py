@@ -40,7 +40,65 @@ PICKUP_PATTERN = re.compile(
 UNLOAD_PATTERN = re.compile(r"\bunload(?:s|ed|ing)?\b", re.IGNORECASE)
 LOAD_PATTERN = re.compile(r"\bload(?:s|ed|ing)?\b", re.IGNORECASE)
 
+# A "to <SOMETHING>" that names a real facility, used to tell a yard move from
+# the trip hiding inside it. "Empty drop e1 yard #3, Bobtail to SDs" is a drop
+# at E1 AND a bobtail to SDS: the departure phrase must not be swallowed by the
+# yard phrase. Only a token that actually resolves to a known facility counts,
+# so "move to Dock 47" (Dock is not a facility) stays a yard move.
+DEPARTURE_TO_PATTERN = re.compile(
+    r"\b(?:bobtail|bob\s*tail|bt|empty|heading|leaving|going|returning|"
+    r"drive|move|pick\s*u?p?|pickup)\b[^.]*?\bto\s+([0-9A-Za-z]+)",
+    re.IGNORECASE,
+)
 
+
+def _cross_facility_destination(raw_text):
+    """A facility the text says the driver is going to, i.e. a to X whose X
+    resolves to a known facility. Returns the canonical code or None.
+
+    This turns a phrase like empty-drop at a yard with a Bobtail to SDs into
+    a trip: the to SDs is the real movement and must not be swallowed by the
+    yard-move phrasing. Only known facilities count, so move to Dock 47
+    stays a yard move (Dock is not a facility).
+    """
+    if not raw_text:
+        return None
+    for match in DEPARTURE_TO_PATTERN.finditer(raw_text):
+        token = match.group(1).strip().upper()
+        resolved = normalize_location(token)
+        if resolved not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST") \
+                and site_of(resolved) in LOCATION_CACHE.get("site_map", {}):
+            return resolved
+    return None
+def _two_facilities_in_order(raw_text):
+    """(origin, destination) when the raw text names two DISTINCT facilities
+    in that order, or (None, None).
+
+    Drivers drop the word "to" constantly: "Empty 200 sds" means an EMPTY
+    departure 200 -> sds. The parser only sometimes recovers that (LLM
+    variance), so when a message was filed as a plain completion but names
+    two valid codes, the state machine can recover the trip itself. Only two
+    KNOWN facilities count; "200 yard", "sds do27" or a dock number is one
+    location, not two.
+    """
+    if not raw_text:
+        return None, None
+    known = set(LOCATION_CACHE.get("codes") or [])
+    known |= set(LOCATION_CACHE.get("alias_map") or {})
+    seen = []
+    for token in re.findall(r"[0-9A-Za-z]+", raw_text):
+        cleaned = token.upper()
+        resolved = normalize_location(cleaned)
+        if resolved in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST", "YARD"):
+            continue
+        if cleaned in known or resolved in known:
+            if not seen or seen[-1] != resolved:
+                seen.append(resolved)
+    if len(seen) >= 2:
+        origin, destination = seen[0], seen[1]
+        if origin != destination and site_of(origin) != site_of(destination):
+            return origin, destination
+    return None, None
 async def commit_trip_leg(
     p,
     did: int,
@@ -192,6 +250,27 @@ async def commit_trip_leg(
                 )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
+# 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
+            # Drivers drop it constantly: "Unloading finished / Empty 200 sds"
+            # is an EMPTY 200 -> sds trip (Matthew Cho 09:47
+            # on 08/28). The parser files these as a plain completion too
+            # often, losing the leg. If the raw text names two DISTINCT known
+            # facilities, record it as a departure -- the completion still
+            # belongs to the prior leg (CASE 1 stamps it on departure).
+            if (case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED",
+                              "CASE_2_DESTINATION_ARRIVAL")
+                    and raw_text):
+                pair_origin, pair_dest = _two_facilities_in_order(raw_text)
+                if pair_origin and pair_dest:
+                    logger.info(
+                        f"Driver #{did} filed as {case_type} but names "
+                        f"{pair_origin} -> {pair_dest}; recording as a departure."
+                    )
+                    case_type = "CASE_1_ORIGIN_DEPARTURE"
+                    origin_loc = pair_origin
+                    dest_loc = pair_dest
+
+            # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
             # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
             # "200F to 200R" is front to rear in one yard, not a trip. Compared
             # by site, so E2F to E2R counts too. Recorded as the move it is
@@ -204,6 +283,28 @@ async def commit_trip_leg(
                     f"recording as a within-facility move."
                 )
                 case_type = "CASE_3_INTRA_FACILITY_MOVE"
+
+            # 1b. THE REVERSE: A YARD MOVE WITH A CROSS-FACILITY "TO X" IS A TRIP
+            # "Empty drop e1 yard #3, Bobtail to SDs" is a drop at E1 AND a
+            # bobtail to SDS -- two movements in one message. The parser files
+            # it as a yard move because "drop e1 yard" dominates, but the
+            # departure to another facility is the leg that must be recorded.
+            # The drop half updates the previous leg's arrival below (CASE 1
+            # completes prior active legs). Only a real facility on a different
+            # site counts, so "move to Dock 47" stays a yard move.
+            if case_type == "CASE_3_INTRA_FACILITY_MOVE":
+                far_dest = _cross_facility_destination(raw_text)
+                if far_dest and origin_loc != "UNKNOWN" \
+                        and site_of(far_dest) != site_of(origin_loc):
+                    logger.info(
+                        f"Driver #{did} filed as a yard move but says "
+                        f"'{far_dest}': recording as a departure."
+                    )
+                    case_type = "CASE_1_ORIGIN_DEPARTURE"
+                    if (not dest_loc or dest_loc in
+                            ["UNKNOWN", "NONE", "NULL", "MISSING_DEST"]
+                            or site_of(dest_loc) == site_of(origin_loc)):
+                        dest_loc = far_dest
 
             # 2. DUPLICATE BOL LOOKUP
             # Deliberately NOT run ahead of the match block. The patch paths --
@@ -695,7 +796,22 @@ async def commit_trip_leg(
                         }
 
                     # ALERT GUARD 1: Incomplete Route Data
-                    if origin_loc == "UNKNOWN" or display_trailer == "UNKNOWN" or dest_loc == "UNKNOWN":
+                    # A bobtail carries no trailer by definition, and an EMPTY
+                    # reposition rarely names one either -- so a departure must
+                    # never be rejected for a missing trailer when the trailer
+                    # is empty. It is only mandatory when the trailer is LOADED
+                    # (the rigor matters there). Origin and destination are
+                    # still required: without them there is no route to record.
+                    # This is what let terse "bobtail to 210" reports (John
+                    # Shim 10:28) and "Empty 200 sds" (Matthew Cho 09:47 on
+                    # 08/28) vanish while the manual log keeps them as rows.
+                    missing_trailer_ok = (
+                        is_bobtail_flag
+                        or (load_status_val or "") == "EMPTY"
+                    )
+                    if (origin_loc == "UNKNOWN" or dest_loc == "UNKNOWN"
+                            or (display_trailer == "UNKNOWN"
+                                and not missing_trailer_ok)):
                         return {
                             "is_clean": False,
                             "leg_id": leg_id,
@@ -1112,6 +1228,49 @@ async def commit_trip_leg(
                         last_seen = await cur.fetchone()
                         facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
 
+                    # A work-finished "<= X, empty to X" where the parser read
+                    # the same facility for both ends usually means the driver
+                    # typo'd the ORIGIN ("Finished live unloading e2r g, Empty
+                    # to e2r" -- John Shim 10:17 on 08/28 meant E2F -> E2R).
+                    # The trailer was actually at the last trip leg's
+                    # destination (E2F, where the first half unloaded) and is
+                    # being moved to the text's facility (E2R). When the whole
+                    # message says the job finished, that last trip's
+                    # destination is where the driver really is -- use it as
+                    # the origin so the move records E2F -> E2R instead of a
+                    # same-code E2R -> E2R shuffle.
+                    if (origin_loc != "UNKNOWN" and origin_loc == dest_loc
+                            and site_of(origin_loc) == "E2"
+                            and intent.get("work_finished")):
+                        await cur.execute(
+                            f"""SELECT destination_location 
+                                  FROM {TABLE_SHUTTLE_LEGS} 
+                                 WHERE user_id = %s 
+                                   AND is_positioning_leg = 0 
+                                   AND leg_status = 'COMPLETED'
+                              ORDER BY id DESC 
+                                 LIMIT 1;""",
+                            (did,)
+                        )
+                        completed_row = await cur.fetchone()
+                        if completed_row and completed_row[0]:
+                            completed_dest = completed_row[0].strip().upper()
+                            if (completed_dest not in ("UNKNOWN", "NONE", "NULL")
+                                    and site_of(completed_dest) == site_of(origin_loc)
+                                    and completed_dest != origin_loc):
+                                logger.info(
+                                    f"Driver #{did} work-finished move origin "
+                                    f"'{origin_loc}' looks like a typo; using "
+                                    f"last trip destination '{completed_dest}'."
+                                )
+                                # Destination stays the text's facility (E2R); only the ORIGIN
+                                # inherits from the last trip. `facility` is the
+                                # shared fallback for from/to, so it must stay
+                                # the destination (E2R) -- the corrected origin
+                                # feeds the from-side below.
+                                dest_loc = origin_loc
+                                origin_loc = completed_dest
+
                     # Which half of the site each door belongs to. At 200 the
                     # FG inbound doors are 3-21 (200F) and the RM outbound doors
                     # 47-66 (200R), so "finish live unloading at pactra #3 move
@@ -1119,7 +1278,16 @@ async def commit_trip_leg(
                     # being staged on a vacant outbound one -- the driver saving
                     # himself, or whoever takes the next RM round, a hook.
                     site = site_of(facility)
-                    from_facility = facility_for_dock(from_dock, site) or facility
+                    # For a typo-corrected E2F->E2R move, `facility` is the
+                    # destination (E2R) and `origin_loc` is E2F -- so the
+                    # from-side falls back to the corrected origin while the
+                    # to-side keeps the facility. For ordinary same-site moves
+                    # (200F->200R) origin IS the facility, so both sides fold
+                    # to one code as before.
+                    from_facility = facility_for_dock(
+                        from_dock, site) or (
+                        origin_loc if origin_loc != "UNKNOWN" else facility
+                    )
                     to_facility = facility_for_dock(to_dock, site) or facility
 
                     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"

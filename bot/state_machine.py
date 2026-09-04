@@ -83,6 +83,16 @@ def _two_facilities_in_order(raw_text):
     """
     if not raw_text:
         return None, None
+    # Guard: an ARRIVAL is not the departure being recovered. "arrived X from
+    # Y" names two facilities but the "from Y" is where the trip started, not
+    # a return leg -- recovering it invented a phantom for every Younypyo Kim
+    # stop. Only treat it as a departure when there is an onward cue (an
+    # explicit "to", or a bare "empty X Y" without "arrived ... from").
+    text_l = raw_text.lower()
+    if (("arrived" in text_l or "arrive" in text_l)
+            and " from " in text_l
+            and " to " not in text_l):
+        return None, None
     known = set(LOCATION_CACHE.get("codes") or [])
     known |= set(LOCATION_CACHE.get("alias_map") or {})
     seen = []
@@ -252,13 +262,17 @@ async def commit_trip_leg(
 
 # 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
             # Drivers drop it constantly: "Unloading finished / Empty 200 sds"
-            # is an EMPTY 200 -> sds trip (Matthew Cho 09:47
-            # on 08/28). The parser files these as a plain completion too
-            # often, losing the leg. If the raw text names two DISTINCT known
-            # facilities, record it as a departure -- the completion still
-            # belongs to the prior leg (CASE 1 stamps it on departure).
-            if (case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED",
-                              "CASE_2_DESTINATION_ARRIVAL")
+            # is an EMPTY 200 -> sds trip (Matthew Cho 09:47 on 08/28). The
+            # parser files these as a plain completion too often, losing the
+            # leg. If the raw text names two DISTINCT known facilities, record
+            # it as a departure -- the completion still belongs to the prior
+            # leg (CASE 1 stamps it on departure).
+            #
+            # Only a plain completion / chatter is recovered. A CASE_2
+            # "arrived X from Y" is an ARRIVAL (the "from Y" says where it came
+            # from), not a departure -- recovering that invented phantom
+            # X->Y return legs for every Younypyo Kim stop on 08/28.
+            if (case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED")
                     and raw_text):
                 pair_origin, pair_dest = _two_facilities_in_order(raw_text)
                 if pair_origin and pair_dest:

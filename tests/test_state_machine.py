@@ -328,6 +328,28 @@ async def test_work_finished_with_two_facilities_no_to_records_a_departure(pool)
     assert leg["load_status"] == "EMPTY"
 
 
+async def test_arrived_x_from_y_is_not_a_phantom_departure(pool):
+    """Live data 08/28, Younypyo Kim: \"arrived 3551 from 200 / empty drop 5\"
+    is an ARRIVAL at 3551 (the 'from 200' says where it came from), NOT a
+    3551->200 return leg. The two-facility recovery must not invent phantom
+    legs for the 'arrived X from Y' pattern -- that over-produced 9 legs for
+    him on 08/28. With an open trip to 3551, this completes it; without one,
+    nothing is recorded (a plain arrival)."""
+    await seed_network(pool)
+    # nothing running -> a plain arrival is nothing to record
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="arrived 3551 from 200 / empty drop 5",
+               destination_location="3551", load_status="EMPTY",
+               work_finished=True),
+    )
+    assert res["is_clean"] is True, res
+    # no spurious 3551->200F departure leg was created
+    legs = await all_legs(pool)
+    assert legs == [], f"expected no leg, got {legs}"
+
+
 async def test_autoheal_attaches_bol_to_open_leg(pool):
     open_leg = await insert_leg(
         pool, leg_status="IN_TRANSIT", load_status="LOADED",

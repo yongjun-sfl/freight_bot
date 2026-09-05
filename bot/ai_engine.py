@@ -332,7 +332,8 @@ DRIVER SLANG & PATTERN DICTIONARY:
 
 CASE CLASSIFICATION RULES:
 1. "CASE_1_ORIGIN_DEPARTURE": Driver is reporting outbound movement, leaving a facility, or traveling between facilities (e.g., "leaving 200", "200 to E2F", "heading to E2F bt").
-2. "CASE_2_DESTINATION_ARRIVAL": Driver is reporting arrival at a facility, gate, door, or yard (e.g., "arrived E2F", "at E2F door 45", "in yard at E2F").
+2. "CASE_2_DESTINATION_ARRIVAL": Driver is reporting arrival at a facility, gate, door, or yard (e.g., "arrived E2F", "at E2F door 45", "in yard at E2F", "empty dropped sds", "dropped do 20 sds").
+   - A DROP is the arrival half of a trip, never a departure: "empty dropped do 20 sds" means the empty trailer was parked at SDS slot 20 -- CASE_2 with destination_location="SDS", do_number="20", load_status="EMPTY". Only reclassify as a departure when the driver also names the NEXT facility they are heading to.
 3. "CASE_HISTORICAL_BOL_UPDATE": Document upload or message specifically referencing late paperwork, delivery receipts, or historical BOLs.
 4. "CASE_3_INTRA_FACILITY_MOVE": Driver is repositioning a trailer WITHIN one facility -- between doors, or between a door and the yard. No facility-to-facility travel is involved. Examples:
    - "empty move #13 to #47"      -> origin_dock="13", destination_dock="47", load_status="EMPTY"
@@ -373,6 +374,7 @@ EXTRACTION & NORMALIZATION RULES:
    - For CASE_1 and CASE_2 a single door goes in door_number (e.g. "#47" or "door 47" -> door_number="47").
    - For CASE_3_INTRA_FACILITY_MOVE there are two positions: put the one moved FROM in origin_dock and the one moved TO in destination_dock. Leave door_number null.
    - Strip the leading "#": "#13" -> "13".
+   - A known facility directly followed by a wall number is the facility plus its dock: "200 #47" means origin_location="200", door_number="47"; "200r #48" means origin_location="200R", door_number="48"; "7634 #10" means origin_location="7634", door_number="10". The number after "#" is a position, never a trailer, and the facility is never dropped because of it.
    - When the driver names the yard, lot or parking area rather than a numbered door, use the literal string "YARD".
    - SDS uses a yard slot, written "DO# 34", "DO 34", "do34", or as a single token like "D021", "D027", "D005". Put just the digits in do_number, dropping leading zeros ("D021" -> "21"). It is a parking position, NOT a delivery order number from any paperwork, and no other site uses it.
    - origin_dock and destination_dock hold POSITIONS ONLY: a door number, or the literal "YARD". A facility code such as 200, 200R, E2F or SDS is NEVER a dock, however the driver phrases it.
@@ -382,7 +384,7 @@ EXTRACTION & NORMALIZATION RULES:
 
 3. Load Status & Trailer Details:
    - Set load_status to "BOBTAIL", "EMPTY", or "LOADED" based on text or slang terms above.
-   - Extract trailer_number (e.g., "77344").
+   - Extract trailer_number (e.g., "77344"). A trailer number is a bare numeric string. A number written after "#" or labelled "door"/"dock" is a position, not equipment, and must not be returned as trailer_number.
 
 Return raw JSON ONLY:
 {{

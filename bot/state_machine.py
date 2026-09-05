@@ -1,114 +1,72 @@
+"""Trip-leg state machine: public entry point.
+
+``commit_trip_leg`` orchestrates one driver message end to end:
+  - build a ``LegContext`` from the parsed intent,
+  - resolve load status,
+  - verify the driver is on the roster,
+  - apply the case-reclassification rules that precede the match
+    (a pair of known facilities reads as a departure, origin inference,
+    same-site departure becomes a within-facility move, a yard move with a
+    cross-facility "to X" becomes a departure),
+  - record any lunch boundary bundled into the same message,
+  - then dispatch to a per-case handler.
+
+Split from a ~1700-line monolith. The pieces live in three modules:
+  * ``leg_helpers.py`` -- regexes and pure text matching,
+  * ``leg_context.py``  -- parsed-message state + shared DB helpers,
+  * ``leg_cases.py``    -- one ``async handle_*(ctx)`` per case type.
+"""
+
 import logging
-import re
+
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
-from ai_engine import (LOCATION_CACHE, facility_for_dock,
-                       normalize_location, site_of)
-from load_types import classify as classify_load
-from manifests import read_manifest, store_manifest
-from rm_manifest import close_rm_load, finish_rm_load, record_rm_load
-from shifts import (format_worked, record_clock_in, record_clock_out,
-                    record_lunch)
-from routes import SPOT_ROUTE_CODE, is_anchor, route_code_for, serves
+from ai_engine import normalize_location, site_of
+from shifts import record_lunch
+
+from leg_helpers import (
+    BOBTAIL_PATTERN,
+    LOAD_PATTERN,
+    PICKUP_PATTERN,
+    UNLOAD_PATTERN,
+    cross_facility_destination,
+    facility_dock_from_text,
+    two_facilities_in_order,
+)
+from leg_context import LegContext
+from leg_cases import (
+    handle_auto_resolve,
+    handle_bol_update,
+    handle_case_1_departure,
+    handle_case_2_arrival,
+    handle_case_3_intra_move,
+    handle_clock_in,
+    handle_clock_out,
+    handle_default,
+    handle_lunch_end,
+    handle_lunch_start,
+    handle_manifest,
+    handle_parse_failed,
+    handle_work_finished,
+)
 
 logger = logging.getLogger(__name__)
 
-# A within-facility move re-reported inside this window is treated as the same
-# event rather than a second drop. Drivers routinely send the paperwork and a
-# photo of the parked trailer minutes apart, both describing one drop.
-REPEAT_MOVE_MINUTES = 30
-
-# Word-boundary matched: a bare `"bt" in text` substring test fires on ordinary
-# words like "doubt", "debt" and "subtotal", which forced load_status to EMPTY
-# and silently skipped the outbound BOL compliance guard.
-BOBTAIL_PATTERN = re.compile(
-    r"\b(?:bobtail|bob\s*tail|bt|b/t|no\s+trailer|single\s+tractor|tractor\s+only)\b",
-    re.IGNORECASE,
-)
-
-# Hooking a load starts a trip; it is never a within-yard reposition. When the
-# driver names no destination there is nothing to record, so the message would
-# otherwise vanish -- "Load trailer pickup sds dock28 #77209" left the whole
-# SDS -> 200F run missing from the day.
-PICKUP_PATTERN = re.compile(
-    r"\b(?:pick\s*-?\s*up|pickup|picking\s+up|hook(?:ed|ing)?(?:\s+up)?)\b",
-    re.IGNORECASE,
-)
-
-# Tells a finished unload from a finished load. `work_finished` says a live
-# job completed but not which kind, and the two leave the trailer in opposite
-# states. Matched on a word boundary so "unloading" is never read as loading.
-UNLOAD_PATTERN = re.compile(r"\bunload(?:s|ed|ing)?\b", re.IGNORECASE)
-LOAD_PATTERN = re.compile(r"\bload(?:s|ed|ing)?\b", re.IGNORECASE)
-
-# A "to <SOMETHING>" that names a real facility, used to tell a yard move from
-# the trip hiding inside it. "Empty drop e1 yard #3, Bobtail to SDs" is a drop
-# at E1 AND a bobtail to SDS: the departure phrase must not be swallowed by the
-# yard phrase. Only a token that actually resolves to a known facility counts,
-# so "move to Dock 47" (Dock is not a facility) stays a yard move.
-DEPARTURE_TO_PATTERN = re.compile(
-    r"\b(?:bobtail|bob\s*tail|bt|empty|heading|leaving|going|returning|"
-    r"drive|move|pick\s*u?p?|pickup)\b[^.]*?\bto\s+([0-9A-Za-z]+)",
-    re.IGNORECASE,
-)
+CASE_HANDLERS = {
+    "CASE_LUNCH_START": handle_lunch_start,
+    "CASE_LUNCH_END": handle_lunch_end,
+    "CASE_CLOCK_IN": handle_clock_in,
+    "CASE_CLOCK_OUT": handle_clock_out,
+    "CASE_WORK_FINISHED": handle_work_finished,
+    "CASE_1_ORIGIN_DEPARTURE": handle_case_1_departure,
+    "CASE_2_DESTINATION_ARRIVAL": handle_case_2_arrival,
+    "CASE_HISTORICAL_BOL_UPDATE": handle_bol_update,
+    "CASE_AUTO_RESOLVE": handle_auto_resolve,
+    "CASE_3_INTRA_FACILITY_MOVE": handle_case_3_intra_move,
+    "CASE_MANIFEST": handle_manifest,
+    "PARSE_FAILED": handle_parse_failed,
+}
 
 
-def _cross_facility_destination(raw_text):
-    """A facility the text says the driver is going to, i.e. a to X whose X
-    resolves to a known facility. Returns the canonical code or None.
-
-    This turns a phrase like empty-drop at a yard with a Bobtail to SDs into
-    a trip: the to SDs is the real movement and must not be swallowed by the
-    yard-move phrasing. Only known facilities count, so move to Dock 47
-    stays a yard move (Dock is not a facility).
-    """
-    if not raw_text:
-        return None
-    for match in DEPARTURE_TO_PATTERN.finditer(raw_text):
-        token = match.group(1).strip().upper()
-        resolved = normalize_location(token)
-        if resolved not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST") \
-                and site_of(resolved) in LOCATION_CACHE.get("site_map", {}):
-            return resolved
-    return None
-def _two_facilities_in_order(raw_text):
-    """(origin, destination) when the raw text names two DISTINCT facilities
-    in that order, or (None, None).
-
-    Drivers drop the word "to" constantly: "Empty 200 sds" means an EMPTY
-    departure 200 -> sds. The parser only sometimes recovers that (LLM
-    variance), so when a message was filed as a plain completion but names
-    two valid codes, the state machine can recover the trip itself. Only two
-    KNOWN facilities count; "200 yard", "sds do27" or a dock number is one
-    location, not two.
-    """
-    if not raw_text:
-        return None, None
-    # Guard: an ARRIVAL is not the departure being recovered. "arrived X from
-    # Y" names two facilities but the "from Y" is where the trip started, not
-    # a return leg -- recovering it invented a phantom for every Younypyo Kim
-    # stop. Only treat it as a departure when there is an onward cue (an
-    # explicit "to", or a bare "empty X Y" without "arrived ... from").
-    text_l = raw_text.lower()
-    if (("arrived" in text_l or "arrive" in text_l)
-            and " from " in text_l
-            and " to " not in text_l):
-        return None, None
-    known = set(LOCATION_CACHE.get("codes") or [])
-    known |= set(LOCATION_CACHE.get("alias_map") or {})
-    seen = []
-    for token in re.findall(r"[0-9A-Za-z]+", raw_text):
-        cleaned = token.upper()
-        resolved = normalize_location(cleaned)
-        if resolved in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST", "YARD"):
-            continue
-        if cleaned in known or resolved in known:
-            if not seen or seen[-1] != resolved:
-                seen.append(resolved)
-    if len(seen) >= 2:
-        origin, destination = seen[0], seen[1]
-        if origin != destination and site_of(origin) != site_of(destination):
-            return origin, destination
-    return None, None
 async def commit_trip_leg(
     p,
     did: int,
@@ -119,129 +77,89 @@ async def commit_trip_leg(
     msg_timestamp: str,
     intent: dict
 ) -> dict:
-    case_type = intent.get("case_type", "NONE_WORK_RELATED")
-    def _not_a_facility(value):
-        """Drop a trailer number that is really a facility code.
+    ctx = LegContext(p, did, user_name, group_title,
+                     orig_chat_id, orig_msg_id, msg_timestamp, intent)
 
-        Bare numeric sites like 7634 read as trailers, and a facility stored
-        as a trailer both loses the location and corrupts trailer history.
-        """
-        if not value:
-            return value
-        clean = str(value).strip().upper()
-        known = set(LOCATION_CACHE.get("codes") or [])
-        known |= set(LOCATION_CACHE.get("alias_map") or {})
-        if clean in known or normalize_location(clean) in known:
-            logger.info(f"Ignoring facility code {clean!r} given as a trailer number.")
-            return None
-        return value
-
-    text_trailer = _not_a_facility(
-        intent.get("trailer_number") or intent.get("text_trailer"))
-    ocr_trailer = _not_a_facility(intent.get("ocr_trailer"))
-    bol_number = intent.get("bol_number")
-    document_type = intent.get("document_type", "UNKNOWN")
-    action_type = intent.get("action")
-    door_num = intent.get("door_number")
-    do_num = intent.get("do_number")
-    origin_dock = intent.get("origin_dock")
-    destination_dock = intent.get("destination_dock")
-    primary_image_blob = intent.get("primary_image_blob")
-    shipper_signed = intent.get("shipper_signed", False)
-    receiver_signed = intent.get("receiver_signed", False)
-    raw_text = intent.get("raw_text") or ""
-
-    raw_orig = intent.get("origin_location")
-    raw_dest = intent.get("destination_location")
-    origin_loc = normalize_location(raw_orig) if raw_orig else "UNKNOWN"
-    dest_loc = normalize_location(raw_dest) if raw_dest else "UNKNOWN"
-
-    parsed_load_status = intent.get("load_status")
-    raw_lower = raw_text.lower()
+    # The parser reads a wall number glued to a facility as equipment ("pick up
+    # load 200 #47 to e2 f" -> trailer "47", origin dropped entirely -- Joseph
+    # Kim 08:35 on 08/28). A "FACILITY #NN" is the facility and a dock: recover
+    # the origin, turn the NN into the door, and never let it ride as a trailer.
+    ctx.origin_loc, ctx.door_num, ctx.text_trailer = facility_dock_from_text(
+        ctx.raw_text, ctx.origin_loc, ctx.door_num, ctx.text_trailer)
 
     # Detect Bobtail Flag
-    is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(raw_text) else 0
+    ctx.is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(ctx.raw_text) else 0
 
     # The driver has just handed the load over, so whatever they do next they
     # do with an empty trailer. Two independent signals because neither is
     # always present: a receiver-stamped POD is first-hand evidence off the
-    # paperwork (the consignees moved from signing to stamping recently), and
-    # work_finished covers the report that arrives with no photo.
-    #
-    # This replaces a test on action_type for "UNLOAD_COMPLETED" and
-    # "FINISHED_UNLOAD", neither of which the parser can emit -- its action
-    # vocabulary is LIVE_UNLOAD / DROP_DOCK / DROP_YARD / DROP_DOOR /
-    # BOBTAIL_ARRIVE. The branch never once fired, so "Finish live unloading at
-    # pactra #10 heading to sds" fell through to inheriting the load status of
-    # the leg that had just ended, and the empty run to SDS was booked LOADED.
-    #
-    # Hooking the next load in the same breath ("finished unloading, picking up
-    # load to E2F") leaves the trailer full again, so a pickup cancels it.
-    work_finished = bool(intent.get("work_finished"))
-    unload_reported = bool(UNLOAD_PATTERN.search(raw_text))
+    # paperwork, and work_finished covers the report that arrives with no
+    # photo. Hooking the next load in the same breath cancels it.
+    work_finished = bool(ctx.intent.get("work_finished"))
+    unload_reported = bool(UNLOAD_PATTERN.search(ctx.raw_text))
     just_delivered = bool(
-        (receiver_signed or (work_finished and unload_reported))
-        and not PICKUP_PATTERN.search(raw_text)
+        (ctx.receiver_signed or (work_finished and unload_reported))
+        and not PICKUP_PATTERN.search(ctx.raw_text)
     )
-    # The mirror: a finished live LOAD sends the trailer out full. This is what
-    # the removed action_type == "LIVE_LOAD" branch was reaching for, and it
-    # never fired either -- so "live loading finished load 200 to E2F" also
-    # inherited its load status from the leg that had just ended, which for a
-    # driver who arrived empty to load meant departing EMPTY with a full trailer.
+    # The mirror: a finished live LOAD sends the trailer out full.
     just_loaded = bool(work_finished and not unload_reported
-                       and LOAD_PATTERN.search(raw_text))
+                       and LOAD_PATTERN.search(ctx.raw_text))
 
     # Extended Fallback Logic for Load Status
-    if is_bobtail_flag or parsed_load_status == "BOBTAIL":
-        load_status_val = "EMPTY"
-        is_bobtail_flag = 1
+    parsed_load_status = ctx.intent.get("load_status")
+    if ctx.is_bobtail_flag or parsed_load_status == "BOBTAIL":
+        ctx.load_status_val = "EMPTY"
+        ctx.is_bobtail_flag = 1
     elif parsed_load_status and parsed_load_status not in ["UNKNOWN", "NULL", "NONE"]:
-        load_status_val = parsed_load_status
+        ctx.load_status_val = parsed_load_status
     elif just_delivered:
-        load_status_val = "EMPTY"
+        ctx.load_status_val = "EMPTY"
     elif just_loaded:
-        load_status_val = "LOADED"
-    elif "load pickup" in raw_lower or "pick up" in raw_lower:
-        load_status_val = "LOADED"
-    elif "empty" in raw_lower:
-        load_status_val = "EMPTY"
+        ctx.load_status_val = "LOADED"
+    elif "load pickup" in ctx.raw_lower or "pick up" in ctx.raw_lower:
+        ctx.load_status_val = "LOADED"
+    elif "empty" in ctx.raw_lower:
+        ctx.load_status_val = "EMPTY"
     else:
         async with p.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    f"""SELECT load_status 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE user_id = %s 
-                           AND load_status IS NOT NULL 
-                      ORDER BY id DESC 
+                    f"""SELECT load_status
+                          FROM {TABLE_SHUTTLE_LEGS}
+                         WHERE user_id = %s
+                           AND load_status IS NOT NULL
+                      ORDER BY id DESC
                          LIMIT 1;""",
                     (did,)
                 )
                 last_status_row = await cur.fetchone()
-                load_status_val = last_status_row[0] if (last_status_row and last_status_row[0]) else "LOADED"
+                ctx.load_status_val = last_status_row[0] if (
+                    last_status_row and last_status_row[0]) else "LOADED"
 
     # Hooking a load is the start of a trip, never a yard shuffle and never
     # just an arrival. Which case the parser filed the message under does not
     # change that, so the test lives here rather than inside one branch.
-    is_load_pickup = bool(load_status_val == "LOADED"
-                          and PICKUP_PATTERN.search(raw_text))
+    ctx.is_load_pickup = bool(ctx.load_status_val == "LOADED"
+                              and PICKUP_PATTERN.search(ctx.raw_text))
 
     async with p.acquire() as conn:
         async with conn.cursor() as cur:
+            ctx.conn = conn
+            ctx.cur = cur
 
             # 0. DRIVER VERIFICATION
             await cur.execute(
-                f"""SELECT user_id 
-                      FROM {TABLE_DRIVERS} 
-                     WHERE user_id = %s 
+                f"""SELECT user_id
+                      FROM {TABLE_DRIVERS}
+                     WHERE user_id = %s
                      LIMIT 1;""",
                 (did,)
             )
             driver_exists = await cur.fetchone()
             if not driver_exists:
-                # Remember them rather than only logging. driver_profiles keys on
-                # the Telegram user_id, which is not recorded anywhere else, so a
-                # driver missing from the roster is silently ignored forever.
+                # Remember them rather than only logging. driver_profiles keys
+                # on the Telegram user_id, which is not recorded anywhere else,
+                # so a driver missing from the roster is silently ignored.
                 # /roster turns this into the list needed to register them.
                 await cur.execute(
                     f"""INSERT INTO {TABLE_UNKNOWN_SENDERS}
@@ -260,1338 +178,79 @@ async def commit_trip_leg(
                 )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
-# 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
-            # Drivers drop it constantly: "Unloading finished / Empty 200 sds"
-            # is an EMPTY 200 -> sds trip (Matthew Cho 09:47 on 08/28). The
-            # parser files these as a plain completion too often, losing the
-            # leg. If the raw text names two DISTINCT known facilities, record
-            # it as a departure -- the completion still belongs to the prior
-            # leg (CASE 1 stamps it on departure).
-            #
-            # Only a plain completion / chatter is recovered. A CASE_2
-            # "arrived X from Y" is an ARRIVAL (the "from Y" says where it came
-            # from), not a departure -- recovering that invented phantom
-            # X->Y return legs for every Younypyo Kim stop on 08/28.
-            if (case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED")
-                    and raw_text):
-                pair_origin, pair_dest = _two_facilities_in_order(raw_text)
+            # 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
+            # "Unloading finished / Empty 200 sds" is an EMPTY 200 -> sds trip.
+            if (ctx.case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED")
+                    and ctx.raw_text):
+                pair_origin, pair_dest = two_facilities_in_order(ctx.raw_text)
                 if pair_origin and pair_dest:
                     logger.info(
-                        f"Driver #{did} filed as {case_type} but names "
+                        f"Driver #{did} filed as {ctx.case_type} but names "
                         f"{pair_origin} -> {pair_dest}; recording as a departure."
                     )
-                    case_type = "CASE_1_ORIGIN_DEPARTURE"
-                    origin_loc = pair_origin
-                    dest_loc = pair_dest
+                    ctx.case_type = "CASE_1_ORIGIN_DEPARTURE"
+                    ctx.origin_loc = pair_origin
+                    ctx.dest_loc = pair_dest
 
-            # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
-            # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
-            # "200F to 200R" is front to rear in one yard, not a trip. Compared
-            # by site, so E2F to E2R counts too. Recorded as the move it is
-            # rather than carded for the dispatcher to correct by hand.
-            if (case_type == "CASE_1_ORIGIN_DEPARTURE"
-                    and origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
-                    and site_of(origin_loc) == site_of(dest_loc)):
-                logger.info(
-                    f"Driver #{did} reported {origin_loc} to {dest_loc}: one site, "
-                    f"recording as a within-facility move."
+            # 0c. ORIGIN INFERENCE FOR DEPARTURES -- the driver is wherever
+            # their last trip ended.
+            if (ctx.case_type == "CASE_1_ORIGIN_DEPARTURE"
+                    and (not ctx.origin_loc or ctx.origin_loc in
+                         ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN"))):
+                await cur.execute(
+                    f"""SELECT destination_location
+                          FROM {TABLE_SHUTTLE_LEGS}
+                         WHERE user_id = %s
+                           AND destination_location NOT IN
+                               ('UNKNOWN', 'MISSING_ORIGIN', 'MISSING_DEST', '')
+                      ORDER BY id DESC
+                         LIMIT 1;""",
+                    (did,)
                 )
-                case_type = "CASE_3_INTRA_FACILITY_MOVE"
+                inferred = await cur.fetchone()
+                if inferred and inferred[0]:
+                    ctx.origin_loc = normalize_location(inferred[0])
+                    logger.info(
+                        f"Driver #{did} departure names no origin; using last "
+                        f"destination {ctx.origin_loc}."
+                    )
 
-            # 1b. THE REVERSE: A YARD MOVE WITH A CROSS-FACILITY "TO X" IS A TRIP
-            # "Empty drop e1 yard #3, Bobtail to SDs" is a drop at E1 AND a
-            # bobtail to SDS -- two movements in one message. The parser files
-            # it as a yard move because "drop e1 yard" dominates, but the
-            # departure to another facility is the leg that must be recorded.
-            # The drop half updates the previous leg's arrival below (CASE 1
-            # completes prior active legs). Only a real facility on a different
-            # site counts, so "move to Dock 47" stays a yard move.
-            if case_type == "CASE_3_INTRA_FACILITY_MOVE":
-                far_dest = _cross_facility_destination(raw_text)
-                if far_dest and origin_loc != "UNKNOWN" \
-                        and site_of(far_dest) != site_of(origin_loc):
+            # 1. A SAME-SITE DEPARTURE IS A WITHIN-FACILITY MOVE
+            # "200F to 200R" is front to rear in one yard, not a trip.
+            if (ctx.case_type == "CASE_1_ORIGIN_DEPARTURE"
+                    and ctx.origin_loc != "UNKNOWN" and ctx.dest_loc != "UNKNOWN"
+                    and site_of(ctx.origin_loc) == site_of(ctx.dest_loc)):
+                logger.info(
+                    f"Driver #{did} reported {ctx.origin_loc} to {ctx.dest_loc}: "
+                    f"one site, recording as a within-facility move."
+                )
+                ctx.case_type = "CASE_3_INTRA_FACILITY_MOVE"
+
+            # 1b. THE REVERSE: A YARD MOVE WITH A CROSS-FACILITY "TO X" IS A
+            # TRIP. "Empty drop e1 yard #3, Bobtail to SDs" is a drop at E1
+            # AND a bobtail to SDS -- two movements in one message.
+            if ctx.case_type == "CASE_3_INTRA_FACILITY_MOVE":
+                far_dest = cross_facility_destination(ctx.raw_text)
+                if far_dest and ctx.origin_loc != "UNKNOWN" \
+                        and site_of(far_dest) != site_of(ctx.origin_loc):
                     logger.info(
                         f"Driver #{did} filed as a yard move but says "
                         f"'{far_dest}': recording as a departure."
                     )
-                    case_type = "CASE_1_ORIGIN_DEPARTURE"
-                    if (not dest_loc or dest_loc in
+                    ctx.case_type = "CASE_1_ORIGIN_DEPARTURE"
+                    if (not ctx.dest_loc or ctx.dest_loc in
                             ["UNKNOWN", "NONE", "NULL", "MISSING_DEST"]
-                            or site_of(dest_loc) == site_of(origin_loc)):
-                        dest_loc = far_dest
+                            or site_of(ctx.dest_loc) == site_of(ctx.origin_loc)):
+                        ctx.dest_loc = far_dest
 
-            # 2. DUPLICATE BOL LOOKUP
-            # Deliberately NOT run ahead of the match block. The patch paths --
-            # CASE_HISTORICAL_BOL_UPDATE, CASE_AUTO_RESOLVE, and the CASE 1
-            # auto-heal -- all locate their target *by* an existing bol_number,
-            # so a pre-match guard made every one of them unreachable. It now
-            # runs only where a brand new leg would claim a BOL.
-            async def find_duplicate_bol_leg():
-                """Id of an existing leg already carrying this BOL, else None."""
-                if not bol_number:
-                    return None
-                await cur.execute(
-                    f"""SELECT id 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE bol_number = %s 
-                         LIMIT 1;""",
-                    (bol_number,)
-                )
-                existing_bol = await cur.fetchone()
-                return existing_bol[0] if existing_bol else None
-
-            async def resolve_round(origin: str, destination: str):
-                """(round_number, route_code) for a new departure.
-
-                A round is one traversal of a defined route: leave an anchor,
-                work the stops that belong to a route anchored there, come back.
-                A leg to anywhere else is a spot delivery and gets its own round.
-
-                This is deliberately not distance-based. 100 and 1380 form their
-                own rounds because they sit on no route, not because they are far
-                -- Cartersville is in fact nearer to 200 than Dalton is.
-                """
-                await cur.execute(
-                    f"""SELECT round_number, route_code, destination_location 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE user_id = %s 
-                           AND is_positioning_leg = 0 
-                           AND round_number IS NOT NULL 
-                           AND DATE(departure_time) = DATE(%s)
-                      ORDER BY id DESC 
-                         LIMIT 1;""",
-                    (did, msg_timestamp)
-                )
-                row = await cur.fetchone()
-
-                async def open_new_round():
-                    await cur.execute(
-                        f"""SELECT COALESCE(MAX(round_number), 0) 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND DATE(departure_time) = DATE(%s);""",
-                        (did, msg_timestamp)
-                    )
-                    (highest_today,) = await cur.fetchone()
-                    return (highest_today or 0) + 1
-
-                if not row:
-                    number = await open_new_round()
-                    if serves(origin, destination):
-                        return number, route_code_for(origin, [destination])
-                    return number, SPOT_ROUTE_CODE
-
-                current, current_route, last_destination = row
-
-                # Where the open round started, and everywhere it has been.
-                await cur.execute(
-                    f"""SELECT origin_location, destination_location 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE user_id = %s 
-                           AND round_number = %s 
-                           AND is_positioning_leg = 0 
-                           AND DATE(departure_time) = DATE(%s)
-                      ORDER BY id ASC;""",
-                    (did, current, msg_timestamp)
-                )
-                legs = await cur.fetchall()
-                anchor = legs[0][0] if legs else None
-                visited = [leg[1] for leg in legs]
-
-                # Has the open round finished? A normal round ends back at its
-                # anchor; a spot delivery ends wherever it rejoins a route.
-                if current_route == SPOT_ROUTE_CODE:
-                    if not is_anchor(last_destination):
-                        # Still out on the spot run, including the leg home.
-                        # Its origin is not a route anchor, so route membership
-                        # cannot be consulted here.
-                        return current, SPOT_ROUTE_CODE
-                elif anchor and site_of(last_destination) != site_of(anchor):
-                    if serves(anchor, destination):
-                        return current, route_code_for(anchor, visited + [destination])
-                    # Off-route: close this round, start a spot delivery.
-                    return await open_new_round(), SPOT_ROUTE_CODE
-
-                number = await open_new_round()
-                if serves(origin, destination):
-                    return number, route_code_for(origin, [destination])
-                return number, SPOT_ROUTE_CODE
-
-            async def current_round_number():
-                """The round a within-facility move happened during."""
-                await cur.execute(
-                    f"""SELECT round_number 
-                          FROM {TABLE_SHUTTLE_LEGS} 
-                         WHERE user_id = %s 
-                           AND round_number IS NOT NULL 
-                           AND DATE(departure_time) = DATE(%s)
-                      ORDER BY id DESC 
-                         LIMIT 1;""",
-                    (did, msg_timestamp)
-                )
-                row = await cur.fetchone()
-                return row[0] if row else None
-
-            async def stamp_finished(target_leg=None):
-                """Record that a live load or unload completed.
-
-                Applies to the leg the driver is ending, which on a merged
-                message ("live loading finished load 200 to E2F") is the leg
-                BEFORE the departure being announced. The job is over, so the
-                leg is marked COMPLETED here and now -- earlier this was
-                stamped each time `finish_rm_load` ran, but when work finished
-                on a CASE 3 yard move ("finish live unloading at pactra #3 move
-                to Dock 47") nothing ever closed the trip leg, and it stayed
-                UNLOADING with a finished time stamped on an open leg.
-                """
-                if target_leg is None:
-                    await cur.execute(
-                        f"""SELECT id FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s AND is_positioning_leg = 0 
-                          ORDER BY id DESC LIMIT 1;""",
-                        (did,)
-                    )
-                    row = await cur.fetchone()
-                    target_leg = row[0] if row else None
-                if not target_leg:
-                    return None
-                await cur.execute(
-                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                           SET finished_time = COALESCE(finished_time, %s),
-                               leg_status = 'COMPLETED'
-                         WHERE id = %s;""",
-                    (msg_timestamp, target_leg)
-                )
-                await finish_rm_load(cur, target_leg, msg_timestamp)
-                return target_leg
-
-            async def open_departure_leg(origin, destination, trailer):
-                """Insert a new IN_TRANSIT leg for a trip that is starting.
-
-                Shared by CASE 1 and by the paths that recognise a hooked load
-                as a departure the driver never announced as one. Reads
-                bol_number, document_type, primary_image_blob and
-                shipper_signed at call time, so a stale BOL cleared above is
-                already gone by the time the row is written.
-                """
-                round_and_route = await resolve_round(origin, destination)
-                await cur.execute(
-                    f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
-                           user_id, 
-                           trailer_number, 
-                           bol_number, 
-                           document_type,
-                           origin_location, 
-                           destination_location, 
-                           departure_time, 
-                           arrival_action, 
-                           bol_image, 
-                           dock_number, 
-                           shipper_signed, 
-                           is_bobtail, 
-                           leg_status, 
-                           load_status,
-                           round_number,
-                           route_code,
-                           load_type
-                       ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'IN_TRANSIT', %s, %s, %s, %s);""",
-                    (
-                        did, trailer, bol_number, document_type, origin, destination,
-                        msg_timestamp, action_type, primary_image_blob, door_num,
-                        1 if shipper_signed else 0, is_bobtail_flag, load_status_val,
-                        *round_and_route,
-                        classify_load(origin, destination, load_status_val,
-                                      round_and_route[1]),
-                    )
-                )
-                await conn.commit()
-                leg_id = cur.lastrowid
-
-                # RM consignments carry line items the receiving departments
-                # at E2F and E2R report on, so they are kept in their own
-                # tables rather than flattened into the leg.
-                await record_rm_load(cur, leg_id, intent, origin, destination,
-                                     trailer, msg_timestamp,
-                                     driver_id=did, driver_name=user_name)
-                await conn.commit()
-                return leg_id
-
-            async def start_hooked_load(where, position, trailer, arrival_leg=None):
-                """Record a load hooked with no destination said aloud.
-
-                The BOL's SHIP TO is the only other statement of where the load
-                is going, and it is the better of the two -- printed by the
-                shipper, not typed one-handed at a dock. It is consulted ONLY
-                when the driver named nowhere, and never when the paperwork is
-                a duplicate: a BOL already sitting on another leg is the
-                previous load's, so its consignee is the previous load's too.
-
-                Falls back to the card when the paperwork cannot say either.
-                """
-                paperwork_dest = intent.get("bol_destination")
-                if paperwork_dest and await find_duplicate_bol_leg():
-                    logger.warning(
-                        f"BOL '{bol_number}' is already recorded on another leg; "
-                        f"not trusting its ship-to as a destination."
-                    )
-                    paperwork_dest = None
-                # A consignee at the site they are standing on is not a trip.
-                if paperwork_dest and site_of(paperwork_dest) == site_of(where):
-                    logger.info(
-                        f"BOL ship-to {paperwork_dest} is the site the load was "
-                        f"hooked at ({where}); not recording a leg."
-                    )
-                    paperwork_dest = None
-
-                if not paperwork_dest:
-                    logger.warning(
-                        f"Driver #{did} picked up a load at {where} without "
-                        f"naming a destination; carding for dispatch."
-                    )
-                    return {
-                        "is_clean": False,
-                        "leg_id": arrival_leg,
-                        "card_text": pickup_with_no_destination(
-                            where, position, trailer),
-                    }
-
-                # Two legs open at once would leave the arrival half-recorded
-                # and skew every dwell measured off it. Hooking a load means
-                # whatever they were doing here is over.
-                if arrival_leg:
-                    await cur.execute(
-                        f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                               SET leg_status = 'COMPLETED' 
-                             WHERE id = %s;""",
-                        (arrival_leg,)
-                    )
-                leg_id = await open_departure_leg(where, paperwork_dest, trailer)
-                logger.info(
-                    f"Driver #{did} hooked a load at {where} without naming a "
-                    f"destination; BOL ship-to gives {paperwork_dest}. "
-                    f"Recorded as Leg #{leg_id}."
-                )
-                return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-            def pickup_with_no_destination(where, position, trailer):
-                """Card for a load hooked with nowhere recorded to take it.
-
-                The trip is real and the dispatcher can work out where it went
-                from the arrival that follows, but only if they are told the
-                message happened. Nothing is written: a leg to UNKNOWN would
-                enter a round and a route as though it were a real destination.
-                """
-                at = f"`{where}`"
-                if position:
-                    at += f" (dock `{position}`)"
-                return (
-                    f"\u26a0\ufe0f **MANUAL RECONCILE: Load Picked Up With No Destination**\n"
-                    f"\U0001f464 Driver: {user_name}\n"
-                    f"\U0001f4ac Message: `{raw_text}`\n"
-                    f"\U0001f69b Trailer: `{trailer or 'UNKNOWN'}`\n"
-                    f"\U0001f4cd Origin: {at}\n"
-                    f"\u2753 Issue: Load picked up with an origin but no destination "
-                    f"mentioned, so the departure was NOT recorded as a leg."
-                )
-
-            lunch_boundary = intent.get("lunch")
+            # Lunch is recorded regardless of the case: drivers routinely
+            # report lunch in the same breath as a departure or a yard move,
+            # and the work must not be lost to the lunch or the other way.
+            lunch_boundary = ctx.intent.get("lunch")
             if lunch_boundary in ("START", "END"):
-                # Recorded regardless of the case: drivers routinely report
-                # lunch in the same breath as a departure or a yard move, and
-                # the work must not be lost to the lunch or the other way round.
                 await record_lunch(cur, did, msg_timestamp, lunch_boundary)
                 await conn.commit()
 
-            match case_type:
+            handler = CASE_HANDLERS.get(ctx.case_type, handle_default)
+            return await handler(ctx)
 
-                # =========================================================
-                # LUNCH (reported on its own)
-                # =========================================================
-                case "CASE_LUNCH_START":
-                    return {
-                        "is_clean": True, "leg_id": None, "card_text": None,
-                        "reply_text": "🍽 Lunch started",
-                    }
-
-                case "CASE_LUNCH_END":
-                    _, _, minutes = await record_lunch(cur, did, msg_timestamp, "END")
-                    await conn.commit()
-                    taken = f" · {minutes} min" if minutes else ""
-                    return {
-                        "is_clean": True, "leg_id": None, "card_text": None,
-                        "reply_text": f"🍽 Lunch ended{taken}",
-                    }
-
-                # =========================================================
-                # SHIFT BOUNDARIES
-                # =========================================================
-                case "CASE_CLOCK_IN":
-                    reported, expected = await record_clock_in(cur, did, msg_timestamp)
-                    await conn.commit()
-                    logger.info(f"🕐 Driver #{did} clocked in at {reported}.")
-                    late = ""
-                    if expected and reported and reported > expected:
-                        minutes = int((reported - expected).total_seconds() // 60)
-                        late = f" ({minutes} min after expected)"
-                    return {
-                        "is_clean": True,
-                        "leg_id": None,
-                        "card_text": None,
-                        "reply_text": f"✅ Clocked in — {reported:%H:%M}{late}",
-                    }
-
-                case "CASE_CLOCK_OUT":
-                    started, ended, worked = await record_clock_out(cur, did, msg_timestamp)
-                    await conn.commit()
-                    logger.info(f"🕐 Driver #{did} clocked out at {ended}.")
-                    if not started:
-                        return {
-                            "is_clean": False,
-                            "leg_id": None,
-                            "reply_text": f"✅ Clocked out — {ended:%H:%M}",
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Clock-out With No Clock-in**\n"
-                                f"\U0001f464 Driver: {user_name}\n"
-                                f"\U0001f550 Clocked out at `{ended:%H:%M}` but never "
-                                f"reported starting, so hours cannot be worked out."
-                            )
-                        }
-                    return {
-                        "is_clean": True,
-                        "leg_id": None,
-                        "card_text": None,
-                        "reply_text": (
-                            f"✅ Clocked out — {ended:%H:%M} · {format_worked(worked)}"
-                        ),
-                    }
-
-                # =========================================================
-                # LIVE LOAD / UNLOAD COMPLETE
-                # =========================================================
-                case "CASE_WORK_FINISHED":
-                    finished_leg = await stamp_finished()
-                    await conn.commit()
-                    if not finished_leg:
-                        return {"is_clean": True, "leg_id": None, "card_text": None}
-                    logger.info(f"🏁 Driver #{did} finished work on Leg #{finished_leg}.")
-                    return {"is_clean": True, "leg_id": finished_leg, "card_text": None}
-
-                # =========================================================
-                # CASE 1: INTER-FACILITY DEPARTURE
-                # =========================================================
-                case "CASE_1_ORIGIN_DEPARTURE":
-                    display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
-
-                    # 1. AUTO-HEALING: Check if active departure exists today missing a BOL/image
-                    await cur.execute(
-                        f"""SELECT id 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND leg_status = 'IN_TRANSIT'
-                               AND load_status = 'LOADED'
-                               AND (bol_number IS NULL OR bol_image IS NULL)
-                               AND DATE(departure_time) = CURRENT_DATE()
-                          ORDER BY id DESC 
-                             LIMIT 1;""",
-                        (did,)
-                    )
-                    open_leg_missing_bol = await cur.fetchone()
-
-                    if open_leg_missing_bol and (bol_number or primary_image_blob):
-                        leg_id = open_leg_missing_bol[0]
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET bol_number = COALESCE(%s, bol_number),
-                                       document_type = IF(%s != 'UNKNOWN', %s, document_type),
-                                       bol_image = COALESCE(%s, bol_image),
-                                       paperwork_time = COALESCE(paperwork_time, %s),
-                                       trailer_number = IF(%s != 'UNKNOWN', %s, trailer_number)
-                                 WHERE id = %s;""",
-                            (bol_number, document_type, document_type, primary_image_blob,
-                             msg_timestamp if primary_image_blob else None,
-                             display_trailer, display_trailer, leg_id)
-                        )
-                        await record_rm_load(cur, leg_id, intent, origin_loc, dest_loc,
-                                             display_trailer, msg_timestamp,
-                                             driver_id=did, driver_name=user_name)
-                        await conn.commit()
-                        logger.info(f"⚡ CASE 1 AUTO-HEAL: Attached missing BOL '{bol_number}' to active Leg #{leg_id}")
-                        return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                    # A BOL already on another leg means the driver attached the
-                    # PREVIOUS load's paperwork to this one. Every field derived
-                    # from that document is therefore wrong and is discarded. The
-                    # movement itself is real, so the leg is still recorded -- with
-                    # no paperwork -- and the auto-heal above completes it once the
-                    # driver reposts the correct BOL.
-                    duplicate_of = await find_duplicate_bol_leg()
-                    stale_bol = None
-                    if duplicate_of:
-                        stale_bol = bol_number
-                        bol_number = None
-                        document_type = "UNKNOWN"
-                        primary_image_blob = None
-                        shipper_signed = False
-                        logger.warning(
-                            f"Driver #{did} attached BOL '{stale_bol}' already recorded on "
-                            f"Leg #{duplicate_of}; saving movement without paperwork."
-                        )
-
-                    # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
-                    await cur.execute(
-                        f"""SELECT id, 
-                                   trailer_number, 
-                                   destination_location 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND destination_location NOT IN ('UNKNOWN', 'MISSING_ORIGIN', 'MISSING_DEST', '')
-                          ORDER BY id DESC 
-                             LIMIT 1;""",
-                        (did,)
-                    )
-                    last_leg = await cur.fetchone()
-
-                    if not origin_loc or origin_loc in ["UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN"]:
-                        origin_loc = last_leg[2] if (last_leg and last_leg[2]) else (raw_orig.strip().upper() if raw_orig else "UNKNOWN")
-
-                    if not dest_loc or dest_loc in ["UNKNOWN", "NONE", "NULL", "MISSING_DEST"]:
-                        dest_loc = raw_dest.strip().upper() if raw_dest else "UNKNOWN"
-
-                    # Still nowhere to go, but the load is carrying paperwork
-                    # that says where it is consigned. Only reached when the
-                    # driver named no destination at all, and skipped for a
-                    # duplicate BOL, whose ship-to belongs to the previous load.
-                    if (dest_loc == "UNKNOWN" and not duplicate_of
-                            and intent.get("bol_destination")
-                            and site_of(intent["bol_destination"]) != site_of(origin_loc)):
-                        dest_loc = intent["bol_destination"]
-                        logger.info(
-                            f"Driver #{did} named no destination; BOL ship-to "
-                            f"gives {dest_loc}."
-                        )
-
-                    if not display_trailer or display_trailer == "UNKNOWN":
-                        display_trailer = last_leg[1] if (last_leg and last_leg[1]) else "UNKNOWN"
-
-                    # A merged "live loading finished load 200 to E2F" ends the
-                    # previous trip and starts the next in one message.
-                    if intent.get("work_finished"):
-                        await stamp_finished()
-
-                    # Complete prior active legs upon new departure
-                    await cur.execute(
-                        f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                               SET leg_status = 'COMPLETED', 
-                                   arrival_time = COALESCE(arrival_time, %s)
-                             WHERE user_id = %s 
-                               AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING');""",
-                        (msg_timestamp, did)
-                    )
-
-                    leg_id = await open_departure_leg(
-                        origin_loc, dest_loc, display_trailer)
-
-                    # ALERT GUARD 0: Stale BOL. Takes precedence over the paperwork
-                    # guards below, which would otherwise fire on the fields just
-                    # cleared and bury the actionable instruction.
-                    if duplicate_of:
-                        return {
-                            "is_clean": False,
-                            "leg_id": leg_id,
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Stale BOL Attached**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"🚛 Trailer: `{display_trailer}`\n"
-                                f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
-                                f"📄 BOL `{stale_bol}` is already recorded on Leg `{duplicate_of}`.\n"
-                                f"👉 Trip saved as Leg `{leg_id}` with no paperwork. "
-                                f"Ask the driver to repost the correct BOL for this load."
-                            )
-                        }
-
-                    # ALERT GUARD 1: Incomplete Route Data
-                    # A bobtail carries no trailer by definition, and an EMPTY
-                    # reposition rarely names one either -- so a departure must
-                    # never be rejected for a missing trailer when the trailer
-                    # is empty. It is only mandatory when the trailer is LOADED
-                    # (the rigor matters there). Origin and destination are
-                    # still required: without them there is no route to record.
-                    # This is what let terse "bobtail to 210" reports (John
-                    # Shim 10:28) and "Empty 200 sds" (Matthew Cho 09:47 on
-                    # 08/28) vanish while the manual log keeps them as rows.
-                    missing_trailer_ok = (
-                        is_bobtail_flag
-                        or (load_status_val or "") == "EMPTY"
-                    )
-                    if (origin_loc == "UNKNOWN" or dest_loc == "UNKNOWN"
-                            or (display_trailer == "UNKNOWN"
-                                and not missing_trailer_ok)):
-                        return {
-                            "is_clean": False,
-                            "leg_id": leg_id,
-                            "card_text": (
-                                f"⚠️ **MANUAL ATTENTION REQUIRED: Incomplete Departure**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"💬 Message: `{raw_text}`\n"
-                                f"🚛 Trailer: `{display_trailer}`\n"
-                                f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
-                                f"❓ Issue: Missing origin, destination, or trailer number."
-                            )
-                        }
-
-                    # DEPARTURE RULE: LOADED Requires BOL # & Shipper Signed Image
-                    if load_status_val == "LOADED" and not is_bobtail_flag and (not bol_number or not primary_image_blob):
-                        return {
-                            "is_clean": False,
-                            "leg_id": leg_id,
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Loaded Departure Compliance Error**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"🚛 Trailer: `{display_trailer}`\n"
-                                f"📍 Route: `{origin_loc}` ➔ `{dest_loc}`\n"
-                                f"📄 BOL #: `{bol_number or 'MISSING'}` | Paper Photo: `{'ATTACHED' if primary_image_blob else 'MISSING'}`\n"
-                                f"❓ Issue: Outbound LOADED trip requires a valid BOL # and shipper-signed photo."
-                            )
-                        }
-
-                    # DEPARTURE RULE: EMPTY Mid-Shift POD Enforcement (FG Loads ONLY)
-                    if load_status_val == "EMPTY" and not is_bobtail_flag:
-                        # `id <> %s` excludes the leg inserted moments ago: without
-                        # it ORDER BY id DESC always returned that new EMPTY row, so
-                        # the `load_status == 'LOADED'` test below could never be true
-                        # and this guard never fired for any driver.
-                        await cur.execute(
-                            f"""SELECT id, 
-                                       load_status, 
-                                       receiver_signed,
-                                       document_type
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND id <> %s
-                                   AND is_positioning_leg = 0
-                                   AND DATE(departure_time) = CURRENT_DATE()
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did, leg_id)
-                        )
-                        last_shift_leg = await cur.fetchone()
-
-                        # Mid-Shift Check: Block ONLY if prior loaded trip was explicitly NOT Raw Materials ('RM')
-                        if (
-                            last_shift_leg 
-                            and last_shift_leg[1] == "LOADED" 
-                            and not last_shift_leg[2] 
-                            and last_shift_leg[3] != "RM"
-                        ):
-                            return {
-                                "is_clean": False,
-                                "leg_id": leg_id,
-                                "card_text": (
-                                    f"⚠️ **MANUAL RECONCILE: Missing Receiver POD for Prior FG Load**\n"
-                                    f"👤 Driver: {user_name}\n"
-                                    f"🚛 Route: `{origin_loc}` ➔ `{dest_loc}` (EMPTY)\n"
-                                    f"❓ Issue: Previous Finished Goods leg today (Leg #{last_shift_leg[0]}) is missing a receiver-signed POD."
-                                )
-                            }
-
-                    return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                # =========================================================
-                # CASE 2: INTER-FACILITY ARRIVAL
-                # =========================================================
-                case "CASE_2_DESTINATION_ARRIVAL":
-                    await cur.execute(
-                        f"""SELECT id, 
-                                   load_status, 
-                                   is_bobtail,
-                                   destination_location 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING')
-                          ORDER BY id DESC 
-                             LIMIT 1;""",
-                        (did,)
-                    )
-                    active_leg = await cur.fetchone()
-
-                    if active_leg:
-                        leg_id = active_leg[0]
-                        dep_load_status = active_leg[1]
-                        dep_is_bobtail = active_leg[2]
-                        booked_destination = active_leg[3]
-
-                        # Arriving somewhere other than where the departure said
-                        # they were going. Compared by site, so 200F and 200R do
-                        # not read as a mismatch, and only when the driver named
-                        # a facility -- most arrivals just say "arrived".
-                        wrong_destination = (
-                            dest_loc != "UNKNOWN"
-                            and booked_destination
-                            and site_of(dest_loc) != site_of(booked_destination)
-                        )
-
-                        if dep_is_bobtail or is_bobtail_flag:
-                            resolved_action = "BOBTAIL_ARRIVE"
-                            target_status = "COMPLETED"
-                        else:
-                            resolved_action = action_type or ("LIVE_UNLOAD" if dep_load_status == "LOADED" else "DROP_YARD")
-                            
-                            if action_type in ["UNLOAD_COMPLETED", "FINISHED_UNLOAD", "DROP"]:
-                                target_status = "COMPLETED"
-                            elif action_type == "LIVE_LOAD":
-                                target_status = "LOADING"
-                            elif action_type == "LIVE_UNLOAD":
-                                target_status = "UNLOADING"
-                            else:
-                                target_status = "COMPLETED"
-
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET arrival_time = COALESCE(arrival_time, %s),
-                                       arrival_action = %s,
-                                       -- A dock named on arrival means the driver
-                                       -- had already pulled to a door, so real time
-                                       -- on site is longer than the recorded dwell.
-                                       arrival_at_dock = %s,
-                                       dock_number = COALESCE(%s, dock_number),
-                                       do_number = COALESCE(%s, do_number),
-                                       receiver_signed = COALESCE(%s, receiver_signed),
-                                       leg_status = %s
-                                 WHERE id = %s;""",
-                            (
-                                msg_timestamp, 
-                                resolved_action, 
-                                1 if door_num else 0, 
-                                door_num, 
-                                do_num, 
-                                # None, not 0: COALESCE must fall through to the
-                                # stored value when no signature was detected,
-                                # otherwise an arrival wipes a POD captured earlier.
-                                1 if receiver_signed else None, 
-                                target_status, 
-                                leg_id
-                            )
-                        )
-                        await close_rm_load(cur, leg_id, msg_timestamp)
-                        await conn.commit()
-                        logger.info(f"✅ Driver #{did} arrived at {dest_loc}. Leg #{leg_id} updated to {target_status}.")
-
-                        # The same message announced an arrival and the next
-                        # hook. "Load trailer pickup sds dock28 #77209" is filed
-                        # as an arrival -- a facility, a door, no travel named --
-                        # so the load leaving again was recorded nowhere at all,
-                        # not even as a card, and the whole SDS -> 200 run
-                        # vanished from the day.
-                        if is_load_pickup:
-                            hooked_at = (dest_loc if dest_loc != "UNKNOWN"
-                                         else booked_destination)
-                            if hooked_at:
-                                return await start_hooked_load(
-                                    hooked_at, door_num,
-                                    text_trailer or ocr_trailer, leg_id)
-
-                        if wrong_destination:
-                            logger.warning(
-                                f"Driver #{did} was routed to {booked_destination} "
-                                f"but reports arriving at {dest_loc}."
-                            )
-                            return {
-                                "is_clean": False,
-                                "leg_id": leg_id,
-                                "card_text": (
-                                    f"⚠️ **MANUAL RECONCILE: Wrong Destination**\n"
-                                    f"\U0001f464 Driver: {user_name}\n"
-                                    f"\U0001f4cd Routed to `{booked_destination}` "
-                                    f"but arrived at `{dest_loc}`.\n"
-                                    f"\U0001f69b Leg `{leg_id}` records the arrival as reported.\n"
-                                    f"\U0001f449 Confirm with the driver while they are still on site."
-                                )
-                            }
-
-                        return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                    # No open trip. A plain "arrived" with nothing running is
-                    # nothing to record, but a LOADED pickup is a departure the
-                    # driver forgot to announce.
-                    #
-                    # The single facility a pickup names is where they hooked,
-                    # whichever field the parser put it in: "pickup sds dock28"
-                    # reads as travel TO sds, so it comes back as the
-                    # destination, and testing origin alone left the message
-                    # silently dropped.
-                    hooked_at = origin_loc if origin_loc != "UNKNOWN" else dest_loc
-                    if is_load_pickup and hooked_at != "UNKNOWN":
-                        return await start_hooked_load(
-                            hooked_at, door_num, text_trailer or ocr_trailer)
-
-                    return {"is_clean": True, "leg_id": None, "card_text": None}
-
-                # =========================================================
-                # CASE 3: HISTORICAL BOL DOCUMENT PATCH
-                # =========================================================
-                case "CASE_HISTORICAL_BOL_UPDATE":
-                    if not bol_number:
-                        return {
-                            "is_clean": False,
-                            "leg_id": None,
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Unreadable Historical Paperwork**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"❓ Issue: Document uploaded but no readable BOL # could be parsed."
-                            )
-                        }
-
-                    await cur.execute(
-                        f"""SELECT id 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND bol_number = %s 
-                               AND departure_time >= NOW() - INTERVAL 48 HOUR
-                          ORDER BY id DESC 
-                             LIMIT 1;""",
-                        (did, bol_number)
-                    )
-                    target_leg = await cur.fetchone()
-
-                    if target_leg:
-                        leg_id = target_leg[0]
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET bol_image = COALESCE(%s, bol_image),
-                                       document_type = IF(%s != 'UNKNOWN', %s, document_type),
-                                       paperwork_time = COALESCE(paperwork_time, %s),
-                                       shipper_signed = COALESCE(%s, shipper_signed),
-                                       receiver_signed = COALESCE(%s, receiver_signed)
-                                 WHERE id = %s;""",
-                            (
-                                primary_image_blob,
-                                document_type, document_type,
-                                msg_timestamp if primary_image_blob else None,
-                                1 if shipper_signed else None,
-                                1 if receiver_signed else None,
-                                leg_id
-                            )
-                        )
-                        await conn.commit()
-                        logger.info(f"✅ Historical proof patched to Leg #{leg_id} for BOL '{bol_number}'.")
-                        return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                    return {
-                        "is_clean": False,
-                        "leg_id": None,
-                        "card_text": (
-                            f"⚠️ **MANUAL RECONCILE: Unmatched Historical BOL**\n"
-                            f"👤 Driver: {user_name}\n"
-                            f"📄 BOL #: `{bol_number}`\n"
-                            f"❓ Issue: Valid BOL parsed, but no matching leg for BOL `{bol_number}` was found in the past 48h."
-                        )
-                    }
-
-                # =========================================================
-                # CASE AUTO RESOLVE: UNCAPTIONED PAPERWORK AUTO-LINK
-                # =========================================================
-                case "CASE_AUTO_RESOLVE":
-                    if not bol_number:
-                        return {
-                            "is_clean": False,
-                            "leg_id": None,
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Uncaptioned Image Scan Failed**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"❓ Action Needed: Document photo uploaded without text, but no clear BOL # was detected."
-                            )
-                        }
-
-                    # Target driver's recent LOADED leg today that is missing paperwork
-                    await cur.execute(
-                        f"""SELECT id 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND DATE(departure_time) = CURRENT_DATE()
-                               AND load_status = 'LOADED'
-                               AND (bol_number IS NULL OR bol_image IS NULL)
-                          ORDER BY id DESC 
-                             LIMIT 1;""",
-                        (did,)
-                    )
-                    active_leg = await cur.fetchone()
-
-                    if active_leg:
-                        leg_id = active_leg[0]
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET bol_number = COALESCE(bol_number, %s),
-                                       document_type = IF(%s != 'UNKNOWN', %s, document_type),
-                                       bol_image = COALESCE(%s, bol_image),
-                                       paperwork_time = COALESCE(paperwork_time, %s),
-                                       shipper_signed = COALESCE(%s, shipper_signed),
-                                       receiver_signed = COALESCE(%s, receiver_signed)
-                                 WHERE id = %s;""",
-                            (
-                                bol_number,
-                                document_type, document_type,
-                                primary_image_blob,
-                                msg_timestamp if primary_image_blob else None,
-                                1 if shipper_signed else None,
-                                1 if receiver_signed else None,
-                                leg_id
-                            )
-                        )
-                        await conn.commit()
-                        logger.info(f"⚡ Silent Auto-Link: Saved BOL '{bol_number}' to Leg #{leg_id}")
-                        return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                    return {
-                        "is_clean": False,
-                        "leg_id": None, 
-                        "card_text": (
-                            f"⚠️ **MANUAL RECONCILE: No Open Leg Found**\n"
-                            f"👤 Driver: {user_name}\n"
-                            f"📄 BOL #: `{bol_number}`\n"
-                            f"❓ Action Needed: Valid BOL scanned, but no unlinked LOADED leg today was found for this driver."
-                        )
-                    }
-
-                # =========================================================
-                # CASE 3: WITHIN-FACILITY REPOSITIONING
-                # =========================================================
-                case "CASE_3_INTRA_FACILITY_MOVE":
-                    display_trailer = text_trailer if text_trailer and text_trailer != "UNKNOWN" else ocr_trailer
-
-                    # A signed BOL sent with a yard-move caption is proof for the
-                    # trip the driver just finished, not for the move they are
-                    # describing. Positioning legs carry no paperwork, so it is
-                    # attached to the delivery instead of being discarded.
-                    if primary_image_blob and bol_number:
-                        await cur.execute(
-                            f"""SELECT id 
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND is_positioning_leg = 0 
-                                   AND (bol_image IS NULL OR bol_number IS NULL) 
-                                   AND DATE(departure_time) = CURRENT_DATE() 
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did,)
-                        )
-                        delivery = await cur.fetchone()
-                        if delivery:
-                            await cur.execute(
-                                f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                       SET bol_number = COALESCE(bol_number, %s),
-                                           bol_image = COALESCE(bol_image, %s),
-                                           document_type = IF(%s != 'UNKNOWN', %s, document_type),
-                                           paperwork_time = COALESCE(paperwork_time, %s),
-                                           receiver_signed = COALESCE(%s, receiver_signed)
-                                     WHERE id = %s;""",
-                                (bol_number, primary_image_blob,
-                                 document_type, document_type, msg_timestamp,
-                                 1 if receiver_signed else None, delivery[0])
-                            )
-                            await conn.commit()
-                            logger.info(
-                                f"Paperwork {bol_number} sent with a yard-move "
-                                f"caption; attached to delivery Leg #{delivery[0]}."
-                            )
-
-                    def as_dock(value):
-                        """A dock position, or None if this is really a facility.
-
-                        The parser occasionally puts a facility code in a dock
-                        field when the driver names the site ("drop empty 200 r
-                        yard"). A facility is never a dock, so it is rejected
-                        here rather than stored as one.
-                        """
-                        clean = (value or "").strip().upper()
-                        if not clean:
-                            return None
-                        if clean == "YARD":
-                            return clean
-                        if normalize_location(clean) in known_codes or clean in known_codes:
-                            logger.info(
-                                f"Ignoring facility code {clean!r} in a dock field."
-                            )
-                            return None
-                        return clean
-
-                    known_codes = set(LOCATION_CACHE.get("codes") or [])
-                    known_codes |= set(LOCATION_CACHE.get("alias_map") or {})
-
-                    misplaced = [c for c in (origin_dock, destination_dock)
-                                 if c and as_dock(c) is None and c.strip().upper() != "YARD"]
-                    from_dock = as_dock(origin_dock) or as_dock(door_num)
-                    to_dock = as_dock(destination_dock)
-
-                    # If a facility arrived in a dock field and none was given
-                    # as a location, that is where the move happened.
-                    if misplaced and origin_loc == "UNKNOWN" and dest_loc == "UNKNOWN":
-                        origin_loc = dest_loc = normalize_location(misplaced[0])
-                    # Usually no facility is named ("empty move #13 to #47"),
-                    # so fall back to where the driver was last recorded.
-                    facility = origin_loc if origin_loc != "UNKNOWN" else dest_loc
-                    if facility == "UNKNOWN":
-                        await cur.execute(
-                            f"""SELECT destination_location 
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND destination_location NOT IN ('UNKNOWN', 'MISSING_ORIGIN', 'MISSING_DEST', '')
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did,)
-                        )
-                        last_seen = await cur.fetchone()
-                        facility = last_seen[0] if (last_seen and last_seen[0]) else "UNKNOWN"
-
-                    # A work-finished "<= X, empty to X" where the parser read
-                    # the same facility for both ends usually means the driver
-                    # typo'd the ORIGIN ("Finished live unloading e2r g, Empty
-                    # to e2r" -- John Shim 10:17 on 08/28 meant E2F -> E2R).
-                    # The trailer was actually at the last trip leg's
-                    # destination (E2F, where the first half unloaded) and is
-                    # being moved to the text's facility (E2R). When the whole
-                    # message says the job finished, that last trip's
-                    # destination is where the driver really is -- use it as
-                    # the origin so the move records E2F -> E2R instead of a
-                    # same-code E2R -> E2R shuffle.
-                    if (origin_loc != "UNKNOWN" and origin_loc == dest_loc
-                            and site_of(origin_loc) == "E2"
-                            and intent.get("work_finished")):
-                        await cur.execute(
-                            f"""SELECT destination_location 
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND is_positioning_leg = 0 
-                                   AND leg_status = 'COMPLETED'
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did,)
-                        )
-                        completed_row = await cur.fetchone()
-                        if completed_row and completed_row[0]:
-                            completed_dest = completed_row[0].strip().upper()
-                            if (completed_dest not in ("UNKNOWN", "NONE", "NULL")
-                                    and site_of(completed_dest) == site_of(origin_loc)
-                                    and completed_dest != origin_loc):
-                                logger.info(
-                                    f"Driver #{did} work-finished move origin "
-                                    f"'{origin_loc}' looks like a typo; using "
-                                    f"last trip destination '{completed_dest}'."
-                                )
-                                # Destination stays the text's facility (E2R); only the ORIGIN
-                                # inherits from the last trip. `facility` is the
-                                # shared fallback for from/to, so it must stay
-                                # the destination (E2R) -- the corrected origin
-                                # feeds the from-side below.
-                                dest_loc = origin_loc
-                                origin_loc = completed_dest
-
-                    # Which half of the site each door belongs to. At 200 the
-                    # FG inbound doors are 3-21 (200F) and the RM outbound doors
-                    # 47-66 (200R), so "finish live unloading at pactra #3 move
-                    # to Dock 47" is a trailer coming off an inbound door and
-                    # being staged on a vacant outbound one -- the driver saving
-                    # himself, or whoever takes the next RM round, a hook.
-                    site = site_of(facility)
-                    # For a typo-corrected E2F->E2R move, `facility` is the
-                    # destination (E2R) and `origin_loc` is E2F -- so the
-                    # from-side falls back to the corrected origin while the
-                    # to-side keeps the facility. For ordinary same-site moves
-                    # (200F->200R) origin IS the facility, so both sides fold
-                    # to one code as before.
-                    from_facility = facility_for_dock(
-                        from_dock, site) or (
-                        origin_loc if origin_loc != "UNKNOWN" else facility
-                    )
-                    to_facility = facility_for_dock(to_dock, site) or facility
-
-                    move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
-
-                    # A drop at the facility a trip is still running to is that
-                    # trip's ARRIVAL, not a yard shuffle. "Drop empty trailer at
-                    # sds yard D021" reads exactly like an internal move -- one
-                    # facility, a position, no travel -- and the parser cannot
-                    # tell the difference, because only the open leg says the
-                    # driver was on their way there. Recorded as a move it
-                    # invented a second SDS -> SDS leg and left the real one
-                    # open until the next departure closed it, stamping an
-                    # arrival time tens of minutes late.
-                    #
-                    # Only a drop with no position moved FROM qualifies: "door 7
-                    # to yard" and "200F to 200R" both name somewhere the driver
-                    # moved off, so they stay genuine moves whatever else is open.
-                    named_two_places = (
-                        origin_loc != "UNKNOWN" and dest_loc != "UNKNOWN"
-                        and origin_loc != dest_loc
-                    )
-                    # A hooked load is a departure, not a yard move: the
-                    # driver just left the destination out.
-                    loaded_pickup = bool(
-                        is_load_pickup and from_dock is None
-                        and not named_two_places
-                    )
-                    await cur.execute(
-                        f"""SELECT id, destination_location
-                              FROM {TABLE_SHUTTLE_LEGS}
-                             WHERE user_id = %s
-                               AND is_positioning_leg = 0
-                               AND leg_status = 'IN_TRANSIT'
-                          ORDER BY id DESC
-                             LIMIT 1;""",
-                        (did,)
-                    )
-                    open_trip = await cur.fetchone()
-                    if (open_trip and from_dock is None and not named_two_places
-                            and facility != "UNKNOWN"):
-                        trip_id, booked_destination = open_trip
-                        if site_of(booked_destination or "") == site_of(facility):
-                            at_dock = bool(to_dock) and to_dock != "YARD"
-                            # The trailer named at the drop wins over the one on
-                            # the leg. A leg's trailer is often inherited from the
-                            # driver's previous leg (CASE 1 fills it in when the
-                            # message does not name one), so it is a guess that
-                            # goes stale the moment they swap trailers -- Sokhwan
-                            # Yun's 11:18 SDS run carried 25773 from three legs
-                            # earlier while he was actually hauling 77155. The
-                            # drop is a first-hand report from the destination,
-                            # and it is the trailer the dispatcher logs.
-                            dropped_trailer = (
-                                display_trailer
-                                if display_trailer and display_trailer != "UNKNOWN"
-                                else None
-                            )
-                            await cur.execute(
-                                f"""UPDATE {TABLE_SHUTTLE_LEGS}
-                                       SET arrival_time = COALESCE(arrival_time, %s),
-                                           arrival_action = %s,
-                                           arrival_at_dock = %s,
-                                           destination_dock = COALESCE(destination_dock, %s),
-                                           do_number = COALESCE(do_number, %s),
-                                           trailer_number = COALESCE(%s, trailer_number),
-                                           receiver_signed = COALESCE(%s, receiver_signed),
-                                           leg_status = 'COMPLETED'
-                                     WHERE id = %s;""",
-                                (msg_timestamp,
-                                 action_type or ("DROP_DOCK" if at_dock
-                                                 else "DROP_YARD"),
-                                 1 if at_dock else 0,
-                                 to_dock, do_num, dropped_trailer,
-                                 1 if receiver_signed else None,
-                                 trip_id)
-                            )
-                            await close_rm_load(cur, trip_id, msg_timestamp)
-                            # Stamped after the arrival, never before: the unload
-                            # is measured from arrival, and finish_rm_load skips
-                            # any load that has not arrived yet.
-                            if intent.get("work_finished"):
-                                await stamp_finished(trip_id)
-                            await conn.commit()
-                            logger.info(
-                                f"Driver #{did} dropped at {facility} while Leg "
-                                f"#{trip_id} was still running there; recorded as "
-                                f"that leg's arrival, not a positioning move."
-                            )
-                            # They hooked the next load in the same breath. The
-                            # arrival is safe now; the onward trip is not, so it
-                            # still has to be raised.
-                            if loaded_pickup:
-                                return await start_hooked_load(
-                                    facility, to_dock or door_num,
-                                    display_trailer, trip_id)
-                            return {"is_clean": True, "leg_id": trip_id,
-                                    "card_text": None}
-
-                    # "Finish live unloading at pactra #3 move to Dock 47" ends
-                    # one job and describes a move in the same breath. CASE 1
-                    # already handles that pairing on a departure; a yard move
-                    # needs it too, or the unload time is lost.
-                    #
-                    # Only if the last trip actually ended here. When the
-                    # departure was never recorded -- the driver did not say
-                    # where he was taking the load -- the newest leg is some
-                    # earlier run to somewhere else, and stamping it would put
-                    # this unload against the wrong trip.
-                    if intent.get("work_finished"):
-                        await cur.execute(
-                            f"""SELECT id, destination_location 
-                                  FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE user_id = %s 
-                                   AND is_positioning_leg = 0 
-                              ORDER BY id DESC 
-                                 LIMIT 1;""",
-                            (did,)
-                        )
-                        finished_candidate = await cur.fetchone()
-                        if (finished_candidate
-                                and site_of(finished_candidate[1] or "") == site):
-                            await stamp_finished(finished_candidate[0])
-                            await conn.commit()
-                        else:
-                            logger.warning(
-                                f"Driver #{did} reported work finished at "
-                                f"{facility}, but their last recorded trip did "
-                                f"not end there; completion not stamped."
-                            )
-
-                    # Recorded if the paperwork says where it is consigned,
-                    # carded otherwise -- the dispatcher then reads the
-                    # destination off the arrival that follows and only needs to
-                    # know the message happened. Either way no leg to UNKNOWN is
-                    # written; that would enter a round and a route as if real.
-                    if loaded_pickup and facility != "UNKNOWN":
-                        return await start_hooked_load(
-                            facility, to_dock or door_num, display_trailer)
-
-                    # Drivers report one move more than once -- typically the
-                    # signed paperwork first and a photo of the parked trailer a
-                    # few minutes later, both captioned with the same drop. Those
-                    # are one event, so a matching recent move is completed
-                    # rather than duplicated.
-                    await cur.execute(
-                        f"""SELECT id, trailer_number, origin_dock, destination_dock 
-                              FROM {TABLE_SHUTTLE_LEGS} 
-                             WHERE user_id = %s 
-                               AND is_positioning_leg = 1 
-                               AND arrival_time >= %s - INTERVAL %s MINUTE 
-                          ORDER BY id DESC 
-                             LIMIT 5;""",
-                        (did, msg_timestamp, REPEAT_MOVE_MINUTES)
-                    )
-                    for row in await cur.fetchall():
-                        prior_id, prior_trailer, prior_from, prior_to = row
-                        if to_dock and prior_to and to_dock != prior_to:
-                            continue
-                        if (display_trailer and prior_trailer
-                                and display_trailer != prior_trailer):
-                            continue
-                        await cur.execute(
-                            f"""SELECT origin_location FROM {TABLE_SHUTTLE_LEGS} 
-                                 WHERE id = %s;""",
-                            (prior_id,)
-                        )
-                        (prior_site,) = await cur.fetchone()
-                        if site_of(prior_site or "") != site_of(facility):
-                            continue
-
-                        await cur.execute(
-                            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                                   SET trailer_number = COALESCE(trailer_number, %s),
-                                       origin_dock = COALESCE(origin_dock, %s),
-                                       destination_dock = COALESCE(destination_dock, %s)
-                                 WHERE id = %s;""",
-                            (display_trailer, from_dock, to_dock, prior_id)
-                        )
-                        await conn.commit()
-                        logger.info(
-                            f"Driver #{did} re-reported the move {move_desc} at "
-                            f"{facility}; folded into positioning Leg #{prior_id}."
-                        )
-                        return {"is_clean": True, "leg_id": prior_id, "card_text": None}
-
-                    # Every internal move gets its own row. Drivers never label
-                    # these, and billing is by shift rather than by move, so no
-                    # cleanup-vs-reposition guess is needed or wanted. Folding a
-                    # move into the trip leg would also silently overwrite earlier
-                    # moves, since a leg holds only one dock pair.
-                    #
-                    # Recorded COMPLETED so a later arrival can never mistake one
-                    # for an open trip.
-                    await cur.execute(
-                        f"""INSERT INTO {TABLE_SHUTTLE_LEGS} (
-                               user_id, 
-                               trailer_number, 
-                               origin_location, 
-                               destination_location, 
-                               origin_dock, 
-                               destination_dock, 
-                               departure_time, 
-                               arrival_time, 
-                               arrival_action, 
-                               is_positioning_leg, 
-                               leg_status, 
-                               load_status,
-                               round_number
-                           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'COMPLETED', %s, %s);""",
-                        (
-                            did, display_trailer, from_facility, to_facility,
-                            from_dock, to_dock, msg_timestamp, msg_timestamp,
-                            "YARD_DROP" if to_dock == "YARD" else "DOCK_MOVE",
-                            load_status_val,
-                            await current_round_number()
-                        )
-                    )
-                    await conn.commit()
-                    leg_id = cur.lastrowid
-                    logger.info(
-                        f"\U0001f4e6 Driver #{did} moved {move_desc} at {facility}; "
-                        f"recorded as positioning Leg #{leg_id}."
-                    )
-
-                    # A known facility is enough to record the move. "200F to
-                    # 200R" says front to rear without naming a dock, and
-                    # demanding one would card a perfectly clear report.
-                    if facility == "UNKNOWN":
-                        return {
-                            "is_clean": False,
-                            "leg_id": leg_id,
-                            "card_text": (
-                                f"⚠️ **MANUAL RECONCILE: Incomplete Internal Move**\n"
-                                f"👤 Driver: {user_name}\n"
-                                f"💬 Message: `{raw_text}`\n"
-                                f"🚛 Trailer: `{display_trailer or 'UNKNOWN'}`\n"
-                                f"📍 Facility: `{facility}` | Move: `{move_desc}`\n"
-                                f"❓ Issue: Could not determine the facility or the destination "
-                                f"position. Saved as Leg `{leg_id}` for correction."
-                            )
-                        }
-
-                    return {"is_clean": True, "leg_id": leg_id, "card_text": None}
-
-                # =========================================================
-                # END-OF-SHIFT MANIFEST
-                # =========================================================
-                case "CASE_MANIFEST":
-                    image = intent.get("manifest_image") or primary_image_blob
-                    if not image:
-                        return {"is_clean": True, "leg_id": None, "card_text": None}
-
-                    parsed = intent.get("manifest_parsed") or {}
-                    manifest_id, rows = await store_manifest(
-                        cur, did, user_name, msg_timestamp, image, parsed)
-                    await conn.commit()
-                    if not manifest_id:
-                        return {"is_clean": True, "leg_id": None, "card_text": None}
-
-                    logger.info(
-                        f"\U0001f4cb Manifest #{manifest_id} stored for Driver "
-                        f"#{did} with {rows} row(s) read."
-                    )
-                    note = f" · {rows} trips read" if rows else " · not readable"
-                    return {
-                        "is_clean": True,
-                        "leg_id": None,
-                        "card_text": None,
-                        "reply_text": f"\U0001f4cb Manifest received{note}",
-                    }
-
-                # =========================================================
-                # PARSE FAILURE: surface, never swallow
-                # =========================================================
-                case "PARSE_FAILED":
-                    logger.error(
-                        f"Parser unavailable for Driver #{did} ({user_name}); "
-                        f"raising manual card. Detail: {intent.get('parse_error')}"
-                    )
-                    return {
-                        "is_clean": False,
-                        "leg_id": None,
-                        "card_text": (
-                            f"⚠️ **MANUAL RECONCILE: Message Could Not Be Parsed**\n"
-                            f"👤 Driver: {user_name}\n"
-                            f"💬 Message: `{raw_text or '(no text - attached document only)'}`\n"
-                            f"❓ Issue: The AI parser was unavailable after repeated retries, so this "
-                            f"update was NOT recorded. Please enter it manually."
-                        )
-                    }
-
-                case _:
-                    return {"is_clean": False, "card_text": None}

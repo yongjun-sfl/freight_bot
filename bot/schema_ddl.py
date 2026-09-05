@@ -115,6 +115,18 @@ CREATE TABLE IF NOT EXISTS {TABLE_SHUTTLE_LEGS} (
     route_code VARCHAR(32) DEFAULT NULL,
     load_type VARCHAR(32) DEFAULT NULL,
     is_bobtail TINYINT(1) DEFAULT 0,
+    -- ETA is a DURATION in minutes: drive time from location_distances
+    -- (weighted_minutes preferred), plus any lunch that overlaps the transit.
+    -- Stored as minutes rather than a datetime so a report can render
+    -- "3:59 PM" from departure_time + this, and a long drive stays a number.
+
+    eta_minutes INT DEFAULT NULL,
+    -- Lunch touched to a leg so ETA can attribute it to the run it happened
+    -- during. A driver may eat at a facility, in transit (rest area,, or
+    -- anywhere they prefer;the leg it overlaps is where the time is added.
+
+    lunch_start DATETIME DEFAULT NULL,
+    lunch_end DATETIME DEFAULT NULL,
     leg_status ENUM('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING', 'COMPLETED') DEFAULT 'IN_TRANSIT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     dispatch_msg_id BIGINT DEFAULT NULL,
@@ -320,6 +332,15 @@ ADDITIVE_COLUMNS = (
     ("dwell_alert_level",
      f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
      "ADD COLUMN dwell_alert_level INT DEFAULT 0 AFTER arrival_at_dock"),
+    ("eta_minutes",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN eta_minutes INT DEFAULT NULL AFTER dwell_alert_level"),
+    ("lunch_start",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN lunch_start DATETIME DEFAULT NULL AFTER eta_minutes"),
+    ("lunch_end",
+     f"ALTER TABLE {TABLE_SHUTTLE_LEGS} "
+     "ADD COLUMN lunch_end DATETIME DEFAULT NULL AFTER lunch_start"),
 )
 
 # Same shape, for location_codes.

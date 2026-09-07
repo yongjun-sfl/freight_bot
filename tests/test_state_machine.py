@@ -133,6 +133,104 @@ async def test_reposted_bol_heals_the_stale_bol_leg(pool):
     assert leg["document_type"] == "FG"
     assert leg["shipper_signed"] == 1
     assert len(await all_legs(pool)) == 2   # the old leg plus this one, no extras
+async def test_reposted_receiver_signed_pod_backfills_the_original_leg(pool):
+    """A duplicate BOL re-posted with a receiver signature is a POD, not stale.
+
+    It backfills the ORIGINAL leg's BOL image and marks receiver_signed --
+    whether or not that leg is already COMPLETED -- and opens no new leg.
+    """
+    original = await insert_leg(
+        pool, bol_number="B100", leg_status="COMPLETED",
+        bol_image=b"original-bol", receiver_signed=0,
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", load_status="LOADED",
+               primary_image_blob=IMG, receiver_signed=True,
+               document_type="FG"),
+    )
+    assert res["is_clean"] is True
+    assert res["leg_id"] == original
+
+    leg = await get_leg(pool, original)
+    assert leg["bol_image"] == IMG
+    assert leg["receiver_signed"] == 1
+    assert leg["document_type"] == "FG"
+    assert leg["paperwork_time"] is not None
+    assert len(await all_legs(pool)) == 1   # no spurious leg for the repost
+
+
+async def test_reposted_shipper_signed_duplicate_is_still_stale(pool):
+    """A shipper-signed duplicate is NOT a POD -- it stays the stale-BOL path.
+
+    Receiver-signed copies backfill the original leg; shipper-signed ones
+    still record the movement, discard the paperwork and card for a repost.
+    """
+    await insert_leg(
+        pool, bol_number="B100", leg_status="COMPLETED",
+        bol_image=b"original-bol", receiver_signed=0,
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
+               origin_location="200", destination_location="E2F",
+               text_trailer="77344", load_status="LOADED",
+               primary_image_blob=IMG, receiver_signed=False,
+               shipper_signed=True, document_type="FG"),
+    )
+    assert res["is_clean"] is False
+    assert "Stale BOL" in res["card_text"]
+    leg_rows = await all_legs(pool)
+    assert len(leg_rows) == 2   # original + new movement leg
+    # The new/only in-transit leg must not carry the stale BOL or its fields.
+    moved = [l for l in leg_rows if l["leg_status"] == "IN_TRANSIT"][0]
+    assert moved["bol_number"] is None
+    assert moved["bol_image"] is None
+    assert moved["document_type"] == "UNKNOWN"
+
+
+async def test_receiver_signed_pod_with_onward_movement_still_records_the_leg(pool):
+    """A POD photo attached to a finish-unload/empty-move message is not a repost.
+
+    When the driver finishes a live unload and immediately reports the empty
+    reposition ("finished live unloading empty 7634 to 200"), the attached
+    receiver-signed BOL belongs to the leg just delivered. Backfill that leg's
+    POD, but DO NOT swallow the new departure -- movement wins over a document.
+    """
+    original = await insert_leg(
+        pool, bol_number="B100", leg_status="COMPLETED",
+        origin_location="200", destination_location="7634",
+        bol_image=b"original-bol", receiver_signed=0,
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", bol_number="B100",
+               origin_location="7634", destination_location="200",
+               load_status="EMPTY", work_finished=True,
+               primary_image_blob=IMG, receiver_signed=True,
+               document_type="FG"),
+    )
+    assert res["is_clean"] is True
+    assert res["leg_id"] != original           # new empty-reposition leg
+
+    old = await get_leg(pool, original)
+    assert old["bol_image"] == IMG             # POD backfilled to the delivery
+    assert old["receiver_signed"] == 1
+    assert old["document_type"] == "FG"
+
+    legs = await all_legs(pool)
+    assert len(legs) == 2                        # delivery + onward movement
+    moved = [l for l in legs if l["id"] == res["leg_id"]][0]
+    assert moved["origin_location"] == "7634"
+    assert moved["destination_location"] == "200"
+    assert moved["bol_number"] is None         # the old BOL must not ride along
+    assert moved["bol_image"] is None
+    assert moved["document_type"] == "UNKNOWN"
 
 
 # ==========================================================================

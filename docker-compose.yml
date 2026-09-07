@@ -8,7 +8,9 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
-      - "3306:3306"
+      # Host port is env-overridable (localhost MySQL/mariadb squat on 3306 in
+      # this dev environment); internal services always reach it as mysql_db:3306
+      - "${MYSQL_HOST_PORT:-3306}:3306"
     volumes:
       # Defaults to the EC2 host path; override locally via MYSQL_DATA_PATH in .env
       - ${MYSQL_DATA_PATH:-/home/ubuntu/SFL/freight_bot/mysql_data}:/var/lib/mysql

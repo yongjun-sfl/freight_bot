@@ -356,6 +356,68 @@ async def handle_case_1_departure(ctx):
     # no paperwork -- and the auto-heal above completes it once the
     # driver reposts the correct BOL.
     duplicate_of = await ctx.find_duplicate_bol_leg()
+
+    # RECEIVER-SIGNED REPOST = POD backfill. When the SAME BOL is reposted
+    # carrying a receiver stamp/signature -- proof the goods reached the
+    # consignee -- it is not stale paperwork. It is the delivery receipt for
+    # the ORIGINAL leg, so backfill that leg's BOL image and mark it
+    # receiver-signed. Whether the leg is COMPLETED or still in transit does
+    # not matter: the POD belongs to it either way. (A shipper-signed
+    # duplicate is still treated as stale below; only a receiver-signed copy
+    # is a completion signal.)
+    if duplicate_of and receiver_signed:
+        await cur.execute(
+            f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                   SET bol_image = COALESCE(%s, bol_image),
+                       document_type = IF(%s != 'UNKNOWN', %s, document_type),
+                       paperwork_time = COALESCE(paperwork_time, %s),
+                       receiver_signed = 1
+                 WHERE id = %s;""",
+            (primary_image_blob, document_type, document_type,
+             msg_timestamp if primary_image_blob else None, duplicate_of)
+        )
+        await conn.commit()
+        logger.info(
+            f"📦 Driver #{did} reposted BOL '{bol_number}' receiver-signed; "
+            f"POD backfilled to Leg #{duplicate_of}."
+        )
+
+        # Movement always wins over a document. If the caption is ONLY the
+        # POD for an already-recorded leg (same route, or no route at all),
+        # no new leg is opened. But a caption like "finish live unloading
+        # empty 7634 to 200" is ALSO the next departure: backfill the POD on
+        # the delivered leg above, then keep recording the empty reposition.
+        await cur.execute(
+            f"SELECT origin_location, destination_location "
+            f"FROM {TABLE_SHUTTLE_LEGS} WHERE id = %s;",
+            (duplicate_of,)
+        )
+        dup_route = await cur.fetchone()
+        unknown_orig = origin_loc in ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")
+        unknown_dest = dest_loc in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST")
+        same_route = bool(
+            dup_route and not unknown_orig and not unknown_dest
+            and site_of(origin_loc) == site_of(dup_route[0])
+            and site_of(dest_loc) == site_of(dup_route[1])
+        )
+        if same_route or (unknown_orig and unknown_dest):
+            return {"is_clean": True, "leg_id": duplicate_of, "card_text": None}
+
+        # Onward movement: the duplicate document belongs to the delivered
+        # leg (POD-backfilled above). Keep the route, discard the stale BOL
+        # fields so they do not ride along, and do not card a repost.
+        pod_bol = bol_number
+        bol_number = ctx.bol_number = None
+        document_type = ctx.document_type = "UNKNOWN"
+        primary_image_blob = ctx.primary_image_blob = None
+        shipper_signed = ctx.shipper_signed = False
+        receiver_signed = ctx.receiver_signed = False
+        duplicate_of = None
+        logger.info(
+            f"Driver #{did} POD for BOL '{pod_bol}' backfilled; "
+            f"recording onward movement without that paperwork."
+        )
+
     stale_bol = None
     if duplicate_of:
         stale_bol = bol_number

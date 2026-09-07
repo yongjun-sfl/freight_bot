@@ -426,6 +426,61 @@ async def test_work_finished_with_two_facilities_no_to_records_a_departure(pool)
     assert leg["load_status"] == "EMPTY"
 
 
+async def test_work_finished_with_llm_pair_but_no_bare_alias_records_departure(pool):
+    """Live data 08/28, Young Teak Kong 12:59: "finish Live unloading e2 to sds".
+
+    The parser sometimes files it as CASE_WORK_FINISHED with the canonical pair
+    already filled in (origin E2F, destination SDS), but the raw-text regex
+    cannot see "e2" because E2 is a site code, not a location alias. The state
+    machine must still promote it to a departure instead of only stamping the
+    completion.
+    """
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_WORK_FINISHED",
+               raw_text="Kong finish Live unloading e2 to sds",
+               origin_location="E2F", destination_location="SDS",
+               work_finished=True),
+    )
+    assert res["is_clean"] is True, res
+    assert res["card_text"] is None, res
+
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["is_positioning_leg"] == 0
+    assert leg["origin_location"] == "E2F", f"was {leg['origin_location']}"
+    assert leg["destination_location"] == "SDS", f"was {leg['destination_location']}"
+    assert leg["load_status"] == "EMPTY"
+
+
+async def test_finish_unload_empty_origin_uses_the_unload_site(pool):
+    """Live data 08/28, Young Teak Kong 09:44: he wrote "empty 200 to sds" after
+    unloading at E2F. The trip is E2F -> SDS (the manual log), not 200F -> SDS:
+    the just-unloaded leg's destination must win over the stray facility name.
+    """
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="200F", destination_location="E2F",
+        load_status="LOADED", document_type="RM", leg_status="UNLOADING",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Kong \nFinish Live unloading  empty 200 to sds",
+               origin_location="200", destination_location="SDS",
+               load_status="EMPTY", work_finished=True),
+    )
+    assert res["is_clean"] is True, res
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "E2F", f"was {leg['origin_location']}"
+    assert leg["destination_location"] == "SDS"
+    assert leg["load_status"] == "EMPTY"
+    assert leg["is_positioning_leg"] == 0
+
+    delivered = [l for l in await all_legs(pool) if l["destination_location"] == "E2F"][0]
+    assert delivered["leg_status"] == "COMPLETED"
+
+
 async def test_arrived_x_from_y_is_not_a_phantom_departure(pool):
     """Live data 08/28, Younypyo Kim: \"arrived 3551 from 200 / empty drop 5\"
     is an ARRIVAL at 3551 (the 'from 200' says where it came from), NOT a
@@ -1263,6 +1318,30 @@ async def test_orphan_loaded_pickup_read_as_an_arrival_also_cards(pool):
     assert "Load Picked Up With No Destination" in res["card_text"]
 
 
+async def test_load_pickup_filed_as_arrival_but_naming_destination_is_a_departure(pool):
+    """Live data 08/28, Young Teak Kong 10:10: "Load pick up D 020 sds to 200".
+
+    The LLM sometimes files that as CASE 2 (an arrival at SDS) even though the
+    caption names the destination. The two-facility recovery must promote it to
+    a CASE 1 departure so the SDS -> 200F loaded leg is not lost to a card.
+    """
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Load pick up  D 020 sds to 200 Kong",
+               origin_location="SDS", destination_location="SDS",
+               load_status="LOADED", text_trailer="77277",
+               bol_number="B1", primary_image_blob=IMG, document_type="FG"),
+    )
+    assert res["is_clean"] is True, res
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "SDS"
+    assert leg["destination_location"] == "200F", f"was {leg['destination_location']}"
+    assert leg["load_status"] == "LOADED"
+    assert leg["is_positioning_leg"] == 0
+
+
 async def test_a_plain_arrival_with_no_open_trip_stays_quiet(pool):
     """Only a pickup is a lost departure; a bare "arrived" is nothing."""
     res = await commit(
@@ -1272,6 +1351,43 @@ async def test_a_plain_arrival_with_no_open_trip_stays_quiet(pool):
     )
     assert res["is_clean"] is True
     assert res["card_text"] is None
+
+
+async def test_empty_drop_with_no_open_trip_infers_the_reposition(pool):
+    """Live data 08/28, Young Teak Kong 15:19: he drops empty at SDS but never
+    said "200F to SDS" aloud (the 14:37 finish message only said "다음 로드
+    주세요"). The empty drop is first-hand evidence the reposition happened, so
+    the bot records it from the last completed trip's destination.
+    """
+    await seed_network(pool)
+    now = eastern_now()
+    departed = ts(now - timedelta(minutes=90))
+    arrived = ts(now - timedelta(minutes=80))
+    finished = ts(now - timedelta(minutes=42))
+    delivered = await insert_leg(
+        pool, origin_location="SDS", destination_location="200F",
+        load_status="LOADED", document_type="FG", receiver_signed=1,
+        leg_status="COMPLETED", departure_time=departed,
+        arrival_time=arrived, finished_time=finished,
+    )
+
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Empty drop yard sds D 012 Kong",
+               destination_location="SDS", load_status="EMPTY"),
+        when=ts(now),
+    )
+    assert res["is_clean"] is True, res
+    assert res["leg_id"] is not None and res["leg_id"] != delivered
+
+    inferred = await get_leg(pool, res["leg_id"])
+    assert inferred["origin_location"] == "200F"
+    assert inferred["destination_location"] == "SDS"
+    assert inferred["load_status"] == "EMPTY"
+    assert inferred["leg_status"] == "COMPLETED"
+    assert ts(inferred["departure_time"]) == finished
+    assert inferred["arrival_time"] is not None
 
 
 async def test_a_loaded_yard_move_is_not_a_lost_pickup(pool):

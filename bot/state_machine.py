@@ -180,9 +180,34 @@ async def commit_trip_leg(
 
             # 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
             # "Unloading finished / Empty 200 sds" is an EMPTY 200 -> sds trip.
-            if (ctx.case_type in ("CASE_WORK_FINISHED", "NONE_WORK_RELATED")
-                    and ctx.raw_text):
+            # A load pickup the parser filed as an arrival ("Load pick up D 020
+            # sds to 200") is likewise a departure; only a hook that names no
+            # destination should reach the CASE 2 no-destination card.
+            recoverable = ctx.case_type in (
+                "CASE_WORK_FINISHED", "NONE_WORK_RELATED")
+            if (ctx.case_type == "CASE_2_DESTINATION_ARRIVAL"
+                    and ctx.is_load_pickup):
+                recoverable = True
+            if recoverable and ctx.raw_text:
                 pair_origin, pair_dest = two_facilities_in_order(ctx.raw_text)
+
+                # The regex needs a bare alias in the code list ("e2 to sds"
+                # does not resolve because E2 is a site, not a location code),
+                # but the LLM sometimes already returns the canonical pair.
+                # When it did, that is a real departure -- use it as the
+                # fallback so a finish-unload + move is not silently dropped.
+                if (not pair_origin
+                        and ctx.case_type == "CASE_WORK_FINISHED"):
+                    llm_origin = ctx.origin_loc
+                    llm_dest = ctx.dest_loc
+                    if (llm_origin and llm_dest
+                            and llm_origin not in (
+                                "UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")
+                            and llm_dest not in (
+                                "UNKNOWN", "NONE", "NULL", "MISSING_DEST")
+                            and site_of(llm_origin) != site_of(llm_dest)):
+                        pair_origin, pair_dest = llm_origin, llm_dest
+
                 if pair_origin and pair_dest:
                     logger.info(
                         f"Driver #{did} filed as {ctx.case_type} but names "

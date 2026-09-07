@@ -25,7 +25,7 @@ from shifts import (
     record_lunch,
 )
 
-from leg_helpers import REPEAT_MOVE_MINUTES
+from leg_helpers import REPEAT_MOVE_MINUTES, UNLOAD_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +430,32 @@ async def handle_case_1_departure(ctx):
             f"Leg #{duplicate_of}; saving movement without paperwork."
         )
 
+    # WORK-FINISHED ORIGIN CORRECTION: after a live unload the driver is at
+    # the facility they just delivered, even when the empty-reposition caption
+    # contains a stray facility name (Young Teak Kong 09:44 wrote "Finish Live
+    # unloading empty 200 to sds" after unloading at E2F -- the trip is
+    # E2F -> SDS, not 200F -> SDS). Trust the leg that was just unloaded.
+    if (intent.get("work_finished") and UNLOAD_PATTERN.search(raw_text)
+            and load_status_val == "EMPTY"
+            and origin_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")):
+        await cur.execute(
+            f"""SELECT destination_location
+                  FROM {TABLE_SHUTTLE_LEGS}
+                 WHERE user_id = %s
+                   AND is_positioning_leg = 0
+              ORDER BY id DESC
+                 LIMIT 1;""",
+            (did,)
+        )
+        unloaded_at_row = await cur.fetchone()
+        if (unloaded_at_row and unloaded_at_row[0]
+                and site_of(unloaded_at_row[0]) != site_of(origin_loc)):
+            logger.info(
+                f"Driver #{did} finished unloading at {unloaded_at_row[0]} but "
+                f"reported empty origin {origin_loc}; using the unload site."
+            )
+            origin_loc = ctx.origin_loc = normalize_location(unloaded_at_row[0])
+
     # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
     await cur.execute(
         f"""SELECT id, 
@@ -751,6 +777,76 @@ async def handle_case_2_arrival(ctx):
     if is_load_pickup and hooked_at != "UNKNOWN":
         return await ctx.start_hooked_load(
             hooked_at, door_num, text_trailer or ocr_trailer)
+
+    # EMPTY-DROP INFERENCE: the driver dropped an empty at a facility
+    # with no trip open to it. The departure was never announced, but the
+    # drop itself is first-hand evidence they moved there empty from
+    # wherever their last completed trip ended. Young Teak Kong 15:19 on
+    # 08/28 ("Empty drop yard sds D 012" after finishing unload at 200F
+    # at 14:37) is the manual log's 14:40 200F -> SDS empty row.
+    if (not is_load_pickup and load_status_val == "EMPTY"
+            and dest_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST")):
+        await cur.execute(
+            f"""SELECT destination_location,
+                       trailer_number,
+                       COALESCE(finished_time, arrival_time, departure_time) AS ended_at
+                  FROM {TABLE_SHUTTLE_LEGS}
+                 WHERE user_id = %s
+                   AND is_positioning_leg = 0
+              ORDER BY id DESC
+                 LIMIT 1;""",
+            (did,)
+        )
+        delivered = await cur.fetchone()
+        if (delivered and delivered[0]
+                and delivered[0] not in ("UNKNOWN", "NONE", "NULL",
+                                          "MISSING_DEST", "")
+                and delivered[2]
+                and site_of(delivered[0]) != site_of(dest_loc)
+                and str(delivered[2])[:10] == str(msg_timestamp)[:10]):
+            await cur.execute(
+                f"""SELECT origin_location, destination_location
+                      FROM {TABLE_SHUTTLE_LEGS}
+                     WHERE user_id = %s
+                       AND is_positioning_leg = 0
+                       AND departure_time >= %s
+                       AND departure_time <= %s
+                  ORDER BY id;""",
+                (did, delivered[2], msg_timestamp)
+            )
+            already_recorded = any(
+                site_of(row[0]) == site_of(delivered[0])
+                and site_of(row[1]) == site_of(dest_loc)
+                for row in await cur.fetchall()
+            )
+            if not already_recorded:
+                reported_trailer = text_trailer or ocr_trailer
+                if reported_trailer and reported_trailer != "UNKNOWN":
+                    empty_trailer = reported_trailer
+                else:
+                    empty_trailer = delivered[1]
+                leg_id = await ctx.open_departure_leg(
+                    normalize_location(delivered[0]), dest_loc,
+                    empty_trailer, departure_time=delivered[2])
+                await cur.execute(
+                    f"""UPDATE {TABLE_SHUTTLE_LEGS}
+                           SET arrival_time = COALESCE(arrival_time, %s),
+                               arrival_action = 'DROP_YARD',
+                               arrival_at_dock = %s,
+                               dock_number = COALESCE(%s, dock_number),
+                               trailer_number = COALESCE(%s, trailer_number),
+                               leg_status = 'COMPLETED'
+                         WHERE id = %s;""",
+                    (msg_timestamp, 1 if door_num else 0, door_num,
+                     empty_trailer, leg_id)
+                )
+                await conn.commit()
+                logger.info(
+                    f"Driver #{did} dropped empty at {dest_loc} with no trip "
+                    f"open; inferred the empty reposition from "
+                    f"{normalize_location(delivered[0])} as Leg #{leg_id}."
+                )
+                return {"is_clean": True, "leg_id": leg_id, "card_text": None}
 
     return {"is_clean": True, "leg_id": None, "card_text": None}
 

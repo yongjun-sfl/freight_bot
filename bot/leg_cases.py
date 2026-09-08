@@ -1342,14 +1342,21 @@ async def handle_case_3_intra_move(ctx):
     # For a typo-corrected E2F->E2R move, `facility` is the
     # destination (E2R) and `origin_loc` is E2F -- so the
     # from-side falls back to the corrected origin while the
-    # to-side keeps the facility. For ordinary same-site moves
-    # (200F->200R) origin IS the facility, so both sides fold
-    # to one code as before.
+    # to-side keeps the facility. For an ordinary same-site move
+    # where the driver names front AND rear (200F->200R), preserve
+    # the named destination instead of folding both sides to the
+    # origin facility.
     from_facility = facility_for_dock(
         from_dock, site) or (
         origin_loc if origin_loc != "UNKNOWN" else facility
     )
-    to_facility = facility_for_dock(to_dock, site) or facility
+    to_facility = facility_for_dock(to_dock, site)
+    if not to_facility:
+        to_facility = (
+            dest_loc
+            if dest_loc != "UNKNOWN" and site_of(dest_loc) == site_of(facility)
+            else facility
+        )
 
     move_desc = f"{from_dock or '?'} \u2794 {to_dock or '?'}"
 

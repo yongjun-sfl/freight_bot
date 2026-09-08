@@ -56,7 +56,25 @@ async def test_same_site_departure_becomes_a_within_facility_move(pool):
     assert res["is_clean"] is True
     leg = await get_leg(pool, res["leg_id"])
     assert leg["is_positioning_leg"] == 1
-    assert leg["origin_location"] == leg["destination_location"]
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "200R"
+
+
+async def test_200_r_spelled_with_space_normalizes_to_rear(pool):
+    """Live 09-04, ILPYO 11:29: the driver wrote '200 r' with a space. That is
+    200R (rear), not a second 200F -- leg #60 must not become 200F => 200F."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text="200F to 200 r",
+               origin_location="200F", destination_location="200 R",
+               load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "200R"
+    assert leg["is_positioning_leg"] == 1
 
 
 async def test_stale_bol_records_movement_without_paperwork(pool):

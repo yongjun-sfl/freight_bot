@@ -3,3 +3,5 @@ mysql_data/
 __pycache__/
 .pytest_cache/
 backups/
+# Replay fixtures and operational data live on disk, not in git.
+data/

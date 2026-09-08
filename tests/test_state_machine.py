@@ -60,6 +60,36 @@ async def test_same_site_departure_becomes_a_within_facility_move(pool):
     assert leg["destination_location"] == "200R"
 
 
+async def test_direction_to_another_driver_is_not_recorded(pool):
+    """ILPYO HONG 09-04 12:47: the text tells Young Teak Kong to drop an empty
+    at E1 and bobtail to SDS. It names another driver and never names Ilpyo, so
+    it must not create a leg on Ilpyo's record."""
+    await seed_network(pool)
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """INSERT INTO driver_profiles
+                        (user_id, driver_name, name_kor, name_eng, short_name,
+                         truck_plate, home_repo, is_active)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
+                (8644639691, "YOUNG TEAK KONG", "공영택", "YOUNG TEAK KONG",
+                 "공영택", "GTX433", "200F", 1),
+            )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_1_ORIGIN_DEPARTURE",
+            raw_text="공영택 사장 께서도 엠티 E1 yard 에 갖다가 놓고 "
+                     "SDS 에 밥테일로 가서 엠티 픽업 합니다",
+            origin_location="E1", destination_location="SDS",
+            load_status="EMPTY", work_finished=False,
+        ),
+    )
+    assert res["leg_id"] is None
+    assert res["card_text"] is None
+    assert await all_legs(pool) == []
+
+
 async def test_200_r_spelled_with_space_normalizes_to_rear(pool):
     """Live 09-04, ILPYO 11:29: the driver wrote '200 r' with a space. That is
     200R (rear), not a second 200F -- leg #60 must not become 200F => 200F."""

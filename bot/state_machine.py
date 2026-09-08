@@ -202,6 +202,46 @@ async def commit_trip_leg(
                 )
                 return {"is_clean": False, "leg_id": None, "card_text": None}
 
+            # 0a. THIRD-PERSON DIRECTION GUARD. Drivers sometimes relay what
+            # ANOTHER driver is supposed to do ("공영택 사장 께서도 엠티 E1 yard
+            # 에 ... 픽업 합니다"). That is a direction to someone else, not the
+            # sender's movement. When another registered driver is named and the
+            # sender is not, treat it as no-op instead of inventing sender legs.
+            raw_upper = " ".join((ctx.raw_text or "").upper().split())
+
+            def name_in_text(name):
+                if not name:
+                    return False
+                normalized = " ".join(str(name).upper().split())
+                return bool(normalized) and normalized in raw_upper
+
+            async def driver_names(uid):
+                await cur.execute(
+                    f"SELECT name_eng, name_kor, short_name "
+                    f"  FROM {TABLE_DRIVERS} WHERE user_id = %s;",
+                    (uid,)
+                )
+                return await cur.fetchone() or (None, None, None)
+
+            own_names = await driver_names(did)
+            await cur.execute(
+                f"SELECT name_eng, name_kor, short_name "
+                f"  FROM {TABLE_DRIVERS} WHERE user_id <> %s;",
+                (did,)
+            )
+            other_rows = await cur.fetchall()
+            other_mentioned = any(
+                name_in_text(name)
+                for row in other_rows for name in row
+            )
+            self_mentioned = any(name_in_text(name) for name in own_names)
+            if other_mentioned and not self_mentioned:
+                logger.info(
+                    f"Driver #{did} message names another driver and not "
+                    f"themselves; treating as a direction/no-op."
+                )
+                return {"is_clean": True, "leg_id": None, "card_text": None}
+
             # 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
             # "Unloading finished / Empty 200 sds" is an EMPTY 200 -> sds trip.
             # A load pickup the parser filed as an arrival ("Load pick up D 020

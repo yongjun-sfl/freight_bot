@@ -135,10 +135,13 @@ async def replay(pool):
 async def bot_legs(pool):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Include positioning legs: the dispatcher's sheet records yard
+            # moves and same-site moves (ILPYO yard move, John Shim E2F->E2R),
+            # so they are matchable truth even though they are not billable
+            # trips. Clock In rows are filtered from the manual side instead.
             await cur.execute("""
                 SELECT l.*, d.name_eng AS driver
                   FROM shuttle_legs l JOIN driver_profiles d ON d.user_id = l.user_id
-                 WHERE l.is_positioning_leg = 0
               ORDER BY d.name_eng, l.departure_time;""")
             return list(await cur.fetchall())
 
@@ -236,6 +239,10 @@ async def main():
     print(f"\n  {processed} messages replayed, {skipped} skipped\n")
 
     manual = load_day(WORKBOOK, SHEET)
+    # A "Clock In" row is a shift event, not a shuttle leg; the bot stores it in
+    # driver_shifts. Everything else in the sheet (including yard moves) is
+    # matched now that bot positioning legs are part of the comparison.
+    manual = [r for r in manual if (r["transaction"] or "").upper() != "CLOCK IN"]
     if ONLY_DRIVER:
         manual = [r for r in manual if r["driver"] == ONLY_DRIVER]
     bot = await bot_legs(pool)

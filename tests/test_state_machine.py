@@ -1134,6 +1134,28 @@ async def test_a_drop_somewhere_else_is_not_the_arrival(pool):
     assert (await get_leg(pool, trip))["leg_status"] == "IN_TRANSIT"
 
 
+async def test_yard_drop_with_from_does_not_create_reverse_leg(pool):
+    """ILPYO 09-04 18:56: 'drop empty 200r yard. from 100 cartersville' is the
+    arrival half of the already-open 100 -> 200F return, not a 200R -> 100
+    departure. The 'from 100' must not be turned into a destination."""
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="100", destination_location="200F",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Hong il pyo drop empty 200r yard. from 100 cartersville",
+               origin_location="200R", destination_location="200R",
+               action="DROP_YARD", load_status="EMPTY"),
+    )
+    assert res["leg_id"] == trip
+    legs = await all_legs(pool)
+    assert len(legs) == 1, f"expected no phantom 200R->100, got {legs}"
+    assert (await get_leg(pool, trip))["leg_status"] == "COMPLETED"
+
+
 async def test_the_trailer_named_at_the_drop_corrects_the_leg(pool):
     """From live data: Sokhwan Yun's 11:18 SDS run was recorded with trailer
     25773, inherited by the CASE 1 fallback from three legs earlier. He had

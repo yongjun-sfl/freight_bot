@@ -118,13 +118,14 @@ def two_facilities_in_order(raw_text):
     """
     if not raw_text:
         return None, None
-    # Guard: an ARRIVAL is not the departure being recovered. "arrived X from
-    # Y" names two facilities but the "from Y" is where the trip started, not
-    # a return leg -- recovering it invented a phantom for every Younypyo Kim
-    # stop. Only treat it as a departure when there is an onward cue (an
-    # explicit "to", or a bare "empty X Y" without "arrived ... from").
+    # Guard: an ARRIVAL/DROP is not the departure being recovered. "arrived X
+    # from Y" or "drop X yard. from Y" names two facilities, but the "from Y"
+    # is where the trip started, not a return leg -- recovering it invented
+    # phantoms (Younypyo Kim arrivals, ILPYO 18:56 200R->100). Only treat it
+    # as a departure when there is an onward cue (an explicit "to").
     text_l = raw_text.lower()
-    if (("arrived" in text_l or "arrive" in text_l)
+    if (("arrived" in text_l or "arrive" in text_l
+            or "drop" in text_l or "dropped" in text_l)
             and " from " in text_l
             and " to " not in text_l):
         return None, None

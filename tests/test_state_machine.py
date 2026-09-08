@@ -163,6 +163,34 @@ async def test_reposted_receiver_signed_pod_backfills_the_original_leg(pool):
     assert len(await all_legs(pool)) == 1   # no spurious leg for the repost
 
 
+async def test_receiver_signed_pod_with_yard_move_caption_backfills_original(pool):
+    """Live 09-04, ILPYO HONG 11:29: 'finished live unloading empty 200 #8 to
+    200 r' is filed as a same-site yard move (CASE_3), but the attached image is
+    the receiver-stamped POD for the FG leg that just delivered. It must
+    backfill that leg, not be lost because the caption never went through
+    CASE_1."""
+    await seed_network(pool)
+    original = await insert_leg(
+        pool, bol_number="B100", leg_status="COMPLETED",
+        bol_image=b"original-bol", receiver_signed=0, document_type="FG",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="Hong il PYO finished live unloading empty 200 #8 to 200 r",
+            origin_location="200", destination_location="200",
+            load_status="EMPTY", bol_number="B100",
+            primary_image_blob=IMG, receiver_signed=True, document_type="FG",
+        ),
+    )
+    assert res["leg_id"] is not None
+    leg = await get_leg(pool, original)
+    assert leg["receiver_signed"] == 1
+    assert leg["bol_image"] == IMG
+    assert leg["document_type"] == "FG"
+
+
 async def test_reposted_shipper_signed_duplicate_is_still_stale(pool):
     """A shipper-signed duplicate is NOT a POD -- it stays the stale-BOL path.
 

@@ -1181,38 +1181,65 @@ async def handle_case_3_intra_move(ctx):
     # A signed BOL sent with a yard-move caption is proof for the
     # trip the driver just finished, not for the move they are
     # describing. Positioning legs carry no paperwork, so it is
-    # attached to the delivery instead of being discarded.
+    # attached to the delivery instead of being discarded. When the
+    # BOL is a RECEIVER-signed repost of a leg that already exists,
+    # that is a POD backfill and must update the original leg even
+    # though the caption never routed through CASE 1.
     if primary_image_blob and bol_number:
-        await cur.execute(
-            f"""SELECT id 
-                  FROM {TABLE_SHUTTLE_LEGS} 
-                 WHERE user_id = %s 
-                   AND is_positioning_leg = 0 
-                   AND (bol_image IS NULL OR bol_number IS NULL) 
-                   AND DATE(departure_time) = CURRENT_DATE() 
-              ORDER BY id DESC 
-                 LIMIT 1;""",
-            (did,)
-        )
-        delivery = await cur.fetchone()
-        if delivery:
+        duplicate_of = await ctx.find_duplicate_bol_leg()
+        if duplicate_of and receiver_signed:
             await cur.execute(
                 f"""UPDATE {TABLE_SHUTTLE_LEGS} 
-                       SET bol_number = COALESCE(bol_number, %s),
-                           bol_image = COALESCE(bol_image, %s),
+                       SET bol_image = COALESCE(%s, bol_image),
                            document_type = IF(%s != 'UNKNOWN', %s, document_type),
                            paperwork_time = COALESCE(paperwork_time, %s),
-                           receiver_signed = COALESCE(%s, receiver_signed)
+                           receiver_signed = 1
                      WHERE id = %s;""",
-                (bol_number, primary_image_blob,
-                 document_type, document_type, msg_timestamp,
-                 1 if receiver_signed else None, delivery[0])
+                (primary_image_blob, document_type, document_type,
+                 msg_timestamp, duplicate_of)
             )
             await conn.commit()
             logger.info(
-                f"Paperwork {bol_number} sent with a yard-move "
-                f"caption; attached to delivery Leg #{delivery[0]}."
+                f"Receiver-signed BOL {bol_number} sent with a yard-move "
+                f"caption; POD backfilled to Leg #{duplicate_of}."
             )
+            # Keep the paperwork on the delivered leg, not on the yard move.
+            bol_number = ctx.bol_number = None
+            document_type = ctx.document_type = "UNKNOWN"
+            primary_image_blob = ctx.primary_image_blob = None
+            receiver_signed = ctx.receiver_signed = False
+            shipper_signed = ctx.shipper_signed = False
+        elif not duplicate_of:
+            await cur.execute(
+                f"""SELECT id 
+                      FROM {TABLE_SHUTTLE_LEGS} 
+                     WHERE user_id = %s 
+                       AND is_positioning_leg = 0 
+                       AND (bol_image IS NULL OR bol_number IS NULL) 
+                       AND DATE(departure_time) = CURRENT_DATE() 
+                  ORDER BY id DESC 
+                     LIMIT 1;""",
+                (did,)
+            )
+            delivery = await cur.fetchone()
+            if delivery:
+                await cur.execute(
+                    f"""UPDATE {TABLE_SHUTTLE_LEGS} 
+                           SET bol_number = COALESCE(bol_number, %s),
+                               bol_image = COALESCE(bol_image, %s),
+                               document_type = IF(%s != 'UNKNOWN', %s, document_type),
+                               paperwork_time = COALESCE(paperwork_time, %s),
+                               receiver_signed = COALESCE(%s, receiver_signed)
+                         WHERE id = %s;""",
+                    (bol_number, primary_image_blob,
+                     document_type, document_type, msg_timestamp,
+                     1 if receiver_signed else None, delivery[0])
+                )
+                await conn.commit()
+                logger.info(
+                    f"Paperwork {bol_number} sent with a yard-move "
+                    f"caption; attached to delivery Leg #{delivery[0]}."
+                )
 
     def as_dock(value):
         """A dock position, or None if this is really a facility.

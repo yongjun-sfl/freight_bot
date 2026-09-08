@@ -4,4 +4,5 @@ __pycache__/
 .pytest_cache/
 backups/
 # Replay fixtures and operational data live on disk, not in git.
-data/
+# Root /data only -- bot/data is the tracked operational data the code reads.
+/data/

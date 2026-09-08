@@ -32,6 +32,11 @@ def _clock(value):
     hour, minute = int(match.group(1)), int(match.group(2))
     if hour == 0 and minute == 0:
         return None            # the sheet uses 00:00:00 for blank
+    # The September manual sheets were typed with a 12-hour clock but no AM/PM,
+    # so an afternoon "01:29" / "02:34" is stored as 1/2 AM. Shuttle work never
+    # starts between 1 and 6 AM; interpret those as PM.
+    if 1 <= hour < 7:
+        hour += 12
     return f"{hour:02d}:{minute:02d}"
 
 

@@ -197,7 +197,7 @@ class LegContext:
         return target_leg
 
     async def open_departure_leg(self, origin, destination, trailer,
-                                 departure_time=None):
+                                 departure_time=None, load_status=None):
         """Insert a new IN_TRANSIT leg for a trip that is starting.
 
         Shared by CASE 1 and by the paths that recognise a hooked load as a
@@ -207,8 +207,11 @@ class LegContext:
         row is written. ``departure_time`` defaults to the message timestamp;
         the drop-inference path passes the delivery leg's finished time so the
         reconstructed empty reposition is backdated to when the driver left.
+        ``load_status`` defaults to the resolved status of the current message;
+        inferred empty/bobtail legs pass "EMPTY" explicitly.
         """
         departure_time = departure_time or self.msg_timestamp
+        effective_load_status = load_status or self.load_status_val
         round_and_route = await self.resolve_round(origin, destination)
         # ETA is the drive allowance from location_distances (DB only -- the
         # CSVs seed once on first boot; the dispatcher may edit the table
@@ -242,8 +245,8 @@ class LegContext:
                 origin, destination, departure_time, self.action_type,
                 self.primary_image_blob, self.door_num,
                 1 if self.shipper_signed else 0, self.is_bobtail_flag,
-                self.load_status_val, *round_and_route,
-                classify_load(origin, destination, self.load_status_val,
+                effective_load_status, *round_and_route,
+                classify_load(origin, destination, effective_load_status,
                               round_and_route[1]),
                 eta,
             )

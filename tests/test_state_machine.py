@@ -1390,6 +1390,74 @@ async def test_empty_drop_with_no_open_trip_infers_the_reposition(pool):
     assert inferred["arrival_time"] is not None
 
 
+async def test_empty_drop_with_bobtail_to_cross_facility_records_both_legs(pool):
+    """Live data 08/28, John Shim 14:15: "Empty drop e1 yard #3, Bobtail to SDs".
+
+    The parser files it as a CASE 2 arrival at E1, which used to close the open
+    SDS -> E1 run but silently lose the E1 -> SDS bobtail. A message that names
+    the drop site AND an onward "to" is both an arrival and the next departure.
+    """
+    await seed_network(pool)
+    trip = await insert_leg(
+        pool, origin_location="SDS", destination_location="E1",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="John's \nEmpty drop e1 yard #3, Bobtail to SDs",
+               destination_location="E1", load_status="EMPTY"),
+    )
+    assert res["is_clean"] is True, res
+    assert res["leg_id"] != trip
+
+    arrived = await get_leg(pool, trip)
+    assert arrived["leg_status"] == "COMPLETED"
+    assert arrived["arrival_time"] is not None
+
+    bobtail = await get_leg(pool, res["leg_id"])
+    assert bobtail["origin_location"] == "E1"
+    assert bobtail["destination_location"] == "SDS"
+    assert bobtail["load_status"] == "EMPTY"
+    assert bobtail["is_positioning_leg"] == 0
+
+
+async def test_departure_from_new_site_infers_preceding_empty_reposition(pool):
+    """Live data 08/28, John Shim 13:35: "Empty pickup SDs do21 to e1" right
+    after lunch at E1. The SDS -> E1 pickup is real, and the unstated E1 -> SDS
+    bobtail that got him to SDS is a leg the dispatcher logs too.
+    """
+    await seed_network(pool)
+    now = eastern_now()
+    await insert_leg(
+        pool, origin_location="SDS", destination_location="E1",
+        load_status="EMPTY", leg_status="COMPLETED",
+        departure_time=ts(now - timedelta(minutes=120)),
+        arrival_time=ts(now - timedelta(minutes=105)),
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="John's \nEmpty pickup SDs do21 to e1",
+               origin_location="SDS", destination_location="E1",
+               load_status="EMPTY"),
+        when=ts(now),
+    )
+    assert res["is_clean"] is True, res
+
+    legs = await all_legs(pool)
+    assert len(legs) == 3          # delivered leg + inferred bobtail + pickup
+    inferred = [l for l in legs if l["origin_location"] == "E1"
+                and l["destination_location"] == "SDS"][0]
+    assert inferred["leg_status"] == "COMPLETED"
+    assert inferred["load_status"] == "EMPTY"
+    assert inferred["is_positioning_leg"] == 0
+
+    pickup = [l for l in legs if l["id"] == res["leg_id"]][0]
+    assert pickup["origin_location"] == "SDS"
+    assert pickup["destination_location"] == "E1"
+
+
 async def test_a_loaded_yard_move_is_not_a_lost_pickup(pool):
     """"loaded move #4 to #13" names where it moved off. Still a yard move."""
     await seed_network(pool)

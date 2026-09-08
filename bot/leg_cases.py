@@ -497,6 +497,82 @@ async def handle_case_1_departure(ctx):
     if intent.get("work_finished"):
         await ctx.stamp_finished()
 
+    # PRECEDING EMPTY/BOBTAIL INFERENCE: a departure from a site the driver's
+    # last completed trip did not end at means they must have deadheaded there
+    # empty first. Drivers do not always type that leg (John Shim wrote only
+    # "Lunch off" at E1, then 13:35 "Empty pickup SDs do21 to e1" -- the manual
+    # log carries the E1 -> SDS bobtail between them). Infer it when no trip is
+    # open and no such reposition is already recorded.
+    if (not duplicate_of
+            and origin_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")
+            and dest_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST")
+            and site_of(origin_loc) != site_of(dest_loc)):
+        await cur.execute(
+            f"""SELECT id, destination_location
+                  FROM {TABLE_SHUTTLE_LEGS}
+                 WHERE user_id = %s
+                   AND is_positioning_leg = 0
+                   AND leg_status IN ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING')
+              ORDER BY id DESC
+                 LIMIT 1;""",
+            (did,)
+        )
+        open_leg = await cur.fetchone()
+        if not open_leg:
+            await cur.execute(
+                f"""SELECT destination_location,
+                           trailer_number,
+                           COALESCE(finished_time, arrival_time, departure_time) AS ended_at
+                      FROM {TABLE_SHUTTLE_LEGS}
+                     WHERE user_id = %s
+                       AND is_positioning_leg = 0
+                       AND leg_status = 'COMPLETED'
+                  ORDER BY id DESC
+                     LIMIT 1;""",
+                (did,)
+            )
+            last_done = await cur.fetchone()
+            if (last_done and last_done[0]
+                    and last_done[0] not in ("UNKNOWN", "NONE", "NULL",
+                                             "MISSING_DEST", "")
+                    and last_done[2]
+                    and site_of(last_done[0]) != site_of(origin_loc)
+                    and str(last_done[2])[:10] == str(msg_timestamp)[:10]):
+                await cur.execute(
+                    f"""SELECT origin_location, destination_location
+                          FROM {TABLE_SHUTTLE_LEGS}
+                         WHERE user_id = %s
+                           AND is_positioning_leg = 0
+                           AND departure_time >= %s
+                           AND departure_time <= %s
+                      ORDER BY id;""",
+                    (did, last_done[2], msg_timestamp)
+                )
+                already_moved = any(
+                    site_of(row[0]) == site_of(last_done[0])
+                    and site_of(row[1]) == site_of(origin_loc)
+                    for row in await cur.fetchall()
+                )
+                if not already_moved:
+                    inferred_id = await ctx.open_departure_leg(
+                        normalize_location(last_done[0]), origin_loc,
+                        None, departure_time=msg_timestamp,
+                        load_status="EMPTY")
+                    await cur.execute(
+                        f"""UPDATE {TABLE_SHUTTLE_LEGS}
+                               SET arrival_time = COALESCE(arrival_time, %s),
+                                   arrival_action = 'BOBTAIL_ARRIVE',
+                                   leg_status = 'COMPLETED'
+                             WHERE id = %s;""",
+                        (msg_timestamp, inferred_id)
+                    )
+                    await conn.commit()
+                    logger.info(
+                        f"Driver #{did} departed from {origin_loc} but last trip "
+                        f"ended at {last_done[0]}; inferred the empty reposition "
+                        f"as Leg #{inferred_id}."
+                    )
+
     # Complete prior active legs upon new departure
     await cur.execute(
         f"""UPDATE {TABLE_SHUTTLE_LEGS} 

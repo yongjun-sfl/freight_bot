@@ -183,11 +183,13 @@ async def commit_trip_leg(
             # A load pickup the parser filed as an arrival ("Load pick up D 020
             # sds to 200") is likewise a departure; only a hook that names no
             # destination should reach the CASE 2 no-destination card.
+            # CASE 2 "arrival" messages that also contain an onward movement
+            # ("Empty drop e1 yard, Bobtail to SDs") are an arrival AND the next
+            # departure -- promote them so the departure is not lost; CASE 1
+            # completes the open arrival leg before opening the new leg.
             recoverable = ctx.case_type in (
-                "CASE_WORK_FINISHED", "NONE_WORK_RELATED")
-            if (ctx.case_type == "CASE_2_DESTINATION_ARRIVAL"
-                    and ctx.is_load_pickup):
-                recoverable = True
+                "CASE_WORK_FINISHED", "NONE_WORK_RELATED",
+                "CASE_2_DESTINATION_ARRIVAL")
             if recoverable and ctx.raw_text:
                 pair_origin, pair_dest = two_facilities_in_order(ctx.raw_text)
 

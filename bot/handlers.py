@@ -44,6 +44,23 @@ def original_send_time(msg):
     return None
 
 
+def effective_user(msg):
+    """The user whose report this is.
+
+    For a forwarded message this is the ORIGINAL sender, not the person who
+    forwarded it. An admin relaying a driver's message from another chat must
+    not turn the driver's movement into an anonymous admin message.
+    """
+    origin = getattr(msg, "forward_origin", None)
+    sender_user = getattr(origin, "sender_user", None)
+    if sender_user is not None:
+        return sender_user
+    legacy = getattr(msg, "forward_from", None)
+    if legacy is not None:
+        return legacy
+    return getattr(msg, "from_user", None)
+
+
 def message_timestamp(msg) -> str:
     """When the driver sent the message, in Eastern.
 
@@ -143,7 +160,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message or not update.message.text or update.message.text.startswith("/"):
         return
 
-    user = update.effective_user
+    user = effective_user(update.message)
     chat = update.effective_chat
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
@@ -213,7 +230,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _process_single_image_event(msg, context: ContextTypes.DEFAULT_TYPE):
-    user = msg.from_user
+    user = effective_user(msg)
     chat = msg.chat
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
@@ -268,7 +285,7 @@ async def _process_media_group_delayed(media_group_id: str, context: ContextType
 
     messages = group_data["messages"]
     primary_msg = messages[0]
-    user = primary_msg.from_user
+    user = effective_user(primary_msg)
     chat = primary_msg.chat
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"
@@ -332,7 +349,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not (doc.mime_type == "application/pdf" or doc.mime_type.startswith("image/")):
         return
 
-    user = msg.from_user
+    user = effective_user(msg)
     chat = msg.chat
     driver_id = user.id
     user_name = user.full_name or user.username or f"Driver_{driver_id}"

@@ -91,8 +91,16 @@ async def replay(pool):
     loop = asyncio.get_running_loop()
     processed = skipped = 0
     for m in messages:
-        sender = str(m.get("from_id") or "").replace("user", "")
-        driver = roster.get(sender)
+        # A driver's report forwarded into the channel by someone else belongs
+        # to the ORIGINAL driver, not the person who forwarded it. Telegram
+        # Desktop exports carry the original in forwarded_from_id.
+        sender = None
+        for raw_id in (m.get("forwarded_from_id"), m.get("from_id")):
+            candidate = str(raw_id or "").replace("user", "")
+            if candidate in roster:
+                sender = candidate
+                break
+        driver = roster.get(sender) if sender else None
         if not driver:
             skipped += 1
             continue

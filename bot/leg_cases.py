@@ -434,7 +434,9 @@ async def handle_case_1_departure(ctx):
     # the facility they just delivered, even when the empty-reposition caption
     # contains a stray facility name (Young Teak Kong 09:44 wrote "Finish Live
     # unloading empty 200 to sds" after unloading at E2F -- the trip is
-    # E2F -> SDS, not 200F -> SDS). Trust the leg that was just unloaded.
+    # E2F -> SDS, not 200F -> SDS). Trust the leg that was just unloaded --
+    # including its exact front/rear code, so "eg2" (bare site E2) becomes E2R
+    # when the live unload was at the rear.
     if (intent.get("work_finished") and UNLOAD_PATTERN.search(raw_text)
             and load_status_val == "EMPTY"
             and origin_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")):
@@ -448,13 +450,14 @@ async def handle_case_1_departure(ctx):
             (did,)
         )
         unloaded_at_row = await cur.fetchone()
-        if (unloaded_at_row and unloaded_at_row[0]
-                and site_of(unloaded_at_row[0]) != site_of(origin_loc)):
-            logger.info(
-                f"Driver #{did} finished unloading at {unloaded_at_row[0]} but "
-                f"reported empty origin {origin_loc}; using the unload site."
-            )
-            origin_loc = ctx.origin_loc = normalize_location(unloaded_at_row[0])
+        if unloaded_at_row and unloaded_at_row[0]:
+            unloaded_at = normalize_location(unloaded_at_row[0])
+            if origin_loc != unloaded_at:
+                logger.info(
+                    f"Driver #{did} finished unloading at {unloaded_at} but "
+                    f"reported empty origin {origin_loc}; using the unload site."
+                )
+                origin_loc = ctx.origin_loc = unloaded_at
 
     # 2. ORIGIN INFERENCE & LAST LEG LOOKUP
     await cur.execute(

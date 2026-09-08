@@ -70,11 +70,15 @@ MOVEMENT_CUE_PATTERN = re.compile(
 # A "to <SOMETHING>" that names a real facility, used to tell a yard move from
 # the trip hiding inside it. "Empty drop e1 yard #3, Bobtail to SDs" is a drop
 # at E1 AND a bobtail to SDS: the departure phrase must not be swallowed by the
-# yard phrase. Only a token that actually resolves to a known facility counts,
-# so "move to Dock 47" (Dock is not a facility) stays a yard move.
+# yard phrase. Only a phrase that actually resolves to a known facility counts,
+# so "move to Dock 47" (Dock is not a facility) stays a yard move. One or two
+# words are captured because drivers split site + front/rear: "to e 1",
+# "to e2 r", "to eg2 f".
 DEPARTURE_TO_PATTERN = re.compile(
     r"\b(?:bobtail|bob\s*tail|bt|empty|heading|leaving|going|returning|"
-    r"drive|move|pick\s*u?p?|pickup)\b[^.]*?\bto\s+([0-9A-Za-z]+)",
+    r"drive|move|pick\s*u?p?|pickup|finish(?:es|ed)?|unload(?:s|ed|ing)?)"
+    r"\b[^.]*?\bto\s+"
+    r"([0-9A-Za-z]+(?:\s+[0-9A-Za-z]+)?)",
     re.IGNORECASE,
 )
 def cross_facility_destination(raw_text):
@@ -89,10 +93,16 @@ def cross_facility_destination(raw_text):
     if not raw_text:
         return None
     for match in DEPARTURE_TO_PATTERN.finditer(raw_text):
-        token = match.group(1).strip().upper()
-        resolved = normalize_location(token)
-        if resolved not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST") \
-                and site_of(resolved) in LOCATION_CACHE.get("site_map", {}):
+        phrase = " ".join(match.group(1).split()).upper()
+        resolved = normalize_location(phrase)
+        # The optional second word may be "yard"/"dock"/"door" (a position, not
+        # part of the name): "to E1 yard" is E1. Try the full phrase first so
+        # "to E2 R" / "to e 1" use their spaced aliases, then fall back.
+        known = set(LOCATION_CACHE.get("alias_map") or {})
+        if resolved not in known and " " in phrase:
+            resolved = normalize_location(phrase.split()[0])
+        if resolved in known and resolved not in (
+                "UNKNOWN", "NONE", "NULL", "MISSING_DEST"):
             return resolved
     return None
 def two_facilities_in_order(raw_text):

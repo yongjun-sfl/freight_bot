@@ -20,7 +20,7 @@ Split from a ~1700-line monolith. The pieces live in three modules:
 import logging
 
 from config import TABLE_DRIVERS, TABLE_SHUTTLE_LEGS, TABLE_UNKNOWN_SENDERS
-from ai_engine import normalize_location, site_of
+from ai_engine import LOCATION_CACHE, normalize_location, site_of
 from shifts import record_lunch
 
 from leg_helpers import (
@@ -87,6 +87,29 @@ async def commit_trip_leg(
     # the origin, turn the NN into the door, and never let it ride as a trailer.
     ctx.origin_loc, ctx.door_num, ctx.text_trailer = facility_dock_from_text(
         ctx.raw_text, ctx.origin_loc, ctx.door_num, ctx.text_trailer)
+
+    # The LLM occasionally invents a code that is not a location at all
+    # (drivers sign captions with their name: "... to e2 r Kong" -> KONG).
+    # Recover the explicit "to X" destination from the raw text before the
+    # movement is recorded under a phantom location.
+    known_locations = set(LOCATION_CACHE.get("alias_map") or {})
+    unknown_tokens = ("UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN", "MISSING_DEST")
+    if known_locations and (ctx.dest_loc and ctx.dest_loc not in unknown_tokens
+            and ctx.dest_loc not in known_locations):
+        recovered_dest = cross_facility_destination(ctx.raw_text or "")
+        if recovered_dest:
+            logger.info(
+                f"Driver #{did} parser returned invalid destination "
+                f"{ctx.dest_loc!r}; raw text says {recovered_dest}."
+            )
+            ctx.dest_loc = recovered_dest
+    if known_locations and (ctx.origin_loc and ctx.origin_loc not in unknown_tokens
+            and ctx.origin_loc not in known_locations):
+        logger.info(
+            f"Driver #{did} parser returned invalid origin {ctx.origin_loc!r}; "
+            f"clearing for origin inference."
+        )
+        ctx.origin_loc = "UNKNOWN"
 
     # Detect Bobtail Flag
     ctx.is_bobtail_flag = 1 if BOBTAIL_PATTERN.search(ctx.raw_text) else 0
@@ -210,6 +233,20 @@ async def commit_trip_leg(
                                 "UNKNOWN", "NONE", "NULL", "MISSING_DEST")
                             and site_of(llm_origin) != site_of(llm_dest)):
                         pair_origin, pair_dest = llm_origin, llm_dest
+                    elif (UNLOAD_PATTERN.search(ctx.raw_text or "")
+                          and llm_origin
+                          and llm_origin not in (
+                              "UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN")
+                          and llm_origin in (LOCATION_CACHE.get("alias_map") or {})):
+                        # "Live unloading finished eg2 to e 1" arrives as
+                        # CASE_WORK_FINISHED with no destination at all. The
+                        # "to <facility>" phrase is the empty reposition's
+                        # destination; keep the LLM origin and let the
+                        # work-finished origin correction fix front/rear.
+                        recovered_dest = cross_facility_destination(
+                            ctx.raw_text or "")
+                        if recovered_dest:
+                            pair_origin, pair_dest = llm_origin, recovered_dest
 
                 if pair_origin and pair_dest:
                     logger.info(

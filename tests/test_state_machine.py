@@ -1855,6 +1855,66 @@ async def test_finished_unload_misfiled_as_yard_move_uses_last_delivery_as_origi
     assert destination == "E1"
 
 
+async def test_work_finished_without_destination_recovers_to_phrase(pool):
+    """Live data 09/04, Young Teak Kong 10:51: 'Live unloading finished eg2 to
+    e 1 Kong' comes back CASE_WORK_FINISHED with origin E2F and NO destination.
+    The 'to e 1' phrase must supply E1, and the just-unloaded E2R leg must
+    correct the origin to E2R."""
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="200F", destination_location="E2R",
+        load_status="LOADED", document_type="RM", leg_status="UNLOADING",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_WORK_FINISHED",
+            raw_text="Live unloading finished  eg2  to e 1 Kong",
+            origin_location="E2F", destination_location=None,
+            load_status=None, work_finished=True,
+        ),
+    )
+    assert res["is_clean"] is True, res
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT origin_location, destination_location FROM shuttle_legs "
+                "WHERE user_id = %s ORDER BY id DESC LIMIT 1;",
+                (DRIVER_ID,),
+            )
+            origin, destination = await cur.fetchone()
+    assert origin == "E2R", f"was {origin}"
+    assert destination == "E1"
+
+
+async def test_parser_invented_destination_code_is_recovered(pool):
+    """The LLM sometimes answers 'KONG' when the caption ends with the driver's
+    name ('... to e2 r Kong'). The raw 'to X' text must win over the phantom."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_1_ORIGIN_DEPARTURE",
+            raw_text="Kong  load pick #53 200 to  e2  r",
+            origin_location="200", destination_location="KONG",
+            load_status="LOADED", work_finished=False,
+        ),
+    )
+    # The recovery rewrites KONG -> E2R, but an incomplete-departure card is
+    # still raised when no trailer was named; the leg must be recorded as E2R.
+    assert res["leg_id"] is not None
+    assert "E2R" in res["card_text"]
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT destination_location FROM shuttle_legs "
+                "WHERE user_id = %s ORDER BY id DESC LIMIT 1;",
+                (DRIVER_ID,),
+            )
+            (destination,) = await cur.fetchone()
+    assert destination == "E2R", f"was {destination}"
+
+
 async def test_eagle_2_front_and_rear_is_not_a_wrong_destination(pool):
     """Routed to E2F, arrives at E2R. Same plant at 310 Nexus Dr, same site --
     the door used is not a routing mistake."""

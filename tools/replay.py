@@ -36,14 +36,15 @@ from schema_ddl import apply_schema
 from seed_network import read_drivers_csv, seed_drivers, seed_network
 from state_machine import commit_trip_leg
 
-EXPORT = "/data/ChatExport_2026-08-29/result.json"
-WORKBOOK = "/data/SFL Log 08_2026.xlsx"
+EXPORT = os.getenv("REPLAY_EXPORT", "/data/ChatExport_2026-08-29/result.json")
+WORKBOOK = os.getenv("REPLAY_WORKBOOK", "/data/SFL Log 08_2026.xlsx")
 SHEET = os.getenv("REPLAY_SHEET", "08282026")
 WITH_PHOTOS = os.getenv("REPLAY_PHOTOS") == "1"
 ONLY_DRIVER = (os.getenv("REPLAY_DRIVER") or "").upper() or None
 DB = "replay_scratch"
 MATCH_WINDOW_MIN = 105  # 1h45m - covers lunch breaks and delayed batch reporting
 REPLAY_DEBUG = os.getenv("REPLAY_DEBUG") == "1"
+EXPORT_DIR = os.path.dirname(EXPORT)
 
 
 def message_text(m):
@@ -112,7 +113,7 @@ async def replay(pool):
         has_photo = bool(m.get("photo"))
 
         if has_photo and WITH_PHOTOS:
-            path = os.path.join("/data/ChatExport_2026-08-29", m["photo"])
+            path = os.path.join(EXPORT_DIR, m["photo"])
             try:
                 image = open(path, "rb").read()
             except OSError:

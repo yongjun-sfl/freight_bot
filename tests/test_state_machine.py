@@ -1156,6 +1156,42 @@ async def test_yard_drop_with_from_does_not_create_reverse_leg(pool):
     assert (await get_leg(pool, trip))["leg_status"] == "COMPLETED"
 
 
+async def test_1814_empty_return_then_yard_drop_completes_same_leg(pool):
+    """ILPYO 09-04: 18:14 'finished live unloading empty 100 to 200' opens the
+    100 -> 200F empty return; 18:56 'drop empty 200r yard. from 100' is that
+    same leg's yard drop. It must complete the 18:14 leg, never create a
+    separate 200R -> 100 departure."""
+    await seed_network(pool)
+    first = await commit(
+        pool,
+        intent(case_type="CASE_WORK_FINISHED",
+               raw_text="Hong il pyo finished live unloading empty 100 to 200",
+               origin_location="100", destination_location=None,
+               load_status=None, work_finished=True),
+        when="2026-09-04 18:14:02",
+    )
+    assert first["is_clean"] is True, first
+    trip = first["leg_id"]
+    assert trip is not None
+    leg = await get_leg(pool, trip)
+    assert leg["origin_location"] == "100"
+    assert leg["destination_location"] == "200F"
+    assert leg["leg_status"] == "IN_TRANSIT"
+
+    second = await commit(
+        pool,
+        intent(case_type="CASE_3_INTRA_FACILITY_MOVE",
+               raw_text="Hong il pyo drop empty 200r yard. from 100 cartersville",
+               origin_location="200R", destination_location="200R",
+               action="DROP_YARD", load_status="EMPTY"),
+        when="2026-09-04 18:56:06",
+    )
+    assert second["leg_id"] == trip, f"expected completion of leg {trip}, got {second}"
+    legs = await all_legs(pool)
+    assert len(legs) == 1, f"expected no phantom 200R->100, got {legs}"
+    assert (await get_leg(pool, trip))["leg_status"] == "COMPLETED"
+
+
 async def test_the_trailer_named_at_the_drop_corrects_the_leg(pool):
     """From live data: Sokhwan Yun's 11:18 SDS run was recorded with trailer
     25773, inherited by the CASE 1 fallback from three legs earlier. He had

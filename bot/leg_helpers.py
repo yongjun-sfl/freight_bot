@@ -43,6 +43,14 @@ PICKUP_PATTERN = re.compile(
 UNLOAD_PATTERN = re.compile(r"\bunload(?:s|ed|ing)?\b", re.IGNORECASE)
 LOAD_PATTERN = re.compile(r"\bload(?:s|ed|ing)?\b", re.IGNORECASE)
 
+# A DROP or ARRIVAL at a named facility. The parser files "drop empty E1 yard"
+# as a same-site yard move when it is actually the arrival half of a trip the
+# driver started elsewhere; the state machine promotes it when a trip is open.
+DROP_PATTERN = re.compile(
+    r"\b(?:drop(?:s|ped|ping)?|dropped|arriv(?:e|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+
 # A report the driver is actually moving a trailer between facilities. The
 # two-facility recovery below exists for messages the parser filed as a plain
 # completion ("Unloading finished / Empty 200 sds") -- the real ones carry a

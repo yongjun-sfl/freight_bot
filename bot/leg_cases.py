@@ -825,15 +825,27 @@ async def handle_case_2_arrival(ctx):
                 f"Driver #{did} was routed to {booked_destination} "
                 f"but reports arriving at {dest_loc}."
             )
+            # The arrival names a real facility and the trip is still open, so
+            # the arrival is stronger evidence of where the driver actually
+            # went than the departure caption was. Correct the record and let
+            # the dispatcher confirm (the card stays visible).
+            await cur.execute(
+                f"UPDATE {TABLE_SHUTTLE_LEGS} "
+                f"   SET destination_location = %s "
+                f" WHERE id = %s;",
+                (dest_loc, leg_id),
+            )
+            await conn.commit()
             return {
                 "is_clean": False,
                 "leg_id": leg_id,
                 "card_text": (
-                    f"⚠️ **MANUAL RECONCILE: Wrong Destination**\n"
+                    f"⚠️ **MANUAL RECONCILE: Wrong Destination Corrected**\n"
                     f"\U0001f464 Driver: {user_name}\n"
                     f"\U0001f4cd Routed to `{booked_destination}` "
                     f"but arrived at `{dest_loc}`.\n"
-                    f"\U0001f69b Leg `{leg_id}` records the arrival as reported.\n"
+                    f"\U0001f69b Leg `{leg_id}` now records "
+                    f"`{booked_destination}` -> `{dest_loc}`.\n"
                     f"\U0001f449 Confirm with the driver while they are still on site."
                 )
             }

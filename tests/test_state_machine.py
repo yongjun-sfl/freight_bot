@@ -1732,8 +1732,8 @@ async def test_registered_driver_is_not_recorded_as_unknown(pool):
 # ==========================================================================
 
 async def test_arriving_off_route_raises_a_card(pool):
-    """Departure said E2F, arrival says SDS. The leg records what was reported,
-    and dispatch is told while the driver is still on site."""
+    """Departure said E2F, arrival says SDS. The leg is corrected to the
+    arrival facility, and dispatch is told while the driver is still on site."""
     await seed_network(pool)
     leg = await insert_leg(
         pool, origin_location="200F", destination_location="E2F",
@@ -1748,6 +1748,111 @@ async def test_arriving_off_route_raises_a_card(pool):
     assert "E2F" in res["card_text"] and "SDS" in res["card_text"]
     assert res["leg_id"] == leg
     assert (await get_leg(pool, leg))["arrival_time"] is not None
+
+
+async def test_arriving_off_route_updates_the_leg_destination(pool):
+    """The arrival names the real facility, so an off-route departure caption
+    must not leave the leg routed to a place the driver never reached."""
+    await seed_network(pool)
+    leg = await insert_leg(
+        pool, origin_location="200F", destination_location="E2F",
+        trailer_number="77344", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL", destination_location="SDS"),
+    )
+    assert res["is_clean"] is False
+    assert "Wrong Destination" in res["card_text"]
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT destination_location FROM shuttle_legs WHERE id = %s;",
+                (leg,),
+            )
+            (destination,) = await cur.fetchone()
+    assert destination == "SDS"
+
+
+async def test_drop_filed_as_yard_move_completes_the_open_trip(pool):
+    """`drop empty E1 yard` parses as an E1->E1 yard move, but with a trip
+    from 200 to SDS still open it is the arrival half of that trip; the leg is
+    completed and its destination corrected to E1."""
+    await seed_network(pool)
+    leg = await insert_leg(
+        pool, origin_location="200F", destination_location="SDS",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="Hong il pyo drop empty E1 yard",
+            origin_location="E1", destination_location="E1",
+            action="DROP_YARD", load_status="EMPTY",
+        ),
+    )
+    assert res["leg_id"] == leg
+    row = await get_leg(pool, leg)
+    assert row["destination_location"] == "E1"
+    assert row["leg_status"] == "COMPLETED"
+    assert row["arrival_time"] is not None
+
+
+async def test_finish_unload_filed_as_yard_move_promotes_to_trip(pool):
+    """A parser miss can file 'unloading empty 100 to 200' as an intra-yard
+    move; two known facilities in the raw text must recover the departure."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="Hong il pyo finished live unloading empty 100 to 200",
+            origin_location="200", destination_location="200",
+            load_status="EMPTY", action="FINISHED_UNLOAD",
+        ),
+    )
+    assert res["is_clean"] is True
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT origin_location, destination_location FROM shuttle_legs "
+                "WHERE user_id = %s ORDER BY id DESC LIMIT 1;",
+                (DRIVER_ID,),
+            )
+            origin, destination = await cur.fetchone()
+    assert origin == "100"
+    assert destination == "200F"
+
+
+async def test_finished_unload_misfiled_as_yard_move_uses_last_delivery_as_origin(pool):
+    """After unloading at E2F, "finished live unloading Empty to E1 yard" is
+    filed as an E1->E1 yard move; the last delivery leg gives the E2F origin."""
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="200F", destination_location="E2F",
+        load_status="LOADED", document_type="RM", leg_status="UNLOADING",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="Hong il pyo finished live unloading Empty to E1 yard",
+            origin_location="E1", destination_location="E1",
+            load_status="EMPTY", action="FINISHED_UNLOAD", work_finished=True,
+        ),
+    )
+    assert res["is_clean"] is True
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT origin_location, destination_location FROM shuttle_legs "
+                "WHERE user_id = %s ORDER BY id DESC LIMIT 1;",
+                (DRIVER_ID,),
+            )
+            origin, destination = await cur.fetchone()
+    assert origin == "E2F"
+    assert destination == "E1"
 
 
 async def test_eagle_2_front_and_rear_is_not_a_wrong_destination(pool):

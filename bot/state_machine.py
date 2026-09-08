@@ -25,6 +25,7 @@ from shifts import record_lunch
 
 from leg_helpers import (
     BOBTAIL_PATTERN,
+    DROP_PATTERN,
     LOAD_PATTERN,
     PICKUP_PATTERN,
     UNLOAD_PATTERN,
@@ -189,7 +190,7 @@ async def commit_trip_leg(
             # completes the open arrival leg before opening the new leg.
             recoverable = ctx.case_type in (
                 "CASE_WORK_FINISHED", "NONE_WORK_RELATED",
-                "CASE_2_DESTINATION_ARRIVAL")
+                "CASE_2_DESTINATION_ARRIVAL", "CASE_3_INTRA_FACILITY_MOVE")
             if recoverable and ctx.raw_text:
                 pair_origin, pair_dest = two_facilities_in_order(ctx.raw_text)
 
@@ -269,6 +270,73 @@ async def commit_trip_leg(
                             ["UNKNOWN", "NONE", "NULL", "MISSING_DEST"]
                             or site_of(ctx.dest_loc) == site_of(ctx.origin_loc)):
                         ctx.dest_loc = far_dest
+
+            # 1c. THE REVERSE ARRIVAL: A DROP AT A THIRD FACILITY IS AN ARRIVAL
+            # WHEN A CROSS-FACILITY TRIP IS OPEN. "drop empty E1 yard" parses as
+            # an E1->E1 yard move, but if the driver left 200 for SDS and is
+            # dropping the empty at E1, the drop is the trip's arrival. A drop
+            # back at the ORIGIN yard is still a yard move (test:
+            # a_drop_somewhere_else_is_not_the_arrival).
+            if ctx.case_type == "CASE_3_INTRA_FACILITY_MOVE" \
+                    and DROP_PATTERN.search(ctx.raw_text or ""):
+                drop_at = normalize_location(ctx.origin_loc or ctx.dest_loc)
+                if drop_at not in (
+                        "UNKNOWN", "NONE", "NULL", "MISSING_ORIGIN", "MISSING_DEST"):
+                    await cur.execute(
+                        f"""SELECT id, origin_location, destination_location
+                              FROM {TABLE_SHUTTLE_LEGS}
+                             WHERE user_id = %s
+                               AND leg_status IN
+                                   ('IN_TRANSIT', 'ARRIVED', 'UNLOADING', 'LOADING')
+                          ORDER BY id DESC
+                             LIMIT 1;""",
+                        (did,)
+                    )
+                    open_leg = await cur.fetchone()
+                    if open_leg and open_leg[1] and open_leg[2]:
+                        booked_origin = normalize_location(open_leg[1])
+                        booked_dest = normalize_location(open_leg[2])
+                        if (site_of(booked_dest) != site_of(drop_at)
+                                and site_of(booked_origin) != site_of(drop_at)):
+                            logger.info(
+                                f"Driver #{did} filed a drop at {drop_at} as a yard "
+                                f"move, but Leg #{open_leg[0]} is still open from "
+                                f"{booked_origin} to {booked_dest}; recording the arrival."
+                            )
+                            ctx.case_type = "CASE_2_DESTINATION_ARRIVAL"
+                            ctx.dest_loc = drop_at
+
+            # 1d. A FINISHED-UNLOAD "to <facility>" MISFILED AS A YARD MOVE.
+            # "finished live unloading Empty to E1 yard" never names where the
+            # unload happened; the last delivery leg is that site, so use it as
+            # the origin instead of recording an E1->E1 yard move.
+            if (ctx.case_type == "CASE_3_INTRA_FACILITY_MOVE"
+                    and ctx.intent.get("work_finished")
+                    and UNLOAD_PATTERN.search(ctx.raw_text or "")):
+                to_loc = cross_facility_destination(ctx.raw_text or "")
+                if to_loc:
+                    await cur.execute(
+                        f"""SELECT destination_location
+                              FROM {TABLE_SHUTTLE_LEGS}
+                             WHERE user_id = %s
+                               AND is_positioning_leg = 0
+                               AND destination_location NOT IN
+                                   ('UNKNOWN', 'NONE', 'NULL', 'MISSING_DEST', '')
+                          ORDER BY id DESC
+                             LIMIT 1;""",
+                        (did,)
+                    )
+                    last_row = await cur.fetchone()
+                    if last_row and last_row[0]:
+                        last_dest = normalize_location(last_row[0])
+                        if site_of(last_dest) != site_of(to_loc):
+                            logger.info(
+                                f"Driver #{did} finished unloading at {last_dest} "
+                                f"and says empty to {to_loc}; recording the departure."
+                            )
+                            ctx.case_type = "CASE_1_ORIGIN_DEPARTURE"
+                            ctx.origin_loc = last_dest
+                            ctx.dest_loc = to_loc
 
             # Lunch is recorded regardless of the case: drivers routinely
             # report lunch in the same breath as a departure or a yard move,

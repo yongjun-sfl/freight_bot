@@ -51,6 +51,14 @@ DROP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# An arrival/unload/drop cue used to find the DESTINATION facility in a message
+# that also says where the driver came "from" ("arrived 200 from 7634",
+# "Live unloading at E2 rear #3 from pactra").
+ARRIVAL_SITE_PATTERN = re.compile(
+    r"\b(?:arriv(?:e|ed|es|ing)|unload(?:s|ed|ing)?|drop(?:s|ped|ping)?)\b",
+    re.IGNORECASE,
+)
+
 # A driver says a trailer is PARKED; that is an arrival report, not a
 # reposition. The parser still may file a same-facility move and invent dock
 # positions ("parked load 100 #417" -> origin_dock 417 / destination_dock YARD).
@@ -126,6 +134,39 @@ def cross_facility_destination(raw_text):
                 "UNKNOWN", "NONE", "NULL", "MISSING_DEST"):
             return resolved
     return None
+def _known_facilities_in_segment(raw_text):
+    """Canonical codes for known facilities named in a text segment, in order.
+
+    Longest phrase first: "E2 rear" / "E2 front" / "200 front" are one
+    facility each, while "200" alone is 200F. Consecutive duplicates are
+    collapsed, and docks/yard tokens never resolve to a facility.
+    """
+    known = set(LOCATION_CACHE.get("codes") or [])
+    known |= set(LOCATION_CACHE.get("alias_map") or {})
+    tokens = re.findall(r"[0-9A-Za-z]+", raw_text or "")
+    seen = []
+    index = 0
+    while index < len(tokens):
+        resolved = None
+        for width in (3, 2, 1):
+            phrase = " ".join(tokens[index:index + width])
+            if not phrase:
+                continue
+            candidate = normalize_location(phrase)
+            if candidate in known:
+                resolved = candidate
+                index += width
+                break
+        if resolved:
+            if resolved not in (
+                    "UNKNOWN", "NONE", "NULL", "MISSING_DEST", "YARD"):
+                if not seen or seen[-1] != resolved:
+                    seen.append(resolved)
+        else:
+            index += 1
+    return seen
+
+
 def two_facilities_in_order(raw_text):
     """(origin, destination) when the raw text names two DISTINCT facilities
     in that order, or (None, None).
@@ -139,37 +180,80 @@ def two_facilities_in_order(raw_text):
     """
     if not raw_text:
         return None, None
-    # Guard: an ARRIVAL/DROP is not the departure being recovered. "arrived X
-    # from Y" or "drop X yard. from Y" names two facilities, but the "from Y"
-    # is where the trip started, not a return leg -- recovering it invented
-    # phantoms (Younypyo Kim arrivals, ILPYO 18:56 200R->100). Only treat it
-    # as a departure when there is an onward cue (an explicit "to").
+    # Guard: an ARRIVAL/DROP/UNLOAD is not the departure being recovered.
+    # "arrived X from Y", "drop X yard. from Y" and "live unloading X from Y"
+    # name two facilities, but the "from Y" is where the trip started, not a
+    # return leg -- recovering it invented phantoms (Younypyo Kim arrivals,
+    # ILPYO 18:56 200R->100). Only treat it as a departure when there is an
+    # onward cue (an explicit "to").
     text_l = raw_text.lower()
-    if (("arrived" in text_l or "arrive" in text_l
-            or "drop" in text_l or "dropped" in text_l)
-            and " from " in text_l
-            and " to " not in text_l):
+    arrival_like = ("arrived" in text_l or "arrive" in text_l
+                    or "drop" in text_l or "dropped" in text_l
+                    or "unload" in text_l)
+    if arrival_like and " from " in text_l and " to " not in text_l:
         return None, None
     # See MOVEMENT_CUE_PATTERN: recover only real movement reports, never
     # chatter that happens to name two known codes.
     if not MOVEMENT_CUE_PATTERN.search(raw_text):
         return None, None
-    known = set(LOCATION_CACHE.get("codes") or [])
-    known |= set(LOCATION_CACHE.get("alias_map") or {})
-    seen = []
-    for token in re.findall(r"[0-9A-Za-z]+", raw_text):
-        cleaned = token.upper()
-        resolved = normalize_location(cleaned)
-        if resolved in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST", "YARD"):
-            continue
-        if cleaned in known or resolved in known:
-            if not seen or seen[-1] != resolved:
-                seen.append(resolved)
+    seen = _known_facilities_in_segment(raw_text)
     if len(seen) >= 2:
         origin, destination = seen[0], seen[1]
         if origin != destination and site_of(origin) != site_of(destination):
             return origin, destination
     return None, None
+
+
+def arrival_facility_from_text(raw_text):
+    """Canonical facility named by an arrival/unload/drop cue.
+
+    "arrived 200 from 7634" -> 200F (not 7634, which is only the origin).
+    "live unloading at E2 rear #3 from pactra" -> E2R. Stops the scan at
+    "from", which names where the trip started rather than where it ended.
+    """
+    if not raw_text:
+        return None
+    match = ARRIVAL_SITE_PATTERN.search(raw_text)
+    if not match:
+        return None
+    tail = raw_text[match.end():]
+    lowered = f" {tail.lower()} "
+    cut = lowered.find(" from ")
+    if cut != -1:
+        tail = tail[:cut]
+    seen = _known_facilities_in_segment(tail)
+    return seen[0] if seen else None
+
+
+def arrival_site_token(raw_text):
+    """Raw token(s) named immediately after an arrival cue, before "from".
+
+    Unlike ``arrival_facility_from_text`` this also returns a token that is NOT
+    a known facility, so a caller can tell a garbled code ("arrived 8634") from
+    a real arrival and keep the booked destination instead of carding.
+    """
+    if not raw_text:
+        return None
+    match = ARRIVAL_SITE_PATTERN.search(raw_text)
+    if not match:
+        return None
+    tail = raw_text[match.end():]
+    lowered = f" {tail.lower()} "
+    cut = lowered.find(" from ")
+    if cut != -1:
+        tail = tail[:cut]
+    tokens = re.findall(r"[0-9A-Za-z]+", tail)
+    while tokens and tokens[0].upper() in ("AT", "THE", "IN", "ON"):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    known = set(LOCATION_CACHE.get("codes") or [])
+    known |= set(LOCATION_CACHE.get("alias_map") or {})
+    for width in (2, 1):
+        phrase = " ".join(tokens[:width])
+        if normalize_location(phrase) in known:
+            return phrase
+    return tokens[0]
 def facility_dock_from_text(raw_text, origin_loc, door_number, trailer):
     """Recover a ``FACILITY #NN`` the parser mis-split.
 

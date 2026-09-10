@@ -25,7 +25,13 @@ from shifts import (
     record_lunch,
 )
 
-from leg_helpers import PARKED_PATTERN, REPEAT_MOVE_MINUTES, UNLOAD_PATTERN
+from leg_helpers import (
+    PARKED_PATTERN,
+    REPEAT_MOVE_MINUTES,
+    UNLOAD_PATTERN,
+    arrival_facility_from_text,
+    arrival_site_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -752,6 +758,42 @@ async def handle_case_2_arrival(ctx):
         dep_load_status = active_leg[1]
         dep_is_bobtail = active_leg[2]
         booked_destination = active_leg[3]
+
+        # "arrived 200 from 7634" names the origin after "from"; if the parser
+        # puts it in destination_location the wrong-destination correction
+        # below would rewrite the open leg to the wrong site. Recover the
+        # arrival facility from the cue. When the cue names a garbled code that
+        # is not a known facility ("arrived 8634" for 7634), keep the booked
+        # destination rather than rewriting the open leg or carding.
+        known_locations = set(LOCATION_CACHE.get("alias_map") or {})
+        arrived_at = arrival_facility_from_text(raw_text)
+        if arrived_at:
+            if arrived_at != dest_loc:
+                logger.info(
+                    f"Driver #{did} arrival cue says {arrived_at}, not parsed "
+                    f"{dest_loc}; using the arrival facility."
+                )
+                dest_loc = ctx.dest_loc = arrived_at
+        else:
+            arrival_token = arrival_site_token(raw_text)
+            if (arrival_token
+                    and normalize_location(arrival_token) not in known_locations
+                    and booked_destination):
+                logger.info(
+                    f"Driver #{did} arrival names unknown facility "
+                    f"{arrival_token!r}; keeping booked destination "
+                    f"{booked_destination}."
+                )
+                dest_loc = ctx.dest_loc = booked_destination
+
+        if (dest_loc not in ("UNKNOWN", "NONE", "NULL", "MISSING_DEST")
+                and dest_loc not in known_locations
+                and booked_destination):
+            logger.info(
+                f"Driver #{did} arrival names unknown facility {dest_loc!r}; "
+                f"keeping booked destination {booked_destination}."
+            )
+            dest_loc = ctx.dest_loc = booked_destination
 
         # Arriving somewhere other than where the departure said
         # they were going. Compared by site, so 200F and 200R do

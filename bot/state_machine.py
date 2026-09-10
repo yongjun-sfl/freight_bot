@@ -24,6 +24,7 @@ from ai_engine import LOCATION_CACHE, normalize_location, site_of
 from shifts import record_lunch
 
 from leg_helpers import (
+    ARRIVAL_SITE_PATTERN,
     BOBTAIL_PATTERN,
     DROP_PATTERN,
     ENGLISH_MOVEMENT_PATTERN,
@@ -31,6 +32,7 @@ from leg_helpers import (
     LOAD_PATTERN,
     PICKUP_PATTERN,
     UNLOAD_PATTERN,
+    arrival_facility_from_text,
     cross_facility_destination,
     facility_dock_from_text,
     two_facilities_in_order,
@@ -275,6 +277,25 @@ async def commit_trip_leg(
                 )
                 return {"is_clean": True, "leg_id": None, "card_text": None}
 
+            # 0b-ter. AN ARRIVAL/UNLOAD "FROM <origin>" WITH NO ONWARD "TO" IS
+            # NOT A DEPARTURE. "Live unloading at E2 rear #3 from pactra" and
+            # "arrived 200 from 7634 / Live loading 85" name two facilities,
+            # but the "from" is where the trip started. Recover the arrival
+            # facility instead of opening a phantom reverse leg.
+            padded_lower = f" {ctx.raw_lower} "
+            if (ctx.case_type == "CASE_1_ORIGIN_DEPARTURE" and ctx.raw_text
+                    and " from " in padded_lower
+                    and " to " not in padded_lower
+                    and ARRIVAL_SITE_PATTERN.search(ctx.raw_text)):
+                arrived_at = arrival_facility_from_text(ctx.raw_text)
+                if arrived_at:
+                    logger.info(
+                        f"Driver #{did} message names an arrival at "
+                        f"{arrived_at} from elsewhere; recording as arrival."
+                    )
+                    ctx.case_type = "CASE_2_DESTINATION_ARRIVAL"
+                    ctx.dest_loc = arrived_at
+
             # 0b. A PAIR OF FACILITIES IS A DEPARTURE EVEN WITHOUT THE WORD "TO"
             # "Unloading finished / Empty 200 sds" is an EMPTY 200 -> sds trip.
             # A load pickup the parser filed as an arrival ("Load pick up D 020
@@ -327,6 +348,25 @@ async def commit_trip_leg(
                         f"{pair_origin} -> {pair_dest}; recording as a departure."
                     )
                     ctx.case_type = "CASE_1_ORIGIN_DEPARTURE"
+                    ctx.origin_loc = pair_origin
+                    ctx.dest_loc = pair_dest
+
+            # 0b-bis. A RAW-TEXT PAIR CORRECTS A DEPARTURE THE PARSER MISFILED
+            # WITH WRONG (BUT KNOWN) CODES. "Pickup load trailer pactra #47 to
+            # E2 rear" reaches here as 200F -> 200F and "Finish live unloading
+            # E2 rear #3 move empty trailer to E1 yard" as 200F -> E1. The raw
+            # text names both facilities, so the pair overrides the parser's
+            # endpoints instead of letting a known-but-wrong code through.
+            if ctx.case_type == "CASE_1_ORIGIN_DEPARTURE" and ctx.raw_text:
+                pair_origin, pair_dest = two_facilities_in_order(ctx.raw_text)
+                if (pair_origin and pair_dest
+                        and (ctx.origin_loc != pair_origin
+                             or ctx.dest_loc != pair_dest)):
+                    logger.info(
+                        f"Driver #{did} departure parsed as "
+                        f"{ctx.origin_loc} -> {ctx.dest_loc} but raw text names "
+                        f"{pair_origin} -> {pair_dest}; using the raw pair."
+                    )
                     ctx.origin_loc = pair_origin
                     ctx.dest_loc = pair_dest
 

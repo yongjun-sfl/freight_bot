@@ -18,6 +18,7 @@ from conftest import (
     get_leg,
     insert_leg,
     intent,
+    midday,
     seed_locations,
     seed_network,
     ts,
@@ -746,6 +747,129 @@ async def test_arrived_x_from_y_is_not_a_phantom_departure(pool):
     # no spurious 3551->200F departure leg was created
     legs = await all_legs(pool)
     assert legs == [], f"expected no leg, got {legs}"
+
+
+async def test_arrival_from_other_facility_does_not_rewrite_open_trip(pool):
+    """YOUNGPYO KIM 09-04 10:58: "arrived 200 from 7634" was parsed with
+    destination 7634 (the origin), and the wrong-destination correction then
+    rewrote the open 7634 -> 200F leg to 7634. The arrival cue's facility wins."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="7634", destination_location="200F",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Yeong kim \narrived 200 from 7634\nLive loading 85",
+               destination_location="7634", load_status="LOADED"),
+    )
+    assert res["leg_id"] == open_leg
+    leg = await get_leg(pool, open_leg)
+    assert leg["destination_location"] == "200F"
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["arrival_time"] is not None
+    assert len(await all_legs(pool)) == 1
+
+
+async def test_arrival_with_unknown_code_keeps_booked_destination(pool):
+    """YOUNGPYO KIM 09-04 11:34: the driver wrote "arrived 8634" (typo for
+    7634). An unknown arrival code must not rewrite the open 200F -> 7634 leg
+    or raise a wrong-destination card; the booked destination stands."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="200F", destination_location="7634",
+        load_status="LOADED", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_2_DESTINATION_ARRIVAL",
+               raw_text="Yeong kim \narrived 8634 from 200\nLive unloading 8",
+               destination_location="200F", load_status="LOADED"),
+    )
+    assert res["is_clean"] is True, res
+    assert res["leg_id"] == open_leg
+    leg = await get_leg(pool, open_leg)
+    assert leg["destination_location"] == "7634"
+    assert leg["arrival_time"] is not None
+    assert len(await all_legs(pool)) == 1
+
+
+async def test_unload_from_origin_filed_as_departure_is_arrival(pool):
+    """SOKHWAN YUN 09-04 08:58: "Live unloading at E2 rear #3 from pactra" was
+    filed as a departure E2R -> 200F. It is the arrival of the open 200F -> E2R
+    leg; recording it as a departure loses the arrival and creates a phantom."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="200F", destination_location="E2R",
+        load_status="LOADED", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Live unloading at E2 rear #3 from pactra Sokhwanyun",
+               origin_location="E2R", destination_location="200F",
+               action="LIVE_UNLOAD", load_status="LOADED"),
+    )
+    assert res["leg_id"] == open_leg
+    leg = await get_leg(pool, open_leg)
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "E2R"
+    assert leg["leg_status"] == "UNLOADING"
+    assert leg["arrival_time"] is not None
+    assert len(await all_legs(pool)) == 1
+
+
+async def test_raw_pair_recovers_e2_rear_destination(pool):
+    """SOKHWAN YUN 09-04 08:23: "Pickup load trailer pactra #47 to E2 rear"
+    reached the state machine as 200F -> 200F. The raw text names the real
+    destination, so the pair override must record 200F -> E2R."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Pickup load trailer pactra #47 to E2 rear Sokhwanyun",
+               origin_location="200F", destination_location="200F",
+               load_status="LOADED"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "E2R"
+
+
+async def test_raw_pair_recovers_e2_rear_origin_from_finish_unload(pool):
+    """SOKHWAN YUN 09-04 09:57: the raw text says the unload happened at E2
+    rear, so the empty reposition to E1 starts there -- not at the parser's
+    200F guess."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Finish live unloading E2 rear #3 move empty trailer "
+                        "to E1 yard Sokhwanyun",
+               origin_location="200F", destination_location="E1",
+               load_status="EMPTY", work_finished=True),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "E2R"
+    assert leg["destination_location"] == "E1"
+    assert leg["load_status"] == "EMPTY"
+
+
+async def test_raw_pair_recovers_swapped_load_pair(pool):
+    """MATTHEW CHO 09-04 10:55: "Load pickup 200 to 7634" parsed with the
+    endpoints swapped. The raw pair must restore 200F -> 7634."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE",
+               raw_text="Matthew \nLoad pickup \n200 to 7634",
+               origin_location="7634", destination_location="200F",
+               load_status="LOADED"),
+    )
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "200F"
+    assert leg["destination_location"] == "7634"
 
 
 async def test_autoheal_attaches_bol_to_open_leg(pool):
@@ -1663,7 +1787,7 @@ async def test_empty_drop_with_no_open_trip_infers_the_reposition(pool):
     the bot records it from the last completed trip's destination.
     """
     await seed_network(pool)
-    now = eastern_now()
+    now = midday()
     departed = ts(now - timedelta(minutes=90))
     arrived = ts(now - timedelta(minutes=80))
     finished = ts(now - timedelta(minutes=42))
@@ -1731,7 +1855,7 @@ async def test_departure_from_new_site_infers_preceding_empty_reposition(pool):
     bobtail that got him to SDS is a leg the dispatcher logs too.
     """
     await seed_network(pool)
-    now = eastern_now()
+    now = midday()
     await insert_leg(
         pool, origin_location="SDS", destination_location="E1",
         load_status="EMPTY", leg_status="COMPLETED",

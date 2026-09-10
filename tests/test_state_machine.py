@@ -699,6 +699,30 @@ async def test_work_finished_with_llm_pair_but_no_bare_alias_records_departure(p
     assert leg["load_status"] == "EMPTY"
 
 
+async def test_work_finished_bare_site_origin_uses_last_trip_destination(pool):
+    """YOUNG TEAK KONG 09-04 10:51: "Live unloading finished eg2 to e 1" is
+    sometimes filed CASE_WORK_FINISHED with bare "EG2" (not a known alias).
+    The unload happened at the last completed trip's destination, so the empty
+    reposition records E2R -> E1 instead of vanishing."""
+    await seed_network(pool)
+    await insert_leg(
+        pool, origin_location="200F", destination_location="E2R",
+        load_status="LOADED", leg_status="COMPLETED",
+    )
+    res = await commit(
+        pool,
+        intent(case_type="CASE_WORK_FINISHED",
+               raw_text="Kong  Live unloading finished  eg2  to e 1 Kong",
+               origin_location="EG2", destination_location="E1",
+               load_status="EMPTY", work_finished=True),
+    )
+    assert res["leg_id"] is not None, res
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "E2R", f"was {leg['origin_location']}"
+    assert leg["destination_location"] == "E1"
+    assert leg["load_status"] == "EMPTY"
+
+
 async def test_finish_unload_empty_origin_uses_the_unload_site(pool):
     """Live data 08/28, Young Teak Kong 09:44: he wrote "empty 200 to sds" after
     unloading at E2F. The trip is E2F -> SDS (the manual log), not 200F -> SDS:

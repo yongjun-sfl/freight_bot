@@ -341,6 +341,38 @@ async def commit_trip_leg(
                             ctx.raw_text or "")
                         if recovered_dest:
                             pair_origin, pair_dest = llm_origin, recovered_dest
+                    elif UNLOAD_PATTERN.search(ctx.raw_text or ""):
+                        # The parser sometimes returns a bare site ("EG2") or a
+                        # typo for the unload origin. The unload happened at the
+                        # last completed trip's destination; use it as the
+                        # origin when the onward "to X" names a different site.
+                        recovered_dest = cross_facility_destination(
+                            ctx.raw_text or "")
+                        if recovered_dest:
+                            await cur.execute(
+                                f"""SELECT destination_location
+                                      FROM {TABLE_SHUTTLE_LEGS}
+                                     WHERE user_id = %s
+                                       AND is_positioning_leg = 0
+                                       AND destination_location NOT IN
+                                           ('UNKNOWN', 'NONE', 'NULL',
+                                            'MISSING_DEST', '')
+                                  ORDER BY id DESC
+                                     LIMIT 1;""",
+                                (did,)
+                            )
+                            last_done = await cur.fetchone()
+                            if (last_done and last_done[0]
+                                    and site_of(last_done[0]) != site_of(
+                                        recovered_dest)):
+                                logger.info(
+                                    f"Driver #{did} unload origin "
+                                    f"{ctx.origin_loc!r} is not a facility; "
+                                    f"using last trip destination "
+                                    f"{last_done[0]}."
+                                )
+                                pair_origin, pair_dest = (last_done[0],
+                                                          recovered_dest)
 
                 if pair_origin and pair_dest:
                     logger.info(

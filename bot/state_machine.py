@@ -26,6 +26,8 @@ from shifts import record_lunch
 from leg_helpers import (
     BOBTAIL_PATTERN,
     DROP_PATTERN,
+    ENGLISH_MOVEMENT_PATTERN,
+    KOREAN_PLAN_PATTERN,
     LOAD_PATTERN,
     PICKUP_PATTERN,
     UNLOAD_PATTERN,
@@ -254,6 +256,22 @@ async def commit_trip_leg(
                 logger.info(
                     f"Driver #{did} message names another driver and not "
                     f"themselves; treating as a direction/no-op."
+                )
+                return {"is_clean": True, "leg_id": None, "card_text": None}
+
+            # 0a-bis. FORWARD-LOOKING PLAN GUARD. Korean text that plans the
+            # next move ("엠티 E1에 드랍하고 ... 합니다", "... 하기로 했습니다")
+            # is not a movement that has happened; recording it creates a
+            # phantom leg and steals the arrival time from the real report that
+            # follows. Only text-only messages with a Korean future/sequence
+            # marker and no English movement cue are ignored; photos and
+            # English captions still pass through.
+            if (not ctx.primary_image_blob
+                    and KOREAN_PLAN_PATTERN.search(ctx.raw_text or "")
+                    and not ENGLISH_MOVEMENT_PATTERN.search(ctx.raw_text or "")):
+                logger.info(
+                    f"Driver #{did} message is a Korean plan/intention, not a "
+                    f"movement; treating as no-op."
                 )
                 return {"is_clean": True, "leg_id": None, "card_text": None}
 

@@ -56,6 +56,22 @@ DROP_PATTERN = re.compile(
 # positions ("parked load 100 #417" -> origin_dock 417 / destination_dock YARD).
 PARKED_PATTERN = re.compile(r"\bpark(?:ed|ing)?\b", re.IGNORECASE)
 
+# Korean plan/intention endings. A driver explaining what will happen next
+# ("엠티 E1에 드랍하고 ... 합니다", "E1 야드에 드랍합니다 ... 하기로 했습니다")
+# is not reporting a movement that has happened; the actual move arrives later,
+# usually with a photo. Only the clear future/sequence markers count, so a
+# terse present-tense report ("엠티 드랍합니다") is not swallowed here.
+KOREAN_PLAN_PATTERN = re.compile(
+    r"(?:하겠|하기로|할\s*예정|예정|겠읍|겠습니다|드리겠|주시기|바랍니다|"
+    r"하고\s|해서\s|가서\s|오면서\s)"
+)
+# Real movement reports in this operation are English captions/photos. A
+# Korean plan message that also carries an English movement cue is left alone.
+ENGLISH_MOVEMENT_PATTERN = re.compile(
+    r"\b(?:drop|pick|load|unload|empty|finished|bobtail|move|moved|arriv|depart)\b",
+    re.IGNORECASE,
+)
+
 # A report the driver is actually moving a trailer between facilities. The
 # two-facility recovery below exists for messages the parser filed as a plain
 # completion ("Unloading finished / Empty 200 sds") -- the real ones carry a

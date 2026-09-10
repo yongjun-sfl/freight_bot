@@ -90,6 +90,76 @@ async def test_direction_to_another_driver_is_not_recorded(pool):
     assert await all_legs(pool) == []
 
 
+async def test_korean_plan_departure_is_not_recorded(pool):
+    """ILPYO 09-04 12:30: the Korean text plans the next move (drop empty at
+    E1, bobtail to SDS, lunch later). The actual movement is reported at
+    12:40/12:51; the plan must not create an E1 -> SDS leg."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_1_ORIGIN_DEPARTURE",
+            raw_text="홍일표까지 한진일 도와서 엠티 e1에 드랍하고 밥테일로 "
+                     "SDS 로 가서 엠티 갖고 오면서 달톤 파일럿에서 점심 합니다",
+            origin_location="E1", destination_location="SDS",
+            load_status="BOBTAIL",
+        ),
+    )
+    assert res["leg_id"] is None
+    assert res["card_text"] is None
+    assert await all_legs(pool) == []
+
+
+async def test_korean_plan_yard_drop_is_not_recorded(pool):
+    """ILPYO 09-04 16:45: the Korean text says the trailer WILL be dropped at
+    E1 yard and another one used instead. The real drop is at 16:51; the plan
+    must not create or complete a leg."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="200F", destination_location="E1",
+        load_status="EMPTY", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="Hong il pyo. e1 창고 관계자 합의 해서 내가 갖고온 "
+                     "트레일러는 E1 야드에 드랍합니다    대신 이미 닥에 대어 "
+                     "있는 트레일러로 운행 하기로 했습니다",
+            origin_location="E1", destination_location="E1",
+            destination_dock="YARD", load_status="EMPTY",
+        ),
+    )
+    assert res["leg_id"] is None
+    assert res["card_text"] is None
+    leg = await get_leg(pool, open_leg)
+    assert leg["leg_status"] == "IN_TRANSIT"
+    assert leg["arrival_time"] is None
+    legs = await all_legs(pool)
+    assert len(legs) == 1
+    assert legs[0]["id"] == open_leg
+
+
+async def test_korean_plan_with_photo_still_records(pool):
+    """A photo caption phrased as a plan still reaches the state machine:
+    photos are first-hand movement evidence, so the plan guard skips them."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_1_ORIGIN_DEPARTURE",
+            raw_text="홍일표까지 한진일 도와서 엠티 e1에 드랍하고 밥테일로 "
+                     "SDS 로 가서 엠티 갖고 오면서 달톤 파일럿에서 점심 합니다",
+            origin_location="E1", destination_location="SDS",
+            load_status="BOBTAIL", primary_image_blob=IMG,
+        ),
+    )
+    assert res["leg_id"] is not None
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["origin_location"] == "E1"
+    assert leg["destination_location"] == "SDS"
+
+
 async def test_200_r_spelled_with_space_normalizes_to_rear(pool):
     """Live 09-04, ILPYO 11:29: the driver wrote '200 r' with a space. That is
     200R (rear), not a second 200F -- leg #60 must not become 200F => 200F."""

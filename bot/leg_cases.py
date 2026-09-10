@@ -25,7 +25,7 @@ from shifts import (
     record_lunch,
 )
 
-from leg_helpers import REPEAT_MOVE_MINUTES, UNLOAD_PATTERN
+from leg_helpers import PARKED_PATTERN, REPEAT_MOVE_MINUTES, UNLOAD_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -1394,8 +1394,23 @@ async def handle_case_3_intra_move(ctx):
         (did,)
     )
     open_trip = await cur.fetchone()
-    if (open_trip and from_dock is None and not named_two_places
-            and facility != "UNKNOWN"):
+    # A parked/arrived report can carry a dock even though no position was
+    # moved FROM. "parked load 100 #417" is filed as a same-facility move with
+    # 417 in origin_dock and YARD in destination_dock (the parser varies); a
+    # real intra-facility move names TWO different positions. Also treat a
+    # "parked" report with no from/to phrase as an arrival, so it completes the
+    # open trip instead of inventing a 100 -> 100 positioning leg.
+    moved_between_positions = bool(
+        from_dock and to_dock and from_dock != to_dock)
+    no_position_moved = not moved_between_positions
+    padded_lower = f" {raw_lower} "
+    parked_arrival = bool(
+        PARKED_PATTERN.search(raw_text or "")
+        and " from " not in padded_lower
+        and " to " not in padded_lower
+    )
+    if (open_trip and (no_position_moved or parked_arrival)
+            and not named_two_places and facility != "UNKNOWN"):
         trip_id, booked_destination = open_trip
         if site_of(booked_destination or "") == site_of(facility):
             at_dock = bool(to_dock) and to_dock != "YARD"

@@ -51,6 +51,11 @@ DROP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A driver says a trailer is PARKED; that is an arrival report, not a
+# reposition. The parser still may file a same-facility move and invent dock
+# positions ("parked load 100 #417" -> origin_dock 417 / destination_dock YARD).
+PARKED_PATTERN = re.compile(r"\bpark(?:ed|ing)?\b", re.IGNORECASE)
+
 # A report the driver is actually moving a trailer between facilities. The
 # two-facility recovery below exists for messages the parser filed as a plain
 # completion ("Unloading finished / Empty 200 sds") -- the real ones carry a

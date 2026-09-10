@@ -107,6 +107,105 @@ async def test_200_r_spelled_with_space_normalizes_to_rear(pool):
     assert leg["is_positioning_leg"] == 1
 
 
+async def test_invalid_parsed_load_status_falls_back_to_text(pool):
+    """ILPYO 09-04 12:30: the parser returned a load_status outside the
+    ENUM('EMPTY','LOADED') and the INSERT aborted with 'Data truncated',
+    swallowing the movement. An invalid token must be ignored and inferred."""
+    await seed_network(pool)
+    res = await commit(
+        pool,
+        intent(case_type="CASE_1_ORIGIN_DEPARTURE", raw_text="empty 200 to e1",
+               origin_location="200", destination_location="E1",
+               load_status="DROP"),
+    )
+    assert res["is_clean"] is True
+    leg = await get_leg(pool, res["leg_id"])
+    assert leg["load_status"] == "EMPTY"
+
+
+async def test_parked_load_same_dock_completes_the_open_trip(pool):
+    """ILPYO 09-04 17:58: 'parked load 100 #417' is an arrival at the trip's
+    destination, but the parser files it as a same-facility move with the dock
+    on both ends. It must complete the open E1 -> 100 trip, not invent a
+    100 -> 100 positioning leg and leave the real arrival time empty."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="E1", destination_location="100",
+        load_status="LOADED", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="parked load 100 #417",
+            origin_location="100", destination_location="100",
+            origin_dock="417", destination_dock="417",
+            load_status="LOADED",
+        ),
+    )
+    assert res["leg_id"] == open_leg
+    legs = await all_legs(pool)
+    assert len(legs) == 1
+    leg = await get_leg(pool, open_leg)
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["arrival_time"] is not None
+    assert leg["destination_dock"] == "417"
+
+
+async def test_parked_load_one_sided_dock_completes_the_open_trip(pool):
+    """Same as above, but the parser put the named dock only in origin_dock
+    (seen in the 09-04 ILPYO-only photos-on rerun). A move needs two different
+    positions; one dock alone is an arrival at the open trip's destination."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="E1", destination_location="100",
+        load_status="LOADED", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="parked load 100 #417",
+            origin_location="100", destination_location="100",
+            origin_dock="417", destination_dock=None,
+            load_status="LOADED",
+        ),
+    )
+    assert res["leg_id"] == open_leg
+    legs = await all_legs(pool)
+    assert len(legs) == 1
+    leg = await get_leg(pool, open_leg)
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["arrival_time"] is not None
+
+
+async def test_parked_load_with_invented_yard_dock_completes_the_open_trip(pool):
+    """The photos-on rerun showed the parser inventing a 417 -> YARD move from
+    'parked load 100 #417'. 'Parked' with no from/to is an arrival; it must
+    complete the open E1 -> 100 trip, not create Leg 100 -> 100."""
+    await seed_network(pool)
+    open_leg = await insert_leg(
+        pool, origin_location="E1", destination_location="100",
+        load_status="LOADED", leg_status="IN_TRANSIT",
+    )
+    res = await commit(
+        pool,
+        intent(
+            case_type="CASE_3_INTRA_FACILITY_MOVE",
+            raw_text="parked load 100 #417",
+            origin_location="100", destination_location="100",
+            origin_dock="417", destination_dock="YARD",
+            load_status="LOADED",
+        ),
+    )
+    assert res["leg_id"] == open_leg
+    legs = await all_legs(pool)
+    assert len(legs) == 1
+    leg = await get_leg(pool, open_leg)
+    assert leg["leg_status"] == "COMPLETED"
+    assert leg["arrival_time"] is not None
+
+
 async def test_stale_bol_records_movement_without_paperwork(pool):
     """A duplicate BOL means the driver attached the PREVIOUS load's paperwork.
 

@@ -131,10 +131,25 @@ async def commit_trip_leg(
 
     # Extended Fallback Logic for Load Status
     parsed_load_status = ctx.intent.get("load_status")
+    if parsed_load_status is not None:
+        parsed_load_status = str(parsed_load_status).strip().upper()
+        if parsed_load_status in ("", "UNKNOWN", "NULL", "NONE"):
+            parsed_load_status = None
+        elif parsed_load_status not in ("EMPTY", "LOADED", "BOBTAIL"):
+            # The parser occasionally returns a word ("DROP", "PICKUP") or a
+            # phrase instead of the enum. shuttle_legs.load_status is
+            # ENUM('EMPTY','LOADED'), so letting it through aborts the INSERT
+            # with "Data truncated" and loses the whole movement. Fall through
+            # to the text/previous-leg inference instead.
+            logger.warning(
+                f"Driver #{did} parser returned invalid load_status "
+                f"{parsed_load_status!r}; inferring from text."
+            )
+            parsed_load_status = None
     if ctx.is_bobtail_flag or parsed_load_status == "BOBTAIL":
         ctx.load_status_val = "EMPTY"
         ctx.is_bobtail_flag = 1
-    elif parsed_load_status and parsed_load_status not in ["UNKNOWN", "NULL", "NONE"]:
+    elif parsed_load_status in ("EMPTY", "LOADED"):
         ctx.load_status_val = parsed_load_status
     elif just_delivered:
         ctx.load_status_val = "EMPTY"
